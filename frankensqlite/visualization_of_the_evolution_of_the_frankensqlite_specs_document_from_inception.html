@@ -1,0 +1,2256 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <!-- Deploy Hash: 2026-02-08-CSS-FIX-V1 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0, viewport-fit=cover" />
+    <title>FrankenSQLite | Spec Reanimation</title>
+    
+    <!-- OpenGraph & Favicon -->
+    <meta property="og:title" content="FrankenSQLite Spec Evolution" />
+    <meta property="og:description" content="137 commits · 10,791 lines · 12 sessions of architectural reanimation." />
+    <meta property="og:image" content="https://frankensqlite.com/og-image.png" />
+    <meta property="og:url" content="https://frankensqlite.com/spec_evolution" />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://frankensqlite.com/twitter-image.png" />
+    <link rel="icon" type="image/webp" href="frankensqlite_illustration.webp" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+    <style>
+        :root {
+            /* --- Mouse Defaults --- */
+            --mouse-x: 50%;
+            --mouse-y: 50%;
+
+            /* --- Core Palette (Stripe-grade Dark Mode) --- */
+            --bg-depth: #020202;
+            --bg-surface: #080808;
+            --bg-surface-2: #101010;
+            --bg-surface-3: #181818;
+
+            /* --- Accents (Neon Lab Green) --- */
+            --primary: #39ff14;
+            --primary-dim: rgba(57, 255, 20, 0.08);
+            --primary-glow: rgba(57, 255, 20, 0.25);
+            --accent-error: #ff2a6d;
+            --accent-info: #05d9e8;
+
+            /* --- Text --- */
+            --text-1: #ffffff;
+            --text-2: #a1a1aa;
+            --text-3: #52525b;
+            --text-4: #27272a;
+
+            /* --- Borders & Glass --- */
+            --border: rgba(255, 255, 255, 0.06);
+            --border-hover: rgba(255, 255, 255, 0.12);
+            --glass-bg: rgba(8, 8, 8, 0.65);
+            --glass-border: rgba(255, 255, 255, 0.04);
+            --backdrop-blur: blur(20px);
+
+            /* --- Typography --- */
+            --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+            --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+            /* --- Metrics --- */
+            --radius-sm: 6px;
+            --radius-md: 12px;
+            --radius-lg: 20px;
+            --header-height: 64px;
+            --sidebar-width: 380px;
+
+            /* --- Animation --- */
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+            --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+            --duration-fast: 0.2s;
+            --duration-med: 0.4s;
+        }
+
+        /* --- Global Reset & Base --- */
+        *, *::before, *::after { box-sizing: border-box; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+        html, body { height: 100%; }
+
+        body {
+            background-color: var(--bg-depth);
+            color: var(--text-1);
+            font-family: var(--font-sans);
+            margin: 0;
+            overflow: hidden;
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            background-image:
+                radial-gradient(circle at 50% 0%, rgba(57, 255, 20, 0.03) 0%, transparent 60%),
+                linear-gradient(to bottom, var(--bg-depth), var(--bg-surface));
+        }
+
+        a { color: var(--primary); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        /* --- Scrollbar --- */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--text-4); border-radius: 99px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+        /* --- Utilities --- */
+        .hidden { display: none !important; }
+        .mobile-only { display: none !important; }
+
+        /* --- Buttons --- */
+        .btn-lab {
+            appearance: none;
+            -webkit-appearance: none;
+            background: var(--bg-surface-2);
+            border: 1px solid var(--border);
+            color: var(--text-2);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            padding: 8px 12px;
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            transition:
+                background var(--duration-fast) var(--ease-out-expo),
+                border-color var(--duration-fast) var(--ease-out-expo),
+                color var(--duration-fast) var(--ease-out-expo),
+                transform var(--duration-fast) var(--ease-out-expo);
+            user-select: none;
+        }
+
+        .btn-lab:hover {
+            background: var(--bg-surface-3);
+            border-color: var(--border-hover);
+            color: var(--text-1);
+        }
+
+        .btn-lab:active { transform: translateY(1px); }
+
+        .btn-lab:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 2px var(--primary-dim);
+            border-color: rgba(57, 255, 20, 0.35);
+        }
+
+        .btn-play { display: none !important; } /* Disabled (no handler wired) */
+
+        /* --- Layout --- */
+        .main-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* --- Header --- */
+        .app-header {
+            height: var(--header-height);
+            background: var(--glass-bg);
+            backdrop-filter: var(--backdrop-blur);
+            border-bottom: 1px solid var(--glass-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 32px;
+            flex-shrink: 0;
+            z-index: 100;
+        }
+
+        .brand { display: flex; align-items: center; gap: 16px; }
+        .brand img { height: 36px; border-radius: 8px; box-shadow: 0 0 20px rgba(57,255,20,0.15); transition: transform 0.3s var(--ease-out-expo); }
+        .brand:hover img { transform: scale(1.05) rotate(-2deg); }
+
+        .brand h1 {
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-1);
+            margin: 0;
+            letter-spacing: -0.01em;
+        }
+        .brand h1 span {
+            color: var(--text-3);
+            font-weight: 400;
+            margin-left: 12px;
+            font-size: 13px;
+        }
+
+        /* --- App Body --- */
+        .app-body { flex: 1; display: flex; overflow: hidden; position: relative; }
+
+        /* --- Sidebar --- */
+        .sidebar {
+            width: var(--sidebar-width);
+            background: rgba(5, 5, 5, 0.4);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            z-index: 50;
+            backdrop-filter: blur(10px);
+            transition: transform 0.4s var(--ease-out-expo), margin-left 0.4s var(--ease-in-out), opacity 0.3s var(--ease-in-out);
+        }
+
+        .sidebar-header {
+            padding: 16px 16px 12px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(8, 8, 8, 0.6);
+        }
+
+        .search-wrapper input {
+            width: 100%;
+            background: var(--bg-surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+            color: var(--text-1);
+            font-family: var(--font-sans);
+            font-size: 13px;
+            outline: none;
+            transition: border-color var(--duration-fast) var(--ease-out-expo), box-shadow var(--duration-fast) var(--ease-out-expo);
+        }
+
+        .search-wrapper input::placeholder { color: var(--text-3); }
+        .search-wrapper input:focus {
+            border-color: rgba(57, 255, 20, 0.45);
+            box-shadow: 0 0 0 2px var(--primary-dim);
+        }
+
+        .commit-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px 12px 16px 12px;
+        }
+
+        .commit-card {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+            margin-bottom: 6px;
+            cursor: pointer;
+            transition:
+                background var(--duration-fast) var(--ease-out-expo),
+                border-color var(--duration-fast) var(--ease-out-expo),
+                transform var(--duration-fast) var(--ease-out-expo);
+        }
+
+        .commit-card:hover { background: rgba(255,255,255,0.03); border-color: var(--border); }
+        .commit-card.selected { background: rgba(255,255,255,0.04); border-color: rgba(57,255,20,0.35); }
+        
+        @keyframes pulse-active {
+            0% { border-color: rgba(57,255,20,0.35); box-shadow: 0 0 0 0 rgba(57,255,20,0.1); }
+            50% { border-color: rgba(57,255,20,0.8); box-shadow: 0 0 12px 0 rgba(57,255,20,0.2); }
+            100% { border-color: rgba(57,255,20,0.35); box-shadow: 0 0 0 0 rgba(57,255,20,0.1); }
+        }
+        .commit-card.selected.playing {
+            animation: pulse-active 1.5s infinite var(--ease-in-out);
+        }
+
+        /* --- Sidebar Commit Pulse (Activity Markers) --- */
+        .commit-list {
+            position: relative;
+        }
+        .commit-card[data-impact-high="true"]::after {
+            content: "";
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 3px;
+            background: var(--accent-error);
+            box-shadow: 2px 0 8px var(--accent-error);
+            opacity: 0.6;
+        }
+        .commit-card[data-impact-med="true"]::after {
+            content: "";
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 3px;
+            background: var(--accent-info);
+            opacity: 0.4;
+        }
+
+        .commit-card-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: var(--text-3);
+            font-family: var(--font-mono);
+            margin-bottom: 6px;
+        }
+
+        .commit-card-subject {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-2);
+            line-height: 1.35;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+
+        .commit-card.selected .commit-card-subject { color: var(--text-1); }
+
+        .commit-card-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .tag-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            background: rgba(255,255,255,0.02);
+        }
+
+        /* --- Main Content --- */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+            background: transparent;
+        }
+
+        .content-header {
+            height: 52px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(8, 8, 8, 0.55);
+            backdrop-filter: blur(10px);
+        }
+
+        .tabs {
+            display: flex;
+            gap: 4px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            padding: 3px;
+            border-radius: 999px;
+        }
+
+        .tab {
+            padding: 6px 12px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            color: var(--text-2);
+            border-radius: 999px;
+            transition: background var(--duration-fast) var(--ease-out-expo), color var(--duration-fast) var(--ease-out-expo);
+            user-select: none;
+        }
+
+        .tab:hover { color: var(--text-1); }
+        .tab.active {
+            background: rgba(255,255,255,0.06);
+            color: var(--text-1);
+            box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+        }
+
+        .viewport { flex: 1; position: relative; overflow: hidden; }
+        .scroll-pane {
+            height: 100%;
+            overflow-y: auto;
+            padding: 36px 40px;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .spec-container { max-width: 920px; margin: 0 auto; padding-bottom: 120px; }
+        .spec-content {
+            font-family: var(--font-sans);
+            font-size: 16px;
+            line-height: 1.75;
+            color: var(--text-2);
+            overflow-wrap: anywhere;
+        }
+
+        .spec-content h1, .spec-content h2, .spec-content h3 {
+            color: var(--text-1);
+            letter-spacing: -0.02em;
+            margin-top: 1.8em;
+            margin-bottom: 0.6em;
+        }
+        .spec-content h1 { font-size: 40px; border-bottom: 1px solid var(--border); padding-bottom: 0.35em; }
+        .spec-content h2 { font-size: 24px; }
+        .spec-content h3 { font-size: 18px; color: #e4e4e7; }
+
+        .spec-content hr { border: none; border-top: 1px solid var(--border); margin: 2.2em 0; }
+        .spec-content p { margin: 0.9em 0; }
+        .spec-content ul, .spec-content ol { margin: 0.8em 0 0.8em 1.4em; }
+
+        .spec-content code {
+            font-family: var(--font-mono);
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+            padding: 2px 6px;
+            border-radius: 6px;
+            font-size: 0.92em;
+            color: #e4e4e7;
+        }
+
+        .spec-content pre {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 16px 18px;
+            overflow-x: auto;
+            margin: 1.2em 0;
+        }
+        .spec-content pre code { background: transparent; border: none; padding: 0; }
+
+        .spec-content blockquote {
+            margin: 1.2em 0;
+            padding: 12px 16px;
+            border-left: 3px solid rgba(57,255,20,0.35);
+            background: rgba(57,255,20,0.05);
+            border-radius: var(--radius-sm);
+            color: #d4d4d8;
+        }
+
+        .spec-content table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.2em 0;
+            overflow: hidden;
+            border-radius: var(--radius-sm);
+        }
+        .spec-content th, .spec-content td {
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            vertical-align: top;
+        }
+        .spec-content th {
+            background: rgba(255,255,255,0.03);
+            color: #e4e4e7;
+            font-weight: 700;
+            text-align: left;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .spec-content td { color: var(--text-2); font-size: 14px; }
+
+        /* --- Dock --- */
+        .dock {
+            background: var(--glass-bg);
+            backdrop-filter: var(--backdrop-blur);
+            border-top: 1px solid var(--glass-border);
+            padding: 14px 24px calc(14px + env(safe-area-inset-bottom));
+            z-index: 100;
+        }
+
+        .evolution-map {
+            height: 52px;
+            background: rgba(255,255,255,0.03);
+            border-radius: var(--radius-sm);
+            position: relative;
+            margin-bottom: 14px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        .map-canvas { width: 100%; height: 100%; display: block; opacity: 0.9; }
+        .map-slider {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            -webkit-appearance: none;
+            appearance: none;
+            background: transparent;
+            margin: 0;
+            z-index: 10;
+            cursor: ew-resize;
+        }
+        .map-slider:focus { outline: none; }
+        .map-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 6px;
+            height: 52px;
+            background: rgba(255,255,255,0.55);
+            border-radius: 4px;
+            box-shadow: 0 0 18px rgba(255,255,255,0.25);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+
+        .dock-bottom { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+
+        /* --- Legend Overlay --- */
+        .legend-overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0,0,0,0.65);
+            backdrop-filter: blur(6px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity var(--duration-med) var(--ease-out-expo);
+            z-index: 9500;
+            padding: 24px;
+        }
+        .legend-overlay.active { opacity: 1; pointer-events: auto; }
+        .legend-card {
+            width: min(760px, 92vw);
+            background: var(--bg-surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 24px;
+            box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+        }
+        .legend-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .legend-item {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 6px;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: rgba(255,255,255,0.02);
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+        .legend-item:hover {
+            border-color: var(--border-hover);
+            background: rgba(255,255,255,0.04);
+        }
+        .legend-item-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .legend-item-name {
+            font-weight: 700;
+            color: var(--text-1);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .legend-item-desc {
+            font-size: 11px;
+            line-height: 1.5;
+            color: var(--text-2);
+        }
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            box-shadow: 0 0 12px rgba(0,0,0,0.4);
+            flex-shrink: 0;
+        }
+
+        /* Responsive Legend */
+        @media (max-width: 640px) {
+            .legend-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* --- Focus Mode --- */
+        .app-header, .dock {
+            transition: max-height 0.4s var(--ease-in-out), padding 0.4s var(--ease-in-out), opacity 0.3s var(--ease-in-out);
+            max-height: 160px;
+            opacity: 1;
+            overflow: hidden;
+        }
+
+        body.focus-mode .app-header,
+        body.focus-mode .dock {
+            max-height: 0;
+            padding-top: 0;
+            padding-bottom: 0;
+            opacity: 0;
+            border-bottom: none;
+            border-top: none;
+            pointer-events: none;
+        }
+
+        body.focus-mode .sidebar { margin-left: calc(var(--sidebar-width) * -1); opacity: 0; }
+
+        body.focus-mode .main-content { margin: 0; height: 100vh; }
+        body.focus-mode .scroll-pane { padding: 40px; }
+
+        .btn-focus-exit {
+            position: fixed;
+            bottom: 32px;
+            right: 32px;
+            background: var(--primary);
+            color: #000;
+            font-weight: 800;
+            padding: 12px 20px;
+            border-radius: 999px;
+            box-shadow: 0 4px 20px var(--primary-glow);
+            z-index: 5000;
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.3s var(--ease-out-expo);
+            cursor: pointer;
+            border: none;
+            font-family: var(--font-mono);
+        }
+        body.focus-mode .btn-focus-exit { opacity: 1; transform: translateY(0); }
+
+        /* --- Responsive Tables (Card View) --- */
+        @media (max-width: 768px) {
+            .spec-content table, .spec-content thead, .spec-content tbody, .spec-content th, .spec-content td, .spec-content tr {
+                display: block;
+            }
+            .spec-content thead tr { position: absolute; top: -9999px; left: -9999px; }
+            .spec-content tr {
+                border: 1px solid var(--border);
+                margin-bottom: 16px;
+                border-radius: var(--radius-sm);
+                background: var(--bg-surface-2);
+                overflow: hidden;
+            }
+            .spec-content td {
+                border: none;
+                border-bottom: 1px solid var(--border);
+                position: relative;
+                padding: 12px 16px 12px 40%;
+                text-align: right !important;
+                font-size: 13px;
+                min-height: 40px;
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+            }
+            .spec-content td::before {
+                position: absolute;
+                top: 0; left: 0; bottom: 0;
+                width: 35%;
+                padding: 12px 16px;
+                background: rgba(255,255,255,0.03);
+                white-space: nowrap;
+                text-align: left;
+                font-weight: 700;
+                color: var(--text-3);
+                content: attr(data-label);
+                font-size: 11px;
+                text-transform: uppercase;
+                display: flex;
+                align-items: center;
+                border-right: 1px solid var(--border);
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+        }
+
+        /* --- Diff Highlight --- */
+        .diff-highlight {
+            background: rgba(57, 255, 20, 0.1);
+            border-left: 2px solid var(--primary);
+            margin: 0 -16px;
+            padding: 0 14px;
+            display: block;
+        }
+
+        .spec-fallback-banner {
+            background: rgba(255, 42, 109, 0.1);
+            border: 1px solid rgba(255, 42, 109, 0.4);
+            border-radius: var(--radius-sm);
+            color: #ff6b94;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            line-height: 1.5;
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            white-space: normal;
+        }
+
+        .spec-fallback-pre {
+            background: var(--bg-surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text-2);
+            font-family: var(--font-mono);
+            font-size: 12px;
+            line-height: 1.6;
+            margin: 0;
+            overflow-x: auto;
+            padding: 12px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        /* --- Loading Overlay --- */
+        #loadingOverlay {
+            position: fixed;
+            inset: 0;
+            background: var(--bg-depth);
+            z-index: 10000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.8s ease;
+        }
+
+        .vital-pulse {
+            width: 44px;
+            height: 44px;
+            border-radius: 999px;
+            border: 3px solid rgba(255, 255, 255, 0.10);
+            border-top-color: var(--primary);
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* --- Mobile Overrides --- */
+        @media (max-width: 768px) {
+            .mobile-only { display: inline-flex !important; }
+            .mobile-hide { display: none !important; }
+
+            .app-header { padding: 0 16px; height: 56px; }
+            .content-header { padding: 0 16px; overflow-x: auto; }
+            .scroll-pane { padding: 20px 16px; }
+
+            .dock { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
+            .evolution-map { height: 60px; }
+            .map-slider::-webkit-slider-thumb { width: 18px; height: 60px; background: rgba(255,255,255,0.18); box-shadow: none; border-left: 2px solid rgba(255,255,255,0.85); border-right: 2px solid rgba(255,255,255,0.85); }
+
+            /* Sidebar becomes a drawer */
+            .sidebar {
+                position: absolute;
+                top: 0; bottom: 0; left: 0;
+                width: 85%;
+                max-width: 320px;
+                transform: translateX(-100%);
+                box-shadow: 0 24px 60px rgba(0,0,0,0.65);
+                border-right: 1px solid var(--glass-border);
+            }
+            .sidebar.active { transform: translateX(0); }
+
+            /* Backdrop for sidebar */
+            .sidebar.active::before {
+                content: "";
+                position: fixed;
+                inset: 0;
+                left: 320px;
+                width: 100vw;
+                background: rgba(0,0,0,0.5);
+                backdrop-filter: blur(4px);
+                z-index: -1;
+            }
+
+            .brand h1 span { display: none; }
+        }
+
+        /* --- Artifact & Scanlines --- */
+        .scanlines {
+            position: fixed;
+            inset: 0;
+            background: linear-gradient(
+                to bottom,
+                transparent 50%,
+                rgba(0, 0, 0, 0.1) 50%
+            );
+            background-size: 100% 4px;
+            z-index: 9999;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.5s ease;
+        }
+        body.focus-mode .scanlines { opacity: 1; }
+
+        @keyframes glitch {
+            0% { transform: translate(0); text-shadow: none; }
+            20% { transform: translate(-2px, 1px); text-shadow: 2px 0 var(--accent-error), -2px 0 var(--accent-info); }
+            40% { transform: translate(2px, -1px); text-shadow: -2px 0 var(--accent-error), 2px 0 var(--accent-info); }
+            60% { transform: translate(-1px, 0); }
+            100% { transform: translate(0); }
+        }
+
+        body.focus-mode .diff-highlight:hover {
+            animation: glitch 0.3s infinite;
+            color: #fff;
+            background: rgba(57, 255, 20, 0.25);
+        }
+
+        /* --- Flashlight Mode --- */
+        body[data-flashlight="true"]::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 9000;
+            pointer-events: none;
+            background: radial-gradient(
+                circle 250px at var(--mouse-x, 50%) var(--mouse-y, 50%),
+                transparent 0%,
+                rgba(0, 0, 0, 0.92) 100%
+            );
+        }
+        
+        #btnFlashlight.active {
+            color: var(--primary);
+            box-shadow: 0 0 15px var(--primary-glow);
+            border-color: var(--primary);
+        }
+
+        /* --- Filters --- */
+        #bucketFilters {
+            display: flex;
+            gap: 6px;
+            overflow-x: auto;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(5,5,5,0.2);
+            scrollbar-width: none;
+            -ms-overflow-style: none;
+        }
+        #bucketFilters::-webkit-scrollbar { display: none; }
+
+        .filter-pill {
+            flex-shrink: 0;
+            padding: 4px 10px;
+            border-radius: 99px;
+            font-size: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            color: var(--text-3);
+            transition: all 0.2s var(--ease-out-expo);
+            user-select: none;
+            background: transparent;
+        }
+        .filter-pill:hover { color: var(--text-2); border-color: var(--border-hover); }
+        .filter-pill.active { border-color: currentColor; background: rgba(255,255,255,0.03); }
+
+        /* Esoteric Math Glitch in Legend */
+        .legend-item:nth-child(8):hover .legend-item-name {
+            animation: glitch 0.4s infinite;
+            color: var(--primary);
+        }
+
+        /* Cleanup unwanted elements */
+        .system-hud, .dna-hud, .metrics-hud, #flashlight, .aberration, .arc-container { display: none !important; }
+    </style>
+</head>
+<body data-flashlight="false">
+<div class="scanlines"></div>
+
+<div id="loadingOverlay">
+    <div class="vital-pulse"></div>
+    <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-2); margin-top: 24px; letter-spacing: 0.1em; font-weight: 500;">INITIALIZING</div>
+</div>
+
+<div class="main-container" id="mainContainer">
+    <header class="app-header">
+    <div class="brand">
+        <button class="btn-lab mobile-only" id="btnOpenLogs" style="margin-right: 12px;">LOGS</button>
+        <img src="frankensqlite_illustration.webp" alt="Logo">
+        <h1>FrankenSQLite<span>Evolutionary DNA</span></h1>
+    </div>
+    <div class="kpis" style="display: flex; gap: 30px;">
+        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">ENTRIES</span><span id="kpiCommits" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
+        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">MASS</span><span id="kpiLines" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
+        <div style="display: flex; gap: 8px; align-items: center; margin-left: 12px;">
+            <button class="btn-lab" id="btnFlashlight" title="Toggle Searchlight (Artifact Mode)">BEAM</button>
+            <button class="btn-lab" id="btnShowLegend">LEGEND</button>
+        </div>
+    </div>
+    <button class="btn-lab mobile-hide" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">SOURCE</button>
+</header>
+
+<div class="app-body">
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <span style="font-size: 10px; font-weight: 700; color: var(--text-3); letter-spacing: 0.1em; text-transform: uppercase;">Laboratory Logs</span>
+                <button class="btn-lab mobile-only" id="btnCloseLogs">CLOSE</button>
+            </div>
+            <div class="search-wrapper">
+                <input id="searchInput" type="text" placeholder="Filter evolution...">
+            </div>
+        </div>
+        <div id="commitList" class="commit-list"></div>
+    </aside>
+
+    <main class="main-content">
+        <div class="content-header">
+            <div class="tabs">
+                <div id="tabSpec" class="tab active">THE_LEDGER</div>
+                <div id="tabTimeline" class="tab">DIAGNOSTICS</div>
+                <div id="tabDiff" class="tab">DELTA</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <button id="btnDiffMode" class="btn-lab hidden" style="border-color: var(--text-4);">MODE: LINE</button>
+                <div id="activeLabel" style="font-size: 10px; font-family: var(--font-mono); color: var(--text-3);"></div>
+            </div>
+        </div>
+
+        <div class="viewport">
+            <div id="viewSpec" class="scroll-pane"><div id="specContainer" class="spec-container"><div id="specContent" class="spec-content"></div></div></div>
+            <div id="viewTimeline" class="hidden scroll-pane">
+                <div id="chartVelocity" style="height: 250px; margin-bottom: 30px;"></div>
+                <div id="chartDistribution" style="height: 250px; margin-bottom: 30px;"></div>
+                <div id="chartMass" style="height: 350px;"></div>
+                <div style="position: absolute; top: 20px; right: 20px;" class="tabs mobile-hide">
+                    <button class="btn-lab" id="btnDay">1D</button><button class="btn-lab" id="btnHour">1H</button><button class="btn-lab" id="btn15m">15M</button><button class="btn-lab" id="btn5m">5M</button>
+                </div>
+            </div>
+            <div id="viewDiff" class="hidden scroll-pane"><div id="diffContent"></div></div>
+        </div>
+    </main>
+</div>
+
+<footer class="dock">
+    <div class="evolution-map">
+        <canvas id="mapCanvas" class="map-canvas"></canvas>
+        <input id="commitSlider" class="map-slider" type="range" min="0" max="100" value="0">
+    </div>
+    
+    <div class="dock-bottom">
+        <div style="display: flex; gap: 8px;">
+            <button id="btnPrev" class="btn-lab">PREV</button>
+            <button id="btnPlay" class="btn-lab btn-play">REANIMATE</button>
+            <button id="btnNext" class="btn-lab">NEXT</button>
+            <button id="btnFocus" class="btn-lab" style="color: var(--primary); border-color: var(--primary-dim);">FOCUS</button>
+        </div>
+
+        <div style="text-align: right; font-family: var(--font-mono); flex: 1; overflow: hidden;" class="mobile-hide">
+            <div id="dockSubject" style="font-size: 12px; font-weight: 600; color: var(--text-1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">-</div>
+            <div id="dockDetails" style="font-size: 9px; color: var(--text-3); text-transform: uppercase;">-</div>
+        </div>
+    </div>
+</footer>
+</div>
+
+<button class="btn-focus-exit" id="btnFocusExit">EXIT FOCUS</button>
+
+<div class="legend-overlay" id="legendOverlay">
+    <div class="legend-card">
+        <h3 style="margin: 0 0 16px 0; font-size: 14px; color: var(--text-1); border-bottom: 1px solid var(--border); padding-bottom: 12px;">Evolutionary Categories</h3>
+        <div class="legend-grid" id="legendGrid"></div>
+        <button class="btn-lab" style="width: 100%; margin-top: 20px; text-align: center;" id="btnCloseLegend">CLOSE</button>
+    </div>
+</div>
+
+<!-- Deps -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+
+<script type="module">
+    import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
+
+    const CANONICAL_ORIGIN = "https://frankensqlite.com";
+    const DB_FILENAME = "spec_evolution_v1.sqlite3";
+    const DB_URL = `${CANONICAL_ORIGIN}/${DB_FILENAME}`;
+    const CANONICAL_HOSTS = new Set(["frankensqlite.com", "www.frankensqlite.com", "frankensqlite-spec-evolution.pages.dev"]);
+    const BUCKETS = [
+        { id: 1, name: "Logic/Math", color: "#39ff14", desc: "Fixing outright mistakes in logic, math, or reasoning." },
+        { id: 2, name: "Legacy SQLite", color: "#adff2f", desc: "Fixing inaccurate statements about the existing sqlite legacy codebase." },
+        { id: 3, name: "Asupersync", color: "#00ff00", desc: "Fixing inaccurate statements about the existing asupersync library codebase." },
+        { id: 4, name: "Architecture", color: "#ff003c", desc: "Fixing conceptual errors or architectural mistakes." },
+        { id: 5, name: "Ministerial", color: "#71717a", desc: "Ministerial/scrivening fixes (e.g., renumbering properly, fixing references, etc)." },
+        { id: 6, name: "Context", color: "#d946ef", desc: "Addition of extra background information or context to make the spec more self-contained and complete." },
+        { id: 7, name: "Engineering", color: "#06b6d4", desc: "Improvements to the spec based on standard computer engineering concepts (e.g., better cache friendliness, better concurrency management, etc.)." },
+        { id: 8, name: "Alien Artifact", color: "#8b5cf6", desc: "Improvements to the spec based on the application of the 'alien artifact' approach: extremely advanced and esoteric/abstruse math rarely seen in applied computer science." },
+        { id: 9, name: "Clarification", color: "#14b8a6", desc: "Further elaboration or clarification of what is already there without making substantive improvements or fixes." },
+        { id: 10, name: "General/Other", color: "#52525b", desc: "A generic 'catch all' umbrella category for all other changes that don't fit nicely within each of the preceding 9 categories." }
+    ];
+
+    let DB = null;
+    let COMMITS = [];
+    let FILTERED = []; 
+    let GROUPS = new Map();
+    let DOC_CACHE = new Map();
+    let PATCH_CACHE = new Map();
+    let METRICS = [];
+    let BASE_DOC = "";
+    
+    const STATE = { 
+        idx: 0, 
+        q: "", 
+        tab: "spec", 
+        timeBucket: "day", 
+        playing: false, 
+        playInterval: null,
+        activeBuckets: new Set(),
+        diffMode: 'line-by-line',
+        renderNonce: 0 
+    };
+
+    const DEPENDENCY_URLS = {
+        markdownIt: "https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js",
+        domPurify: "https://cdn.jsdelivr.net/npm/dompurify@3.1.0/dist/purify.min.js",
+        diff2Html: "https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html.min.js",
+        diff2HtmlCss: "https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css",
+        hljs: "https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js",
+        hljsCss: "https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css",
+    };
+
+    const DEPENDENCY_PROMISES = new Map();
+    const DEPENDENCY_ATTEMPTS = new Map();
+
+    function monotonicNowMs() {
+        if (typeof performance !== "undefined" && typeof performance.now === "function") {
+            return performance.now();
+        }
+        return Date.now();
+    }
+
+    function emitStructuredLog(level, event, payload = {}) {
+        const body = { event, ...payload };
+        const line = JSON.stringify(body);
+        if (level === "error") console.error(line);
+        else if (level === "warn") console.warn(line);
+        else console.info(line);
+    }
+
+    function nextDependencyAttempt(dep) {
+        const attempt = (DEPENDENCY_ATTEMPTS.get(dep) || 0) + 1;
+        DEPENDENCY_ATTEMPTS.set(dep, attempt);
+        return attempt;
+    }
+
+    function startRenderPass(panel) {
+        const start = monotonicNowMs();
+        emitStructuredLog("info", "spec_viz_render_start", { panel });
+        if (typeof performance !== "undefined" && typeof performance.mark === "function") {
+            try { performance.mark(`spec_viz_render_start:${panel}`); } catch (_e) {}
+        }
+        return start;
+    }
+
+    function finishRenderPass(panel, startedAt, nodeCount) {
+        const durationMs = Math.round(monotonicNowMs() - startedAt);
+        emitStructuredLog("info", "spec_viz_render_finish", {
+            panel,
+            duration_ms: durationMs,
+            node_count: nodeCount,
+        });
+        if (typeof performance !== "undefined" &&
+            typeof performance.mark === "function" &&
+            typeof performance.measure === "function") {
+            try {
+                performance.mark(`spec_viz_render_finish:${panel}`);
+                performance.measure(
+                    `spec_viz_render:${panel}`,
+                    `spec_viz_render_start:${panel}`,
+                    `spec_viz_render_finish:${panel}`
+                );
+            } catch (_e) {}
+        }
+    }
+
+    function logFallback(panel, reason, error) {
+        emitStructuredLog("warn", "spec_viz_fallback_activated", {
+            panel,
+            reason,
+            error: error ? String(error && (error.message || error)) : undefined,
+        });
+    }
+
+    function clearFallbackBanner(root) {
+        const existing = root.querySelector("[data-spec-viz-fallback-banner='1']");
+        if (existing) existing.remove();
+    }
+
+    function showFallbackBanner(root, message) {
+        clearFallbackBanner(root);
+        const banner = document.createElement("div");
+        banner.setAttribute("data-spec-viz-fallback-banner", "1");
+        banner.className = "spec-fallback-banner";
+        banner.textContent = message;
+        root.prepend(banner);
+    }
+
+    function renderEscapedFallback(root, text, message) {
+        root.innerHTML = "";
+        showFallbackBanner(root, message);
+        const pre = document.createElement("pre");
+        pre.className = "spec-fallback-pre";
+        pre.textContent = text || "";
+        root.appendChild(pre);
+    }
+
+    function loadScriptDependency(dep, url) {
+        if (DEPENDENCY_PROMISES.has(dep)) return DEPENDENCY_PROMISES.get(dep);
+
+        const attempt = nextDependencyAttempt(dep);
+        const startedAt = monotonicNowMs();
+        emitStructuredLog("info", "spec_viz_dependency_load_start", { dep, url, attempt });
+
+        const promise = new Promise((resolve, reject) => {
+            const selector = `script[data-spec-viz-dep="${dep}"]`;
+            let script = document.querySelector(selector);
+            if (script && script.dataset.loaded === "true") {
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: 0,
+                });
+                resolve();
+                return;
+            }
+
+            if (!script) {
+                script = document.createElement("script");
+                script.src = url;
+                script.async = true;
+                script.defer = true;
+                script.setAttribute("data-spec-viz-dep", dep);
+            }
+
+            const cleanup = () => {
+                script.removeEventListener("load", onLoad);
+                script.removeEventListener("error", onError);
+            };
+
+            const onLoad = () => {
+                cleanup();
+                script.dataset.loaded = "true";
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                resolve();
+            };
+
+            const onError = () => {
+                cleanup();
+                DEPENDENCY_PROMISES.delete(dep);
+                emitStructuredLog("error", "spec_viz_dependency_load_failure", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                reject(new Error(`Dependency load failed: ${dep}`));
+            };
+
+            script.addEventListener("load", onLoad, { once: true });
+            script.addEventListener("error", onError, { once: true });
+            if (!script.parentNode) document.head.appendChild(script);
+        });
+
+        DEPENDENCY_PROMISES.set(dep, promise);
+        return promise;
+    }
+
+    function loadStyleDependency(dep, url) {
+        if (DEPENDENCY_PROMISES.has(dep)) return DEPENDENCY_PROMISES.get(dep);
+
+        const attempt = nextDependencyAttempt(dep);
+        const startedAt = monotonicNowMs();
+        emitStructuredLog("info", "spec_viz_dependency_load_start", { dep, url, attempt });
+
+        const promise = new Promise((resolve, reject) => {
+            const selector = `link[data-spec-viz-dep="${dep}"]`;
+            let link = document.querySelector(selector);
+            if (link && link.dataset.loaded === "true") {
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: 0,
+                });
+                resolve();
+                return;
+            }
+
+            if (!link) {
+                link = document.createElement("link");
+                link.rel = "stylesheet";
+                link.href = url;
+                link.setAttribute("data-spec-viz-dep", dep);
+            }
+
+            const cleanup = () => {
+                link.removeEventListener("load", onLoad);
+                link.removeEventListener("error", onError);
+            };
+
+            const onLoad = () => {
+                cleanup();
+                link.dataset.loaded = "true";
+                emitStructuredLog("info", "spec_viz_dependency_load_finish", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                resolve();
+            };
+
+            const onError = () => {
+                cleanup();
+                DEPENDENCY_PROMISES.delete(dep);
+                emitStructuredLog("error", "spec_viz_dependency_load_failure", {
+                    dep,
+                    url,
+                    attempt,
+                    duration_ms: Math.round(monotonicNowMs() - startedAt),
+                });
+                reject(new Error(`Dependency load failed: ${dep}`));
+            };
+
+            link.addEventListener("load", onLoad, { once: true });
+            link.addEventListener("error", onError, { once: true });
+            if (!link.parentNode) document.head.appendChild(link);
+        });
+
+        DEPENDENCY_PROMISES.set(dep, promise);
+        return promise;
+    }
+
+    async function ensureMarkdown() {
+        await Promise.all([
+            loadScriptDependency("markdown-it", DEPENDENCY_URLS.markdownIt),
+            loadScriptDependency("dompurify", DEPENDENCY_URLS.domPurify),
+        ]);
+        if (typeof window.markdownit !== "function" || !window.DOMPurify) {
+            throw new Error("markdown-it / DOMPurify unavailable after load");
+        }
+    }
+
+    async function ensureDiff() {
+        await Promise.all([
+            loadScriptDependency("diff2html", DEPENDENCY_URLS.diff2Html),
+            loadStyleDependency("diff2html-css", DEPENDENCY_URLS.diff2HtmlCss),
+            loadScriptDependency("dompurify", DEPENDENCY_URLS.domPurify),
+        ]);
+        if (!window.Diff2Html || !window.DOMPurify) {
+            throw new Error("Diff2Html / DOMPurify unavailable after load");
+        }
+    }
+
+    async function ensureHighlight() {
+        await Promise.all([
+            loadScriptDependency("hljs", DEPENDENCY_URLS.hljs),
+            loadStyleDependency("hljs-css", DEPENDENCY_URLS.hljsCss),
+        ]);
+        if (!window.hljs) {
+            throw new Error("highlight.js unavailable after load");
+        }
+    }
+
+    // --- Initialization ---
+
+    function fetchAsArrayBuffer(url) {
+        // XHR handles binary responses more reliably than fetch on iOS Safari,
+        // where Brotli-compressed arrayBuffer() responses can arrive corrupted.
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", url, true);
+            xhr.responseType = "arraybuffer";
+            xhr.setRequestHeader("Cache-Control", "no-cache");
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+                else reject(new Error(`HTTP ${xhr.status} fetching ${url}`));
+            };
+            xhr.onerror = () => reject(new Error(`Network error fetching ${url}`));
+            xhr.send();
+        });
+    }
+
+    function enforceCanonicalHost() {
+        const host = window.location.hostname.toLowerCase();
+        if (!CANONICAL_HOSTS.has(host)) return false;
+        if (window.location.origin === CANONICAL_ORIGIN) return false;
+        const target = new URL(window.location.href);
+        target.protocol = "https:";
+        target.host = "frankensqlite.com";
+        window.location.replace(target.toString());
+        return true;
+    }
+
+    function sqliteMagicPrefix(bytes) {
+        return new TextDecoder().decode(bytes.slice(0, 15));
+    }
+
+    function buildDbCandidates() {
+        const candidates = [];
+        const seen = new Set();
+        const push = (value) => {
+            let parsed;
+            try {
+                parsed = new URL(value, window.location.origin);
+            } catch {
+                return;
+            }
+            const href = parsed.toString();
+            if (seen.has(href)) return;
+            seen.add(href);
+            candidates.push(href);
+        };
+
+        push(DB_URL);
+        push(`/${DB_FILENAME}`);
+        push(DB_FILENAME);
+        push(`${CANONICAL_ORIGIN}/${DB_FILENAME}`);
+
+        // Some stale clients cached a query-string DB URL; always retry stripped variants.
+        for (const href of [...candidates]) {
+            const stripped = new URL(href);
+            stripped.search = "";
+            stripped.hash = "";
+            push(stripped.toString());
+        }
+        return candidates;
+    }
+
+    async function loadSqliteBytes() {
+        const candidates = buildDbCandidates();
+        const failures = [];
+        for (const candidate of candidates) {
+            try {
+                const buf = await fetchAsArrayBuffer(candidate);
+                const bytes = new Uint8Array(buf);
+                const magic = sqliteMagicPrefix(bytes);
+                if (magic === "SQLite format 3") {
+                    return bytes;
+                }
+                failures.push(`${candidate} -> not SQLite (${bytes.byteLength} bytes, starts with "${magic.slice(0,12)}...")`);
+            } catch (e) {
+                failures.push(`${candidate} -> ${e.message || String(e)}`);
+            }
+        }
+        throw new Error(`Could not load SQLite database after trying ${candidates.length} URL(s): ${failures.join(" | ")}`);
+    }
+
+    const PREFERS_REDUCED_MOTION =
+        typeof window !== "undefined" &&
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    const LAB_EFFECTS = {
+        disabled: new Set(),
+        logged: new Set(),
+    };
+
+    function logOnce(key, payload) {
+        if (LAB_EFFECTS.logged.has(key)) return;
+        LAB_EFFECTS.logged.add(key);
+        console.info(JSON.stringify(payload));
+    }
+
+    function disableEffect(effect, reason, error) {
+        LAB_EFFECTS.disabled.add(effect);
+        logOnce(`disabled:${effect}`, {
+            event: "spec_viz_effect_disabled",
+            effect,
+            reason,
+            error: error ? String(error && (error.message || error)) : undefined,
+        });
+    }
+
+    function runEffect(effect, fn) {
+        if (PREFERS_REDUCED_MOTION) return;
+        if (LAB_EFFECTS.disabled.has(effect)) return;
+        try {
+            fn();
+        } catch (e) {
+            disableEffect(effect, "exception", e);
+        }
+    }
+
+    function createDataPacket() {
+        // Optional visual flourish: never allow this to crash the viz.
+        const body = document.body;
+        if (!body) return;
+
+        const packet = document.createElement("div");
+        packet.setAttribute("data-spec-viz-packet", "1");
+        packet.style.position = "fixed";
+        packet.style.zIndex = "9999";
+        packet.style.width = "6px";
+        packet.style.height = "6px";
+        packet.style.borderRadius = "999px";
+        packet.style.background = "rgba(57, 255, 20, 0.9)";
+        packet.style.boxShadow = "0 0 12px rgba(57, 255, 20, 0.55)";
+        packet.style.pointerEvents = "none";
+
+        const w = Math.max(1, window.innerWidth || 1);
+        const h = Math.max(1, window.innerHeight || 1);
+        const startX = Math.floor(Math.random() * w * 0.3);
+        const endX = Math.floor(w * (0.7 + Math.random() * 0.3));
+        const y = Math.floor(h * (0.55 + Math.random() * 0.35));
+
+        packet.style.left = `${startX}px`;
+        packet.style.top = `${y}px`;
+        packet.style.opacity = "0";
+        body.appendChild(packet);
+
+        const cleanup = () => packet.remove();
+
+        if (typeof packet.animate === "function") {
+            const anim = packet.animate(
+                [
+                    { transform: "translate3d(0, 0, 0) scale(0.8)", opacity: 0 },
+                    { transform: `translate3d(${endX - startX}px, -16px, 0) scale(1)`, opacity: 1 },
+                    { transform: `translate3d(${endX - startX}px, -24px, 0) scale(0.9)`, opacity: 0 },
+                ],
+                {
+                    duration: 900,
+                    iterations: 1,
+                    easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+                    fill: "forwards",
+                }
+            );
+            anim.addEventListener("finish", cleanup, { once: true });
+            anim.addEventListener("cancel", cleanup, { once: true });
+            return;
+        }
+
+        // Fallback: no WAAPI support; best-effort render and remove.
+        packet.style.opacity = "1";
+        setTimeout(cleanup, 900);
+    }
+
+    function isSelftestMode() {
+        const params = new URLSearchParams(window.location.search);
+        return params.get("selftest") === "1" || window.location.hash.includes("selftest");
+    }
+
+    function renderSelftestResult(ok, error) {
+        const el = document.createElement("div");
+        el.id = "specVizSelftest";
+        el.textContent = ok ? "SPEC_VIZ_SELFTEST_PASS" : "SPEC_VIZ_SELFTEST_FAIL";
+        el.style.position = "fixed";
+        el.style.left = "8px";
+        el.style.bottom = "8px";
+        el.style.zIndex = "10000";
+        el.style.fontFamily = "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace";
+        el.style.fontSize = "11px";
+        el.style.padding = "6px 8px";
+        el.style.border = "1px solid rgba(255,255,255,0.12)";
+        el.style.background = "rgba(0,0,0,0.72)";
+        el.style.color = ok ? "rgba(57, 255, 20, 0.95)" : "rgba(255, 0, 60, 0.95)";
+        document.body.appendChild(el);
+
+        console.info(
+            JSON.stringify({
+                event: "spec_viz_selftest",
+                result: ok ? "pass" : "fail",
+                error: error ? String(error && (error.message || error)) : undefined,
+            })
+        );
+    }
+
+    function runSelftest() {
+        try {
+            createDataPacket();
+            renderSelftestResult(true, null);
+        } catch (e) {
+            renderSelftestResult(false, e);
+        }
+    }
+
+    async function init() {
+        try {
+            const SQL = await window.initSqlJs({ locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` });
+            const bytes = await loadSqliteBytes();
+            DB = new SQL.Database(bytes);
+            
+            const baseRes = DB.exec("SELECT text FROM base_doc LIMIT 1");
+            if (baseRes.length) BASE_DOC = baseRes[0].values[0][0];
+            
+            loadCommits();
+            loadGroups();
+            setupEventListeners();
+            initBucketFilters();
+            syncNeuralFilters();
+            
+            // Initial Render
+            renderCommitList(true);
+            drawSynapticMap();
+
+            await computeSynapticMetrics();
+            
+            // Deep Linking
+            const hash = window.location.hash;
+            let startIdx = COMMITS.length - 1;
+            if (hash.startsWith("#entry-")) {
+                const requested = parseInt(hash.replace("#entry-", ""));
+                if (!isNaN(requested)) startIdx = requested;
+            }
+            
+            await selectCommit(startIdx, true);
+            
+            hideLoader();
+            
+            window.addEventListener("hashchange", () => {
+                const newHash = window.location.hash;
+                if (newHash.startsWith("#entry-")) {
+                    const idx = parseInt(newHash.replace("#entry-", ""));
+                    if (!isNaN(idx) && idx !== STATE.idx) selectCommit(idx, true);
+                }
+            });
+        } catch (e) {
+            console.error(e);
+            document.getElementById("loadingOverlay").innerHTML = `<div style="color:var(--accent-error); font-family:var(--font-mono); font-size:12px;">INIT_FAILURE: ${e.message}</div>`;
+        }
+    }
+
+    function loadCommits() {
+        const res = DB.exec("SELECT idx, hash, short, date_iso, author, subject, add_lines, del_lines, impact, primary_bucket, labels_json FROM commits ORDER BY idx ASC");
+        if (!res.length) return;
+        COMMITS = res[0].values.map(r => ({ 
+            idx: r[0], hash: r[1], short: r[2], date: r[3], author: r[4], 
+            subject: r[5], add: r[6], del: r[7], impact: r[8], 
+            primary: r[9], labels: JSON.parse(r[10]) 
+        }));
+        document.getElementById("commitSlider").max = COMMITS.length - 1;
+        document.getElementById("kpiCommits").textContent = COMMITS.length;
+    }
+
+    function loadGroups() {
+        const res = DB.exec("SELECT commit_hash, labels_json FROM change_groups");
+        if (!res.length) return;
+        res[0].values.forEach(r => {
+            if (!GROUPS.has(r[0])) GROUPS.set(r[0], []);
+            GROUPS.get(r[0]).push(...JSON.parse(r[1]));
+        });
+    }
+
+    // --- Interactions ---
+
+    window.selectCommit = async function(idx, animateScroll = true, isAuto = false) {
+        if (!isAuto && STATE.playing) togglePlay();
+
+        const targetIdx = Math.max(0, Math.min(COMMITS.length - 1, idx));
+        if (targetIdx === STATE.idx && document.querySelector(".commit-card.selected")) {
+             await updateView();
+             return;
+        }
+        
+        STATE.idx = targetIdx;
+        document.getElementById("commitSlider").value = STATE.idx;
+        history.replaceState(null, null, `#entry-${STATE.idx}`);
+        
+        const c = COMMITS[STATE.idx];
+        const subjectEl = document.getElementById("dockSubject");
+        if (subjectEl) subjectEl.textContent = c.subject;
+        const detailsEl = document.getElementById("dockDetails");
+        if (detailsEl) detailsEl.textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
+        
+        const activeLabel = document.getElementById("activeLabel");
+        if (activeLabel) activeLabel.textContent = `LOG_ENTRY_${STATE.idx} // ${c.short}`;
+
+        renderCommitList();
+        const newSel = document.querySelector(`.commit-card[data-idx="${STATE.idx}"]`);
+        if (newSel && animateScroll) newSel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+
+        // Reset scroll for manual navigation
+        if (!isAuto) document.querySelectorAll(".scroll-pane").forEach(el => el.scrollTop = 0);
+
+        await updateView();
+
+        // Optional effects are never allowed to crash the viz.
+        runEffect("createDataPacket", createDataPacket);
+    };
+
+    function initBucketFilters() {
+        const filterContainer = document.createElement("div");
+        filterContainer.id = "bucketFilters";
+        filterContainer.innerHTML = BUCKETS.map(b => `
+            <div class="filter-pill" data-id="${b.id}" style="color: ${b.color}cc" title="${b.desc}">
+                ${b.name}
+            </div>
+        `).join("");
+        
+        const sidebarHeader = document.querySelector(".sidebar-header");
+        sidebarHeader.appendChild(filterContainer);
+
+        filterContainer.querySelectorAll(".filter-pill").forEach(pill => {
+            pill.addEventListener("click", () => {
+                const id = parseInt(pill.dataset.id);
+                if (STATE.activeBuckets.has(id)) {
+                    STATE.activeBuckets.delete(id);
+                    pill.classList.remove("active");
+                } else {
+                    STATE.activeBuckets.add(id);
+                    pill.classList.add("active");
+                }
+                syncNeuralFilters();
+                renderCommitList();
+            });
+        });
+    }
+
+    function togglePlay() {
+        const btn = document.getElementById("btnPlay");
+        if (STATE.playing) {
+            if (STATE.playInterval) clearInterval(STATE.playInterval);
+            STATE.playing = false;
+            btn.textContent = "REANIMATE";
+            btn.style.color = "var(--text-2)";
+            renderCommitList();
+        } else {
+            if (FILTERED.length === 0) return;
+            STATE.playing = true;
+            btn.textContent = "SUSPEND";
+            btn.style.color = "var(--primary)";
+            renderCommitList();
+            STATE.playInterval = setInterval(() => {
+                if (FILTERED.length === 0) { togglePlay(); return; }
+                // Find next index in FILTERED
+                const nextIdx = FILTERED.findIndex(c => c.idx > STATE.idx);
+                if (nextIdx !== -1) {
+                    selectCommit(FILTERED[nextIdx].idx, true, true);
+                } else if (FILTERED.length > 0 && STATE.idx < FILTERED[0].idx) {
+                    selectCommit(FILTERED[0].idx, true, true);
+                } else {
+                    togglePlay(); // End of filtered list
+                }
+            }, 1500);
+        }
+    }
+
+    async function updateView() {
+        const nonce = ++STATE.renderNonce;
+        const container = document.getElementById("view" + STATE.tab.charAt(0).toUpperCase() + STATE.tab.slice(1));
+        
+        // Out animation
+        await animate(container, { opacity: 0.5, y: 5 }, { duration: 0.1 }).finished;
+        
+        // Check if we were superseded during animation
+        if (nonce !== STATE.renderNonce) return;
+
+        if (STATE.tab === "spec") await renderSpec(nonce);
+        else if (STATE.tab === "timeline") renderCharts(nonce);
+        else if (STATE.tab === "diff") await renderDiff(nonce);
+        
+        // In animation
+        if (nonce === STATE.renderNonce) {
+            animate(container, { opacity: 1, y: 0 }, { duration: 0.3, easing: spring() });
+        }
+    }
+
+    async function renderSpec(nonce) {
+        const renderStartedAt = startRenderPass("spec");
+        const el = document.getElementById("specContent");
+        const targetIdx = STATE.idx;
+        const text = await reconstructSnapshot(targetIdx);
+
+        if (nonce !== STATE.renderNonce) return;
+
+        try {
+            await ensureMarkdown();
+            if (nonce !== STATE.renderNonce) return;
+
+            const md = window.markdownit({ html: true });
+            el.innerHTML = window.DOMPurify.sanitize(md.render(text));
+            clearFallbackBanner(el);
+
+            // --- Feature: Responsive Tables & Diff Highlight ---
+            enhanceTables(el);
+            await highlightDiffContext(el, targetIdx);
+
+            const codeBlocks = el.querySelectorAll("pre code");
+            if (codeBlocks.length > 0) {
+                try {
+                    await ensureHighlight();
+                    if (nonce !== STATE.renderNonce) return;
+                    if (window.hljs && typeof window.hljs.highlightElement === "function") {
+                        codeBlocks.forEach((block) => window.hljs.highlightElement(block));
+                    }
+                } catch (e) {
+                    logFallback("spec", "highlight_dependency_failed", e);
+                    showFallbackBanner(el, "Code highlighting unavailable (dependency load failed).");
+                }
+            }
+        } catch (e) {
+            logFallback("spec", "markdown_dependency_failed", e);
+            renderEscapedFallback(
+                el,
+                text,
+                "Spec renderer dependencies unavailable. Displaying raw markdown."
+            );
+        } finally {
+            const kpiLines = document.getElementById("kpiLines");
+            if (kpiLines) kpiLines.textContent = text.split("\n").length.toLocaleString();
+            finishRenderPass("spec", renderStartedAt, el.querySelectorAll("*").length);
+        }
+    }
+
+    function enhanceTables(root) {
+        root.querySelectorAll("table").forEach(table => {
+            const headers = Array.from(table.querySelectorAll("th")).map(th => th.textContent.trim());
+            table.querySelectorAll("tr").forEach(tr => {
+                tr.querySelectorAll("td").forEach((td, i) => {
+                    if (headers[i]) td.setAttribute("data-label", headers[i]);
+                });
+            });
+        });
+    }
+
+    function stripMd(text) {
+        return text.replace(/^#+\s+/, "")
+                   .replace(/^[*+-]\s+/, "")
+                   .replace(/^\d+\.\s+/, "")
+                   .replace(/^>\s+/, "")
+                   .replace(/[*_~`]/g, "")
+                   .trim();
+    }
+
+    async function highlightDiffContext(root, idx) {
+        try {
+            const p = await getPatch(idx);
+            if (!p) return;
+            
+            const addedLines = new Set();
+            p.split("\n").forEach(line => {
+                if (line.startsWith("+") && !line.startsWith("+++")) {
+                    const content = stripMd(line.slice(1));
+                    if (content.length > 6) addedLines.add(content);
+                }
+            });
+
+            if (addedLines.size === 0) return;
+
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+            const nodesToReplace = [];
+            
+            let node;
+            while(node = walker.nextNode()) {
+                const txt = stripMd(node.textContent);
+                if (txt.length > 6 && addedLines.has(txt)) {
+                    nodesToReplace.push(node);
+                }
+            }
+
+            // Batch DOM updates
+            nodesToReplace.forEach(node => {
+                if (node.parentNode && !node.parentNode.classList.contains("diff-highlight")) {
+                    const span = document.createElement("span");
+                    span.className = "diff-highlight";
+                    span.textContent = node.textContent;
+                    node.parentNode.replaceChild(span, node);
+                }
+            });
+        } catch (e) {
+            console.warn("Diff highlight failed", e);
+        }
+    }
+
+    function toggleFocusMode() {
+        document.body.classList.toggle("focus-mode");
+    }
+
+    function initLegend() {
+        const grid = document.getElementById("legendGrid");
+        grid.innerHTML = BUCKETS.map(b => `
+            <div class="legend-item" title="${b.desc}">
+                <div class="legend-item-header">
+                    <div class="legend-dot" style="background: ${b.color}"></div>
+                    <span class="legend-item-name">${b.name}</span>
+                </div>
+                <div class="legend-item-desc">${b.desc}</div>
+            </div>
+        `).join("");
+        
+        document.getElementById("btnShowLegend").addEventListener("click", () => document.getElementById("legendOverlay").classList.add("active"));
+        document.getElementById("btnCloseLegend").addEventListener("click", () => document.getElementById("legendOverlay").classList.remove("active"));
+        document.getElementById("legendOverlay").addEventListener("click", (e) => {
+            if (e.target.id === "legendOverlay") e.target.classList.remove("active");
+        });
+    }
+
+    async function reconstructSnapshot(idx) {
+        if (DOC_CACHE.has(idx)) return DOC_CACHE.get(idx);
+        // Find nearest checkpoint
+        let startIdx = 0;
+        let lines = BASE_DOC.split("\n");
+        for (let i = Math.floor(idx / 10) * 10; i >= 0; i -= 10) {
+            if (DOC_CACHE.has(i)) {
+                startIdx = i + 1;
+                lines = DOC_CACHE.get(i).split("\n");
+                break;
+            }
+        }
+        for (let i = startIdx; i <= idx; i++) {
+            const p = await getPatch(i);
+            if (p) lines = applySynapticPatch(lines, p);
+            if (i % 10 === 0 && !DOC_CACHE.has(i)) DOC_CACHE.set(i, lines.join("\n"));
+        }
+        const res = lines.join("\n");
+        DOC_CACHE.set(idx, res);
+        return res;
+    }
+
+    function applySynapticPatch(lines, patch) {
+        // Use slice() instead of spread for large array safety
+        const out = lines.slice();
+        const patchLines = patch.split("\n");
+        let offset = 0;
+        for (let i = 0; i < patchLines.length; i++) {
+            const line = patchLines[i];
+            if (line.startsWith("@@")) {
+                const m = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+                if (m) {
+                    const os = parseInt(m[1]), oc = parseInt(m[2] || "1");
+                    const startPos = os - 1 + offset;
+                    const newSeg = [];
+                    i++;
+                    while (i < patchLines.length && patchLines[i] && !patchLines[i].startsWith("@@")) {
+                        const row = patchLines[i];
+                        if (row.startsWith("+")) newSeg.push(row.slice(1));
+                        else if (!row.startsWith("-")) newSeg.push(row.slice(1));
+                        i++;
+                    }
+                    i--;
+                    
+                    // Batched splice implementation with safe chunk size
+                    const CHUNK_SIZE = 5000;
+                    if (newSeg.length > CHUNK_SIZE) {
+                        // Remove the old segment first
+                        out.splice(startPos, oc);
+                        // Insert new segment in chunks
+                        for (let j = 0; j < newSeg.length; j += CHUNK_SIZE) {
+                            const chunk = newSeg.slice(j, j + CHUNK_SIZE);
+                            out.splice(startPos + j, 0, ...chunk);
+                        }
+                    } else {
+                        out.splice(startPos, oc, ...newSeg);
+                    }
+                    
+                    offset += (parseInt(m[4] || "1") - oc);
+                }
+            }
+        }
+        return out;
+    }
+
+    async function getPatch(idx) {
+        if (PATCH_CACHE.has(idx)) return PATCH_CACHE.get(idx);
+        const res = DB.exec("SELECT patch FROM patches WHERE idx = ?", [idx]);
+        const p = res.length ? res[0].values[0][0] : "";
+        PATCH_CACHE.set(idx, p); return p;
+    }
+
+    async function computeSynapticMetrics() {
+        let lines = BASE_DOC.split("\n");
+        for (let i = 0; i < COMMITS.length; i++) {
+            const p = await getPatch(i);
+            if (p) lines = applySynapticPatch(lines, p);
+            const text = lines.join("\n");
+            const tokens = text.split(/\s+/).length;
+            METRICS.push({ lines: lines.length, tokens, lev: COMMITS[i].impact || 0 });
+            if (i % 10 === 0) DOC_CACHE.set(i, text);
+        }
+    }
+
+    async function renderDiff(nonce) {
+        const renderStartedAt = startRenderPass("diff");
+        const el = document.getElementById("diffContent");
+        const p = await getPatch(STATE.idx);
+
+        if (nonce !== STATE.renderNonce) return;
+
+        if (!p) {
+            el.innerHTML = "<div style='padding:20px; color:var(--text-3)'>NO DELTA</div>";
+            finishRenderPass("diff", renderStartedAt, 1);
+            return;
+        }
+
+        try {
+            await ensureDiff();
+            if (nonce !== STATE.renderNonce) return;
+
+            const diffHtml = window.Diff2Html.html(p, {
+                drawFileList: false,
+                matching: "lines",
+                outputFormat: STATE.diffMode,
+                colorScheme: "dark",
+            });
+            el.innerHTML = window.DOMPurify.sanitize(diffHtml);
+            clearFallbackBanner(el);
+        } catch (e) {
+            logFallback("diff", "diff_dependency_failed", e);
+            renderEscapedFallback(
+                el,
+                p,
+                "Diff renderer dependencies unavailable. Displaying unified patch text."
+            );
+        } finally {
+            finishRenderPass("diff", renderStartedAt, el.querySelectorAll("*").length);
+        }
+    }
+
+    // --- Visuals & Animation ---
+
+    function renderCommitList(animateEntry = false) {
+        const container = document.getElementById("commitList");
+        container.innerHTML = FILTERED.slice().reverse().map(c => {
+            const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
+            const isSelected = c.idx === STATE.idx;
+            const classes = ["commit-card"];
+            if (isSelected) classes.push("selected");
+            if (isSelected && STATE.playing) classes.push("playing");
+            
+            const highImpact = c.impact > 200;
+            const medImpact = c.impact > 50 && c.impact <= 200;
+
+            return `
+                <div class="${classes.join(" ")}" 
+                     data-idx="${c.idx}" 
+                     data-impact-high="${highImpact}"
+                     data-impact-med="${medImpact}"
+                     onclick="window.selectCommit(${c.idx}); toggleSidebar(false);">
+                    <div class="commit-card-header">
+                        <span>#${c.idx}</span>
+                        <span>${dayjs(c.date).format("MMM DD")}</span>
+                    </div>
+                    <div class="commit-card-subject">${escapeHtml(c.subject)}</div>
+                    <div class="commit-card-meta">
+                        <span class="tag-pill" style="color:${b.color}; border:1px solid ${b.color}20" title="${b.desc}">${b.name}</span>
+                        <span style="color:var(--text-3); font-size:10px;">+${c.add} / -${c.del}</span>
+                    </div>
+                </div>`;
+        }).join("");
+
+        if (animateEntry) {
+            animate(".commit-card", 
+                { opacity: [0, 1], x: [-10, 0] }, 
+                { delay: stagger(0.02), duration: 0.3, easing: "ease-out" }
+            );
+        }
+    }
+
+    function drawSynapticMap() {
+        const cvs = document.getElementById("mapCanvas");
+        const ctx = cvs.getContext("2d");
+        const w = cvs.width = cvs.clientWidth;
+        const h = cvs.height = cvs.clientHeight;
+        if (!w || !h || COMMITS.length === 0) return;
+        ctx.clearRect(0, 0, w, h);
+        const barW = w / COMMITS.length;
+        COMMITS.forEach((c, i) => {
+            const labels = GROUPS.get(c.hash) || c.labels;
+            const buckets = labels.length ? labels : [10];
+            const counts = {}; buckets.forEach(l => counts[l] = (counts[l] || 0) + 1);
+            const total = buckets.length;
+            let cy = 0;
+            Object.keys(counts).forEach(l => {
+                const b = BUCKETS.find(x => x.id == l) || BUCKETS[9];
+                const sh = (counts[l] / total) * h;
+                ctx.fillStyle = b.color; 
+                ctx.fillRect(i * barW, cy, Math.max(1, barW), sh);
+                cy += sh;
+            });
+        });
+    }
+
+    function toggleSidebar(active) {
+        const sidebar = document.getElementById("sidebar");
+        if (active) {
+            sidebar.classList.add("active");
+            document.body.style.overflow = "hidden";
+        } else {
+            sidebar.classList.remove("active");
+            document.body.style.overflow = "";
+        }
+    }
+
+    function setupEventListeners() {
+        document.getElementById("searchInput").addEventListener("input", e => { STATE.q = e.target.value; syncNeuralFilters(); renderCommitList(); });
+        document.getElementById("commitSlider").addEventListener("input", e => selectCommit(parseInt(e.target.value), false));
+        
+        ["Spec", "Timeline", "Diff"].forEach(t => {
+            const btn = document.getElementById("tab" + t);
+            btn.addEventListener("click", e => {
+                ["Spec", "Timeline", "Diff"].forEach(tt => { 
+                    document.getElementById("tab" + tt).classList.remove("active"); 
+                    document.getElementById("view" + tt).classList.add("hidden"); 
+                });
+                e.target.classList.add("active"); 
+                document.getElementById("view" + t).classList.remove("hidden");
+                STATE.tab = t.toLowerCase(); 
+                
+                // Show/Hide diff mode toggle
+                const diffBtn = document.getElementById("btnDiffMode");
+                if (STATE.tab === "diff") diffBtn.classList.remove("hidden");
+                else diffBtn.classList.add("hidden");
+
+                updateView();
+            });
+        });
+
+        document.getElementById("btnDiffMode").addEventListener("click", (e) => {
+            STATE.diffMode = STATE.diffMode === 'line-by-line' ? 'side-by-side' : 'line-by-line';
+            e.target.textContent = STATE.diffMode === 'line-by-line' ? 'MODE: LINE' : 'MODE: SIDE';
+            renderDiff(STATE.renderNonce);
+        });
+
+        // Navigation Buttons
+        document.getElementById("btnPrev").addEventListener("click", () => {
+            const currentIdx = FILTERED.findIndex(c => c.idx >= STATE.idx);
+            if (currentIdx > 0) {
+                selectCommit(FILTERED[currentIdx - 1].idx);
+            } else if (currentIdx === -1 && FILTERED.length > 0) {
+                // If current is after all filtered, pick the last filtered
+                selectCommit(FILTERED[FILTERED.length - 1].idx);
+            }
+        });
+
+        document.getElementById("btnNext").addEventListener("click", () => {
+            const currentIdx = FILTERED.findIndex(c => c.idx > STATE.idx);
+            if (currentIdx !== -1) {
+                selectCommit(FILTERED[currentIdx].idx);
+            }
+        });
+
+        // Mobile Sidebar
+        document.getElementById("btnOpenLogs").addEventListener("click", (e) => {
+            e.stopPropagation();
+            toggleSidebar(true);
+        });
+        document.getElementById("btnCloseLogs").addEventListener("click", () => toggleSidebar(false));
+        document.addEventListener("click", (e) => {
+            const sidebar = document.getElementById("sidebar");
+            const btn = document.getElementById("btnOpenLogs");
+            if (sidebar.classList.contains("active") && !sidebar.contains(e.target) && e.target !== btn) {
+                toggleSidebar(false);
+            }
+        });
+
+        window.addEventListener("resize", () => { drawSynapticMap(); Object.values(charts).forEach(c => c.resize()); });
+        
+        // Playback Control
+        const btnPlay = document.getElementById("btnPlay");
+        btnPlay.classList.remove("btn-play"); // Reveal it
+        btnPlay.addEventListener("click", togglePlay);
+
+        // Focus Mode
+        document.getElementById("btnFocus").addEventListener("click", toggleFocusMode);
+        document.getElementById("btnFocusExit").addEventListener("click", toggleFocusMode);
+        
+        initLegend();
+        setupInteractivity();
+    }
+
+    function setupInteractivity() {
+        // --- 1. Keyboard Shortcuts ---
+        window.addEventListener("keydown", (e) => {
+            if (e.target.tagName === "INPUT") return;
+            
+            switch(e.code) {
+                case "Space": e.preventDefault(); togglePlay(); break;
+                case "ArrowLeft": document.getElementById("btnPrev").click(); break;
+                case "ArrowRight": document.getElementById("btnNext").click(); break;
+                case "KeyF": toggleFocusMode(); break;
+                case "KeyL": document.getElementById("btnShowLegend").click(); break;
+                case "Slash": e.preventDefault(); document.getElementById("searchInput").focus(); break;
+                case "Escape": 
+                    document.getElementById("legendOverlay").classList.remove("active");
+                    if (document.body.classList.contains("focus-mode")) toggleFocusMode();
+                    break;
+            }
+        });
+
+        // --- 2. Interactive Map (Bottom Canvas) ---
+        const cvs = document.getElementById("mapCanvas");
+        cvs.style.cursor = "crosshair";
+        
+        const getMapIdx = (e) => {
+            const rect = cvs.getBoundingClientRect();
+            const x = (e.clientX || (e.touches && e.touches[0].clientX)) - rect.left;
+            return Math.floor((x / rect.width) * COMMITS.length);
+        };
+
+        const updateMapPreview = () => {
+            const c = COMMITS[STATE.idx];
+            document.getElementById("dockSubject").textContent = c.subject;
+            document.getElementById("dockDetails").textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
+        };
+
+        cvs.addEventListener("click", (e) => {
+            selectCommit(getMapIdx(e));
+            updateMapPreview();
+        });
+        
+        cvs.addEventListener("mousemove", (e) => {
+            const idx = getMapIdx(e);
+            if (idx >= 0 && idx < COMMITS.length) {
+                const c = COMMITS[idx];
+                document.getElementById("dockSubject").textContent = `PREVIEW: ${c.subject}`;
+                document.getElementById("dockDetails").textContent = `ENTRY #${idx} // IMPACT: ${c.impact}`;
+            }
+        });
+
+        cvs.addEventListener("mouseleave", updateMapPreview);
+
+        // --- 3. Flashlight Mode ---
+        const btnFlash = document.getElementById("btnFlashlight");
+        const updateFlash = (e) => {
+            if (document.body.getAttribute("data-flashlight") === "true") {
+                const x = e.clientX || (e.touches && e.touches[0].clientX);
+                const y = e.clientY || (e.touches && e.touches[0].clientY);
+                document.body.style.setProperty("--mouse-x", x + "px");
+                document.body.style.setProperty("--mouse-y", y + "px");
+            }
+        };
+
+        btnFlash.addEventListener("click", () => {
+            const active = document.body.getAttribute("data-flashlight") === "true";
+            document.body.setAttribute("data-flashlight", !active);
+            btnFlash.classList.toggle("active", !active);
+        });
+
+        window.addEventListener("mousemove", updateFlash);
+        window.addEventListener("touchmove", updateFlash, { passive: true });
+    }
+
+    function syncNeuralFilters() { 
+        const q = STATE.q.toLowerCase(); 
+        FILTERED = COMMITS.filter(c => {
+            const matchesText = !q || c.subject.toLowerCase().includes(q) || c.hash.includes(q);
+            const matchesBucket = STATE.activeBuckets.size === 0 || STATE.activeBuckets.has(c.primary);
+            return matchesText && matchesBucket;
+        }); 
+
+        if (FILTERED.length === 0 && STATE.playing) togglePlay();
+
+        // If current selection is now hidden, select the first visible one
+        if (FILTERED.length > 0 && !FILTERED.some(c => c.idx === STATE.idx)) {
+            selectCommit(FILTERED[0].idx, true, true);
+        }
+    }
+    
+    function hideLoader() {
+        const loader = document.getElementById("loadingOverlay");
+        animate(loader, { opacity: 0 }, { duration: 0.5 }).finished.then(() => {
+            loader.classList.add("hidden");
+        });
+    }
+
+    function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
+
+    let charts = {};
+    function renderCharts(nonce) {
+        if (nonce !== STATE.renderNonce) return;
+        const t = { 
+            backgroundColor: 'transparent', 
+            textStyle: { fontFamily: 'JetBrains Mono', color: '#71717a' }, 
+            grid: { top: 30, bottom: 30, left: 40, right: 20 }, 
+            xAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { show: false } }, 
+            yAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { lineStyle: { color: '#27272a' } } } 
+        };
+        
+        if (!charts.velocity) {
+            charts.velocity = echarts.init(document.getElementById("chartVelocity"));
+            charts.velocity.on('click', (params) => {
+                const idx = params.dataIndex;
+                if (idx !== undefined) selectCommit(idx);
+            });
+        }
+        charts.velocity.setOption({ 
+            ...t, 
+            series: [{ 
+                data: COMMITS.map(c => [c.date, c.impact]), 
+                type: 'line', 
+                smooth: true, 
+                lineStyle: { color: '#39ff14', width: 2 }, 
+                markLine: {
+                    symbol: ['none', 'none'],
+                    label: { show: false },
+                    data: [{ xAxis: COMMITS[STATE.idx].date }],
+                    lineStyle: { color: 'rgba(255, 255, 255, 0.4)', type: 'dashed' }
+                },
+                areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{offset: 0, color: 'rgba(57, 255, 20, 0.2)'}, {offset: 1, color: 'rgba(57, 255, 20, 0)'}]) } 
+            }] 
+        });
+        
+        if (!charts.dist) charts.dist = echarts.init(document.getElementById("chartDistribution"));
+        const counts = {}; COMMITS.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
+        charts.dist.setOption({ 
+            ...t, 
+            series: [{ 
+                type: 'pie', 
+                radius: ['50%', '80%'], 
+                itemStyle: { borderRadius: 5, borderColor: '#020202', borderWidth: 2 },
+                label: { show: false },
+                data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } })) 
+            }] 
+        });
+        renderMassGrowth(nonce);
+    }
+
+    function renderMassGrowth(nonce) {
+        if (nonce && nonce !== STATE.renderNonce) return;
+        if (!charts.mass) {
+            charts.mass = echarts.init(document.getElementById("chartMass"));
+            charts.mass.on('click', (params) => {
+                const dateStr = params.name;
+                const commit = COMMITS.find(c => {
+                    const d = dayjs(c.date);
+                    return d.format("YYYY-MM-DD") === dateStr || d.format("MM-DD HH:00") === dateStr;
+                });
+                if (commit) selectCommit(commit.idx);
+            });
+        }
+        const buckets = groupCommits(STATE.timeBucket);
+        const labels = Object.keys(buckets).sort();
+        const series = BUCKETS.map(b => ({ 
+            name: b.name, 
+            type: 'bar', 
+            stack: 'total', 
+            itemStyle: { color: b.color }, 
+            data: labels.map(l => buckets[l][b.id] || 0) 
+        }));
+        
+        const t = { 
+            backgroundColor: 'transparent', 
+            textStyle: { fontFamily: 'JetBrains Mono', color: '#71717a' }, 
+            grid: { top: 30, bottom: 30, left: 40, right: 20 }, 
+            xAxis: { axisLine: { lineStyle: { color: '#27272a' } } }, 
+            yAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { lineStyle: { color: '#27272a' } } } 
+        };
+        
+        charts.mass.setOption({ ...t, tooltip: { trigger: 'axis' }, xAxis: { type: 'category', data: labels }, series }, true);
+    }
+
+    function groupCommits(unit) {
+        const res = {};
+        COMMITS.forEach(c => {
+            let k; const d = dayjs(c.date);
+            if (unit === "day") k = d.format("YYYY-MM-DD");
+            else k = d.format("MM-DD HH:00");
+            if (!res[k]) res[k] = {};
+            res[k][c.primary] = (res[k][c.primary] || 0) + c.impact;
+        });
+        return res;
+    }
+
+    if (enforceCanonicalHost()) {
+        // Redirect in progress.
+    } else if (isSelftestMode()) {
+        runSelftest();
+    } else {
+        init();
+    }
+</script>
+</body>
+</html>

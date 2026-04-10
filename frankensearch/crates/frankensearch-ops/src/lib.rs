@@ -1,0 +1,74 @@
+//! Operations control-plane TUI for frankensearch fleet monitoring.
+//!
+//! This crate builds on the shared [`frankensearch_tui`] framework to provide
+//! an operations console that discovers running frankensearch instances,
+//! displays real-time metrics, and provides fleet-wide observability.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────┐
+//! │  frankensearch-ops (this crate)                 │
+//! │  ├─ app: OpsApp entry point and event loop      │
+//! │  ├─ data_source: DataSource trait + mock impl   │
+//! │  ├─ storage: Ops telemetry DB bootstrap          │
+//! │  ├─ state: Shared AppState for async bridge     │
+//! │  ├─ screens: Fleet, Search, Index, Resource     │
+//! │  └─ category: Screen groupings for navigation   │
+//! ├─────────────────────────────────────────────────┤
+//! │  frankensearch-tui (shared framework)           │
+//! │  Screen, ScreenRegistry, AppShell, Keymap, ...  │
+//! ├─────────────────────────────────────────────────┤
+//! │  /dp/frankentui (ftui-*)                        │
+//! └─────────────────────────────────────────────────┘
+//! ```
+
+#![forbid(unsafe_code)]
+
+pub mod accessibility;
+pub mod app;
+pub mod category;
+pub mod data_source;
+pub mod discovery;
+pub mod overlays;
+pub mod preferences;
+pub mod presets;
+pub mod screens;
+pub mod simulator;
+pub mod state;
+pub mod storage;
+pub mod theme;
+
+// ─── Re-exports ─────────────────────────────────────────────────────────────
+
+pub use accessibility::{
+    ACCESSIBILITY_SCHEMA_VERSION, AnimationTiming, FRAME_BUDGET_MS, FRAME_BUDGETS,
+    FRAME_DROP_THRESHOLD_MS, FramePhase, FrameQualityTracker, FrameQualityVerdict, FrameTimeBudget,
+    INPUT_FEEDBACK_BUDGET_MS, KeyboardBinding, KeyboardParityAudit, MAX_CONSECUTIVE_DROPS,
+    MIN_EFFECTIVE_FPS, QualityConstraints, TARGET_FPS,
+};
+pub use app::OpsApp;
+pub use category::ScreenCategory;
+pub use data_source::{DataSource, MockDataSource, StorageDataSource};
+pub use discovery::{
+    DiscoveredInstance, DiscoveryConfig, DiscoveryEngine, DiscoverySignalKind, DiscoverySource,
+    DiscoveryStats, DiscoveryStatus, InstanceSighting, StaticDiscoverySource,
+};
+pub use overlays::{render_overlay, render_palette_overlay};
+pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
+pub use presets::{Density, ViewPreset, ViewState};
+pub use simulator::{
+    E2eSimulationReport, PerfSimulationReport, SimulatedProject, SimulatedSearchEvent,
+    SimulationBatch, SimulationRun, TelemetrySimulator, TelemetrySimulatorConfig, WorkloadProfile,
+};
+pub use state::{
+    AppState, ControlPlaneHealth, ControlPlaneMetrics, InstanceAttribution, InstanceLifecycle,
+    LifecycleEvent, LifecycleSignal, LifecycleTrackerConfig, LifecycleTransition,
+    ProjectAttributionResolver, ProjectLifecycleTracker,
+};
+pub use storage::{
+    AnomalyMaterializationSnapshot, OPS_SCHEMA_VERSION, OpsStorage, OpsStorageConfig, SloHealth,
+    SloMaterializationConfig, SloMaterializationResult, SloRollupSnapshot, SloScope,
+    bootstrap as bootstrap_ops_storage, current_version as current_ops_schema_version,
+};
+pub use theme::{FocusIndicatorSpec, PALETTE_SCHEMA_VERSION, SemanticPalette, ThemeVariant};

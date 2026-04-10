@@ -1,0 +1,58 @@
+[package]
+name = "mcp-agent-mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MCP Agent Mail - multi-agent coordination via MCP"
+
+[[bin]]
+name = "mcp-agent-mail"
+path = "src/main.rs"
+
+[dependencies]
+mcp-agent-mail-core = { workspace = true }
+mcp-agent-mail-storage = { workspace = true, default-features = false }
+mcp-agent-mail-tools = { workspace = true, default-features = false }
+mcp-agent-mail-server = { workspace = true, default-features = false }
+mcp-agent-mail-cli = { workspace = true, default-features = false }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+
+[features]
+default = [
+    "mcp-agent-mail-server/default",
+    "mcp-agent-mail-cli/default",
+    "mcp-agent-mail-tools/default",
+    "mcp-agent-mail-storage/default",
+]
+portable = [
+    "mcp-agent-mail-server/portable",
+    "mcp-agent-mail-cli/portable",
+    "mcp-agent-mail-tools/portable",
+    "mcp-agent-mail-storage/portable",
+]
+
+[dev-dependencies]
+criterion = { workspace = true }
+fastmcp = { workspace = true }
+fastmcp-core = { workspace = true }
+mcp-agent-mail-conformance = { workspace = true }
+mcp-agent-mail-db = { workspace = true }
+mcp-agent-mail-share = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[lints]
+workspace = true

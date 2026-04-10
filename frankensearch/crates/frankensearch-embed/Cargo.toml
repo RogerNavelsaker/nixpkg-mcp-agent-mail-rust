@@ -1,0 +1,42 @@
+[package]
+name = "frankensearch-embed"
+version = "0.1.3"
+description = "Embedder implementations for frankensearch (hash, model2vec, fastembed)"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+default = ["hash"]
+hash = []
+model2vec = ["dep:safetensors", "dep:tokenizers"]
+fastembed = ["dep:fastembed"]
+download = ["asupersync/tls", "asupersync/tls-webpki-roots"]
+api = ["asupersync/tls", "asupersync/tls-webpki-roots"]
+bundled-default-models = ["model2vec", "fastembed"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+sha2 = { workspace = true }
+
+# Feature-gated embedder dependencies
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+tempfile = "3"
+safetensors = { workspace = true }
+tokenizers = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

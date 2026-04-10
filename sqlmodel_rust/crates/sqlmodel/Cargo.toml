@@ -1,0 +1,36 @@
+[package]
+name = "sqlmodel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SQL databases in Rust, designed to be intuitive and type-safe"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel"
+readme = "README.md"
+keywords = ["sql", "orm", "database", "sqlmodel", "async"]
+categories = ["database", "database-implementations", "asynchronous"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+console = ["dep:sqlmodel-console"]
+c-sqlite-tests = ["dep:sqlmodel-sqlite"]
+
+[dependencies]
+sqlmodel-core.workspace = true
+sqlmodel-macros.workspace = true
+sqlmodel-query.workspace = true
+sqlmodel-schema.workspace = true
+sqlmodel-session.workspace = true
+sqlmodel-pool.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Optional console support for rich output
+sqlmodel-console = { workspace = true, optional = true }
+sqlmodel-sqlite = { workspace = true, optional = true }

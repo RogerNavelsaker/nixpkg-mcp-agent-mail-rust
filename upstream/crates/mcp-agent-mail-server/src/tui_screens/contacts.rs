@@ -1,0 +1,2409 @@
+//! Contacts screen — cross-agent contact links and policy display.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
+
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
+use ftui::widgets::block::Block;
+use ftui::widgets::borders::BorderType;
+use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::table::{Row, Table, TableState};
+use ftui::{Buffer, Event, Frame, KeyCode, KeyEventKind, Style};
+use ftui_extras::canvas::{CanvasRef, Mode, Painter};
+use ftui_extras::mermaid::{self, MermaidCompatibilityMatrix, MermaidFallbackPolicy};
+use ftui_extras::{mermaid_layout, mermaid_render};
+use ftui_runtime::program::Cmd;
+
+use ftui::PackedRgba;
+
+use crate::tui_action_menu::{ActionEntry, contacts_actions};
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
+use crate::tui_events::{ContactSummary, MailEvent};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
+use crate::tui_widgets::generate_contact_graph_mermaid;
+use crate::tui_widgets::{MetricTile, MetricTrend};
+
+/// Column indices for sorting.
+const COL_FROM: usize = 0;
+const COL_TO: usize = 1;
+const COL_STATUS: usize = 2;
+const COL_REASON: usize = 3;
+const COL_UPDATED: usize = 4;
+
+const SORT_LABELS: &[&str] = &["From", "To", "Status", "Reason", "Updated"];
+const MERMAID_RENDER_DEBOUNCE: Duration = Duration::from_secs(1);
+const GRAPH_EVENTS_WINDOW: usize = 512;
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+const GRAPH_MIN_WIDTH: u16 = 60;
+const GRAPH_MIN_HEIGHT: u16 = 10;
+
+#[derive(Debug, Clone)]
+struct MermaidPanelCache {
+    source_hash: u64,
+    width: u16,
+    height: u16,
+    buffer: Buffer,
+}
+
+#[derive(Debug, Default, Clone)]
+struct GraphFlowMetrics {
+    edge_volume: HashMap<(String, String), u32>,
+    node_sent: HashMap<String, u32>,
+    node_received: HashMap<String, u32>,
+}
+
+impl GraphFlowMetrics {
+    fn node_total(&self, agent: &str) -> u32 {
+        self.node_sent.get(agent).copied().unwrap_or(0)
+            + self.node_received.get(agent).copied().unwrap_or(0)
+    }
+
+    fn edge_weight(&self, from: &str, to: &str) -> u32 {
+        self.edge_volume
+            .get(&(from.to_string(), to.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn max_node_total(&self) -> u32 {
+        self.node_sent
+            .keys()
+            .chain(self.node_received.keys())
+            .map(|agent| self.node_total(agent))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn max_edge_weight(&self) -> u32 {
+        self.edge_volume.values().copied().max().unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Table,
+    Graph,
+}
+
+/// Status filter modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusFilter {
+    All,
+    Pending,
+    Approved,
+    Blocked,
+}
+
+impl StatusFilter {
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Pending,
+            Self::Pending => Self::Approved,
+            Self::Approved => Self::Blocked,
+            Self::Blocked => Self::All,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Pending => "Pending",
+            Self::Approved => "Approved",
+            Self::Blocked => "Blocked",
+        }
+    }
+
+    fn matches(self, status: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Pending => status == "pending",
+            Self::Approved => status == "approved",
+            Self::Blocked => status == "blocked",
+        }
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+pub struct ContactsScreen {
+    table_state: TableState,
+    contacts: Vec<ContactSummary>,
+    sort_col: usize,
+    sort_asc: bool,
+    filter: String,
+    filter_active: bool,
+    status_filter: StatusFilter,
+    view_mode: ViewMode,
+    /// (Agent Name, x, y) normalized 0.0-1.0
+    graph_nodes: Vec<(String, f64, f64)>,
+    /// Fast lookup for node coordinates keyed by agent name.
+    graph_node_lookup: HashMap<String, (f64, f64)>,
+    /// Cached flow metrics for graph rendering.
+    graph_metrics: GraphFlowMetrics,
+    /// Number of rebuild passes run from shared state.
+    rebuild_count: u64,
+    /// Number of table transform passes run (filter/sort/reduce).
+    table_transform_count: u64,
+    /// Number of graph layout recomputations.
+    graph_layout_recompute_count: u64,
+    /// Last per-rebuild row churn value.
+    row_churn_last: u64,
+    /// Cumulative contact-row churn across rebuilds.
+    row_churn_total: u64,
+    graph_selected_idx: usize,
+    show_mermaid_panel: bool,
+    mermaid_cache: RefCell<Option<MermaidPanelCache>>,
+    mermaid_last_render_at: RefCell<Option<Instant>>,
+    /// Previous contact counts for `MetricTrend` computation.
+    prev_contact_counts: (u64, u64, u64, u64),
+    detail_visible: bool,
+    detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
+    /// True when the DB poller has not yet delivered any data.
+    db_context_unavailable: bool,
+    /// Banner copy explaining why poller-driven data is unavailable.
+    db_context_banner: &'static str,
+    /// Latest `db_stats` generation that this screen has actually rebuilt from.
+    applied_db_stats_gen: u64,
+    /// Tracks the last query/view inputs that produced the current contacts list.
+    last_query_signature: Option<ContactsQuerySignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContactsQuerySignature {
+    filter: String,
+    status_filter: StatusFilter,
+    sort_col: usize,
+    sort_asc: bool,
+}
+
+impl ContactsScreen {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            table_state: TableState::default(),
+            contacts: Vec::new(),
+            sort_col: COL_UPDATED,
+            sort_asc: false,
+            filter: String::new(),
+            filter_active: false,
+            status_filter: StatusFilter::All,
+            view_mode: ViewMode::Table,
+            graph_nodes: Vec::new(),
+            graph_node_lookup: HashMap::new(),
+            graph_metrics: GraphFlowMetrics::default(),
+            rebuild_count: 0,
+            table_transform_count: 0,
+            graph_layout_recompute_count: 0,
+            row_churn_last: 0,
+            row_churn_total: 0,
+            graph_selected_idx: 0,
+            show_mermaid_panel: false,
+            mermaid_cache: RefCell::new(None),
+            mermaid_last_render_at: RefCell::new(None),
+            prev_contact_counts: (0, 0, 0, 0),
+            detail_visible: true,
+            detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
+            last_data_gen: super::DataGeneration::stale(),
+            db_context_unavailable: false,
+            db_context_banner: super::POLLER_DB_WAITING_BANNER,
+            applied_db_stats_gen: 0,
+            last_query_signature: None,
+        }
+    }
+
+    fn current_query_signature(&self) -> ContactsQuerySignature {
+        ContactsQuerySignature {
+            filter: self.filter.clone(),
+            status_filter: self.status_filter,
+            sort_col: self.sort_col,
+            sort_asc: self.sort_asc,
+        }
+    }
+
+    fn rebuild_from_state(&mut self, state: &TuiSharedState) {
+        let (db, db_stats_gen) = state.db_stats_snapshot_with_generation();
+        let query_signature = self.current_query_signature();
+        let preserve_stale = db.contact_links > 0
+            && db.contacts_list.is_empty()
+            && !self.contacts.is_empty()
+            && self.last_query_signature.as_ref() == Some(&query_signature);
+        let total_rows = if preserve_stale {
+            db.contact_links
+        } else {
+            u64::try_from(db.contacts_list.len()).unwrap_or(u64::MAX)
+        };
+        let mut rows: Vec<ContactSummary> = if preserve_stale {
+            self.contacts.clone()
+        } else {
+            db.contacts_list
+        };
+
+        // Apply status filter
+        let sf = self.status_filter;
+        rows.retain(|r| sf.matches(&r.status));
+
+        // Apply text filter
+        if !self.filter.is_empty() {
+            let f = self.filter.to_lowercase();
+            rows.retain(|r| {
+                crate::tui_screens::contains_ci(&r.from_agent, &f)
+                    || crate::tui_screens::contains_ci(&r.to_agent, &f)
+                    || crate::tui_screens::contains_ci(&r.reason, &f)
+                    || crate::tui_screens::contains_ci(&r.from_project_slug, &f)
+            });
+        }
+
+        // Sort
+        rows.sort_by(|a, b| {
+            let cmp = match self.sort_col {
+                COL_FROM => super::cmp_ci(&a.from_agent, &b.from_agent),
+                COL_TO => super::cmp_ci(&a.to_agent, &b.to_agent),
+                COL_STATUS => a.status.cmp(&b.status),
+                COL_REASON => super::cmp_ci(&a.reason, &b.reason),
+                COL_UPDATED => a.updated_ts.cmp(&b.updated_ts),
+                _ => std::cmp::Ordering::Equal,
+            };
+            if self.sort_asc { cmp } else { cmp.reverse() }
+        });
+
+        self.rebuild_count = self.rebuild_count.saturating_add(1);
+        self.table_transform_count = self.table_transform_count.saturating_add(1);
+        self.row_churn_last = contact_row_churn(&self.contacts, &rows);
+        self.row_churn_total = self.row_churn_total.saturating_add(self.row_churn_last);
+
+        let rendered_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        let dropped_count = total_rows.saturating_sub(rendered_count);
+        let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+        let filter = sanitize_diagnostic_value(&self.filter);
+        let filter = if filter.is_empty() {
+            "all".to_string()
+        } else {
+            filter
+        };
+
+        self.contacts = rows;
+        let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+        self.layout_graph(&recent_events);
+        self.graph_metrics = build_graph_flow_metrics(&self.contacts, &recent_events);
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "contacts".to_string(),
+            scope: "db_stats.contacts_list".to_string(),
+            query_params: format!(
+                "filter={filter};status_filter={};sort_col={sort_label};sort_asc={};list_rows={total_rows};total_rows={total_rows};rebuilds={};table_transforms={};layout_recomputes={};row_churn_last={};row_churn_total={};preserved_stale={preserve_stale}",
+                self.status_filter.label(),
+                self.sort_asc,
+                self.rebuild_count,
+                self.table_transform_count,
+                self.graph_layout_recompute_count,
+                self.row_churn_last,
+                self.row_churn_total,
+            ),
+            raw_count: total_rows,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
+
+        // Clamp selection
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.contacts.len()
+        {
+            self.table_state.selected = if self.contacts.is_empty() {
+                None
+            } else {
+                Some(self.contacts.len() - 1)
+            };
+        }
+        self.last_query_signature = Some(query_signature);
+        self.applied_db_stats_gen = db_stats_gen;
+    }
+
+    fn layout_graph(&mut self, recent_events: &[MailEvent]) {
+        // Collect unique agents
+        let mut agents = std::collections::HashSet::new();
+        for c in &self.contacts {
+            agents.insert(c.from_agent.clone());
+            agents.insert(c.to_agent.clone());
+        }
+        for (from, recipients) in message_flow_iter(recent_events) {
+            if !from.trim().is_empty() {
+                agents.insert(from.to_string());
+            }
+            for to in recipients {
+                if !to.trim().is_empty() {
+                    agents.insert(to.clone());
+                }
+            }
+        }
+        let mut agents_vec: Vec<String> = agents.into_iter().collect();
+        agents_vec.sort();
+
+        self.graph_layout_recompute_count = self.graph_layout_recompute_count.saturating_add(1);
+        let count = agents_vec.len();
+        self.graph_nodes.clear();
+        self.graph_node_lookup.clear();
+        self.graph_selected_idx = self.graph_selected_idx.min(count.saturating_sub(1));
+
+        if count == 0 {
+            return;
+        }
+
+        // Circle layout
+        for (i, agent) in agents_vec.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let angle = 2.0 * std::f64::consts::PI * (i as f64) / (count as f64);
+            // Center at 0.5, 0.5; radius 0.4
+            let x = 0.4f64.mul_add(angle.cos(), 0.5);
+            let y = 0.4f64.mul_add(angle.sin(), 0.5);
+            self.graph_node_lookup.insert(agent.clone(), (x, y));
+            self.graph_nodes.push((agent, x, y));
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.contacts.is_empty() {
+            return;
+        }
+        let len = self.contacts.len();
+        let current = self.table_state.selected.unwrap_or(0);
+        let next = if delta > 0 {
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
+        self.table_state.selected = Some(next);
+        self.detail_scroll = 0;
+    }
+
+    fn move_graph_selection(&mut self, delta: isize) {
+        if self.graph_nodes.is_empty() {
+            self.graph_selected_idx = 0;
+            return;
+        }
+        let len = self.graph_nodes.len();
+        let current = self.graph_selected_idx;
+        let next = if delta > 0 {
+            current
+                .saturating_add(delta.unsigned_abs())
+                .min(len.saturating_sub(1))
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
+        self.graph_selected_idx = next;
+    }
+
+    fn selected_graph_agent(&self) -> Option<&str> {
+        self.graph_nodes
+            .get(self.graph_selected_idx)
+            .map(|(name, _, _)| name.as_str())
+    }
+
+    fn handle_filter_key(&mut self, key_code: KeyCode, state: &TuiSharedState) {
+        match key_code {
+            KeyCode::Escape | KeyCode::Enter => {
+                self.filter_active = false;
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.rebuild_from_state(state);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_key(&mut self, key_code: KeyCode, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        match key_code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.move_graph_selection(1);
+                } else {
+                    self.move_selection(1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.move_graph_selection(-1);
+                } else {
+                    self.move_selection(-1);
+                }
+            }
+            KeyCode::Left if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel => {
+                self.move_graph_selection(-1);
+            }
+            KeyCode::Right if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel => {
+                self.move_graph_selection(1);
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.graph_selected_idx = self.graph_nodes.len().saturating_sub(1);
+                } else if !self.contacts.is_empty() {
+                    self.table_state.selected = Some(self.contacts.len() - 1);
+                }
+            }
+            KeyCode::Home => {
+                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
+                    self.graph_selected_idx = 0;
+                } else if !self.contacts.is_empty() {
+                    self.table_state.selected = Some(0);
+                }
+            }
+            KeyCode::Enter => {
+                if self.view_mode == ViewMode::Graph
+                    && !self.show_mermaid_panel
+                    && let Some(agent) = self.selected_graph_agent()
+                {
+                    return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(
+                        agent.to_string(),
+                    )));
+                }
+            }
+            KeyCode::Char('g') => {
+                self.show_mermaid_panel = !self.show_mermaid_panel;
+            }
+            KeyCode::Char('/') => {
+                self.filter_active = true;
+                self.filter.clear();
+            }
+            KeyCode::Char('f') => {
+                self.status_filter = self.status_filter.next();
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char('n') => {
+                self.view_mode = match self.view_mode {
+                    ViewMode::Table => ViewMode::Graph,
+                    ViewMode::Graph => ViewMode::Table,
+                };
+                self.graph_selected_idx = 0;
+            }
+            KeyCode::Char('s') => {
+                self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char('S') => {
+                self.sort_asc = !self.sort_asc;
+                self.rebuild_from_state(state);
+            }
+            KeyCode::Char('i') => {
+                self.detail_visible = !self.detail_visible;
+            }
+            KeyCode::Char('J') => {
+                let max = self.last_detail_max_scroll.get();
+                self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::Char('K') => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Escape => {
+                if self.show_mermaid_panel {
+                    self.show_mermaid_panel = false;
+                } else if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.rebuild_from_state(state);
+                }
+            }
+            _ => {}
+        }
+        Cmd::None
+    }
+}
+
+impl Default for ContactsScreen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MailScreen for ContactsScreen {
+    fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        let Event::Key(key) = event else {
+            return Cmd::None;
+        };
+        if key.kind != KeyEventKind::Press {
+            return Cmd::None;
+        }
+        if self.filter_active {
+            self.handle_filter_key(key.code, state);
+            return Cmd::None;
+        }
+        self.handle_key(key.code, state)
+    }
+
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        let current_gen = state.data_generation();
+
+        // Rebuild every second with dirty gating. This keeps graph/event-driven
+        // state fresh without doing heavy recomputation every render frame.
+        if tick_count.is_multiple_of(10) {
+            let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+            if dirty.db_stats || dirty.events {
+                self.prev_contact_counts = self.contact_counts();
+                self.rebuild_from_state(state);
+            }
+            self.last_data_gen = current_gen;
+        }
+
+        if let Some(banner) =
+            super::poller_db_context_banner(state, self.applied_db_stats_gen, tick_count)
+        {
+            self.db_context_unavailable = true;
+            self.db_context_banner = banner;
+        } else {
+            self.db_context_unavailable = false;
+            self.db_context_banner = super::POLLER_DB_WAITING_BANNER;
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, state: &TuiSharedState) {
+        if area.height < 3 || area.width < 20 {
+            return;
+        }
+
+        // Outer bordered panel
+        let outer_block = crate::tui_panel_helpers::panel_block(" Contact Graph ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+        let area = inner;
+
+        if self.db_context_unavailable {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let banner = Paragraph::new(self.db_context_banner)
+                .style(Style::default().fg(tp.severity_error));
+            let banner_area = Rect::new(area.x, area.y, area.width, 1);
+            banner.render(banner_area, frame);
+            return;
+        }
+
+        let is_table_mode = self.view_mode == ViewMode::Table && !self.show_mermaid_panel;
+
+        // ── Responsive split for table mode ────────────────────────────
+        // On Lg+: table + side detail panel; on Xl: table + graph visualization
+        let split = if is_table_mode && self.detail_visible {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+                .at(
+                    Breakpoint::Lg,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+                )
+                .at(
+                    Breakpoint::Xl,
+                    Flex::horizontal()
+                        .constraints([Constraint::Percentage(45.0), Constraint::Fill]),
+                )
+                .split(area)
+        } else {
+            ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill])).split(area)
+        };
+
+        let main_area = split.rects[0];
+
+        // Layout depends on mode: Table gets summary band + footer, Graph/Mermaid maximize canvas
+        let summary_h: u16 = if is_table_mode && main_area.height >= 10 {
+            2
+        } else {
+            0
+        };
+        let header_h: u16 = 1;
+        let footer_h: u16 = u16::from(is_table_mode && main_area.height >= 6);
+        let table_h = main_area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+
+        let mut y = main_area.y;
+
+        // ── Summary band (Table view only) ─────────────────────────────
+        if summary_h > 0 {
+            let summary_area = Rect::new(main_area.x, y, main_area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        // ── Info header ────────────────────────────────────────────────
+        let header_area = Rect::new(main_area.x, y, main_area.width, header_h);
+        y += header_h;
+
+        let sort_indicator = if self.sort_asc {
+            " \u{25b2}"
+        } else {
+            " \u{25bc}"
+        };
+        let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
+        let filter_display = if self.filter_active {
+            format!(" [/] Search: {}_ ", self.filter)
+        } else if !self.filter.is_empty() {
+            format!(" [/] Filter: {} ", self.filter)
+        } else {
+            String::new()
+        };
+        let info = format!(
+            "{} contacts | Status: {} | Sort: {}{} {}",
+            self.contacts.len(),
+            self.status_filter.label(),
+            sort_label,
+            sort_indicator,
+            filter_display,
+        );
+        let p = Paragraph::new(info);
+        p.render(header_area, frame);
+
+        // ── Main content area ──────────────────────────────────────────
+        let content_area = Rect::new(main_area.x, y, main_area.width, table_h);
+        y += table_h;
+        let main_graph_visible = self.view_mode == ViewMode::Graph
+            && content_area.width >= GRAPH_MIN_WIDTH
+            && content_area.height >= GRAPH_MIN_HEIGHT;
+        let side_graph_visible = split.rects.len() >= 2
+            && is_table_mode
+            && self.detail_visible
+            && split.breakpoint >= Breakpoint::Xl
+            && split.rects[1].width >= GRAPH_MIN_WIDTH
+            && split.rects[1].height >= GRAPH_MIN_HEIGHT;
+
+        if self.show_mermaid_panel {
+            let recent_events = state.recent_events(GRAPH_EVENTS_WINDOW);
+            self.render_mermaid_panel(frame, content_area, &recent_events);
+        } else if main_graph_visible {
+            self.render_graph(frame, content_area, &self.graph_metrics);
+        } else {
+            self.render_table(frame, content_area);
+        }
+
+        // ── Footer summary (Table view only) ───────────────────────────
+        if footer_h > 0 {
+            let footer_area = Rect::new(main_area.x, y, main_area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
+
+        // ── Side detail panel (Lg+) ────────────────────────────────────
+        if split.rects.len() >= 2 && is_table_mode && self.detail_visible {
+            let detail_area = split.rects[1];
+            if split.breakpoint >= Breakpoint::Xl {
+                // On Xl: show graph visualization in the side panel
+                if side_graph_visible {
+                    self.render_graph(frame, detail_area, &self.graph_metrics);
+                } else {
+                    self.render_contact_detail_panel(frame, detail_area);
+                }
+            } else {
+                // On Lg: show text detail panel
+                self.render_contact_detail_panel(frame, detail_area);
+            }
+        }
+    }
+
+    fn keybindings(&self) -> Vec<HelpEntry> {
+        vec![
+            HelpEntry {
+                key: "j/k",
+                action: "Select contact / graph node",
+            },
+            HelpEntry {
+                key: "g",
+                action: "Toggle Mermaid graph panel",
+            },
+            HelpEntry {
+                key: "Enter",
+                action: "Open selected graph node in Agents",
+            },
+            HelpEntry {
+                key: "/",
+                action: "Search/filter",
+            },
+            HelpEntry {
+                key: "f",
+                action: "Cycle status filter",
+            },
+            HelpEntry {
+                key: "n",
+                action: "Toggle Table/Graph",
+            },
+            HelpEntry {
+                key: "s",
+                action: "Cycle sort column",
+            },
+            HelpEntry {
+                key: "S",
+                action: "Toggle sort order",
+            },
+            HelpEntry {
+                key: "i",
+                action: "Toggle detail panel",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail panel",
+            },
+            HelpEntry {
+                key: "Esc",
+                action: "Close Mermaid / clear filter",
+            },
+        ]
+    }
+
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Agent contact links and approval status. Accept/deny pending requests.")
+    }
+
+    fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
+        if let DeepLinkTarget::ContactByPair(from, to) = target
+            && let Some(pos) = self
+                .contacts
+                .iter()
+                .position(|c| c.from_agent == *from && c.to_agent == *to)
+        {
+            self.table_state.selected = Some(pos);
+            return true;
+        }
+        false
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        self.filter_active
+    }
+
+    fn contextual_actions(&self) -> Option<(Vec<ActionEntry>, u16, String)> {
+        let selected_idx = self.table_state.selected?;
+        let contact = self.contacts.get(selected_idx)?;
+
+        let actions = contacts_actions(&contact.from_agent, &contact.to_agent, &contact.status);
+
+        // Anchor row is the selected row + header offset
+        #[allow(clippy::cast_possible_truncation)]
+        let anchor_row = (selected_idx as u16).saturating_add(2);
+        let context_id = format!("{}:{}", contact.from_agent, contact.to_agent);
+
+        Some((actions, anchor_row, context_id))
+    }
+
+    fn copyable_content(&self) -> Option<String> {
+        let idx = self.table_state.selected?;
+        let contact = self.contacts.get(idx)?;
+        Some(format!(
+            "{} -> {} ({})",
+            contact.from_agent, contact.to_agent, contact.status
+        ))
+    }
+
+    fn title(&self) -> &'static str {
+        "Contacts"
+    }
+
+    fn tab_label(&self) -> &'static str {
+        "Links"
+    }
+}
+
+// Helper methods for ContactsScreen (not part of MailScreen trait)
+impl ContactsScreen {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn render_graph(&self, frame: &mut Frame<'_>, area: Rect, metrics: &GraphFlowMetrics) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Network Graph")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.width < 4 || inner.height < 4 {
+            return;
+        }
+
+        let mut painter = Painter::for_area(inner, Mode::Braille);
+        painter.clear();
+
+        let w = f64::from(inner.width) * 2.0; // Braille resolution width (2 cols per cell)
+        let h = f64::from(inner.height) * 4.0; // Braille resolution height (4 rows per cell)
+        let max_edge_weight = metrics.max_edge_weight();
+
+        // Draw edges with directional arrowheads and weight-based thickness.
+        for contact in &self.contacts {
+            if let (Some(start), Some(end)) = (
+                self.graph_node_lookup.get(&contact.from_agent),
+                self.graph_node_lookup.get(&contact.to_agent),
+            ) {
+                let color = match contact.status.as_str() {
+                    "approved" => tp.contact_approved,
+                    "blocked" => tp.contact_blocked,
+                    _ => tp.contact_pending,
+                };
+
+                let x1 = (start.0 * w).round() as i32;
+                let y1 = (start.1 * h).round() as i32;
+                let x2 = (end.0 * w).round() as i32;
+                let y2 = (end.1 * h).round() as i32;
+
+                let weight = metrics.edge_weight(&contact.from_agent, &contact.to_agent);
+                let thickness = scaled_level(weight, max_edge_weight, 1, 3);
+                draw_weighted_line(&mut painter, x1, y1, x2, y2, thickness, color);
+                draw_arrow_head(&mut painter, x1, y1, x2, y2, color);
+            }
+        }
+
+        // Draw nodes with traffic-based radius and selected highlight.
+        let max_node_volume = metrics.max_node_total();
+        for (idx, (name, nx, ny)) in self.graph_nodes.iter().enumerate() {
+            let x = (nx * w).round() as i32;
+            let y = (ny * h).round() as i32;
+            let node_volume = metrics.node_total(name);
+            let radius = scaled_level(node_volume, max_node_volume, 1, 3);
+            let selected = idx == self.graph_selected_idx;
+            let node_color = if selected {
+                tp.panel_border_focused
+            } else {
+                tp.text_primary
+            };
+            for dx in -radius..=radius {
+                for dy in -radius..=radius {
+                    if dx * dx + dy * dy <= radius * radius {
+                        painter.point_colored(x + dx, y + dy, node_color);
+                    }
+                }
+            }
+        }
+
+        CanvasRef::from_painter(&painter).render(inner, frame);
+
+        // Draw labels (overlay on top of canvas)
+        for (idx, (name, nx, ny)) in self.graph_nodes.iter().enumerate() {
+            // Map normalized coords back to cell coords
+            let cx = inner.x + (nx * f64::from(inner.width)) as u16;
+            let cy = inner.y + (ny * f64::from(inner.height)) as u16;
+
+            // Simple centering logic
+            let label: String = name.chars().take(8).collect();
+            let lx = cx.saturating_sub(label.len() as u16 / 2);
+
+            if lx >= inner.x
+                && lx + label.len() as u16 <= inner.right()
+                && cy >= inner.y
+                && cy < inner.bottom()
+            {
+                let selected = idx == self.graph_selected_idx;
+                let fg_color = if selected {
+                    tp.selection_fg
+                } else {
+                    tp.panel_title_fg
+                };
+                let bg_color = if selected {
+                    tp.selection_bg
+                } else {
+                    tp.bg_deep
+                };
+                for (i, ch) in label.chars().enumerate() {
+                    if let Some(cell) = frame.buffer.get_mut(lx + i as u16, cy) {
+                        cell.content = ftui::Cell::from_char(ch).content;
+                        cell.fg = fg_color;
+                        cell.bg = bg_color;
+                    }
+                }
+            }
+        }
+
+        if let Some(agent) = self.selected_graph_agent() {
+            let sent = metrics.node_sent.get(agent).copied().unwrap_or(0);
+            let received = metrics.node_received.get(agent).copied().unwrap_or(0);
+            let total = sent + received;
+            let hint = format!(
+                "Node: {agent} | sent: {sent} recv: {received} total: {total} | Enter: open agent"
+            );
+            let hint_rect = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+            Paragraph::new(hint).render(hint_rect, frame);
+        }
+    }
+
+    fn render_mermaid_panel(&self, frame: &mut Frame<'_>, area: Rect, events: &[MailEvent]) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Mermaid Contact Graph [g]")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        if inner.width < 4 || inner.height < 4 {
+            return;
+        }
+
+        let source = generate_contact_graph_mermaid(&self.contacts, events);
+        let source_hash = stable_hash(source.as_bytes());
+
+        let (has_cache, source_changed, size_changed) = {
+            let cache = self.mermaid_cache.borrow();
+            cache.as_ref().map_or((false, true, true), |cached| {
+                (
+                    true,
+                    cached.source_hash != source_hash,
+                    cached.width != inner.width || cached.height != inner.height,
+                )
+            })
+        };
+        let cache_is_fresh = has_cache && !source_changed && !size_changed;
+
+        let can_refresh = self
+            .mermaid_last_render_at
+            .borrow()
+            .as_ref()
+            .is_none_or(|last| last.elapsed() >= MERMAID_RENDER_DEBOUNCE);
+
+        // Refresh immediately when source/size changes; debounce only protects
+        // against redundant refresh attempts for unchanged content.
+        if !cache_is_fresh && (!has_cache || source_changed || size_changed || can_refresh) {
+            let buffer = render_mermaid_source_to_buffer(&source, inner.width, inner.height);
+            *self.mermaid_cache.borrow_mut() = Some(MermaidPanelCache {
+                source_hash,
+                width: inner.width,
+                height: inner.height,
+                buffer,
+            });
+            *self.mermaid_last_render_at.borrow_mut() = Some(Instant::now());
+        }
+
+        if let Some(cache) = self.mermaid_cache.borrow().as_ref() {
+            blit_buffer_to_frame(frame, inner, &cache.buffer);
+        } else {
+            Paragraph::new("Preparing Mermaid graph...").render(inner, frame);
+        }
+    }
+
+    /// Count contacts by status (total, approved, pending, blocked).
+    fn contact_counts(&self) -> (u64, u64, u64, u64) {
+        let total = self.contacts.len() as u64;
+        let approved = self
+            .contacts
+            .iter()
+            .filter(|c| c.status == "approved")
+            .count() as u64;
+        let pending = self
+            .contacts
+            .iter()
+            .filter(|c| c.status == "pending")
+            .count() as u64;
+        let blocked = self
+            .contacts
+            .iter()
+            .filter(|c| c.status == "blocked")
+            .count() as u64;
+        (total, approved, pending, blocked)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, approved, pending, blocked) = self.contact_counts();
+        let (prev_total, prev_approved, prev_pending, prev_blocked) = self.prev_contact_counts;
+
+        let total_str = total.to_string();
+        let approved_str = approved.to_string();
+        let pending_str = pending.to_string();
+        let blocked_str = blocked.to_string();
+
+        let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
+            (
+                "Contacts",
+                &total_str,
+                trend_for(total, prev_total),
+                tp.metric_agents,
+            ),
+            (
+                "Approved",
+                &approved_str,
+                trend_for(approved, prev_approved),
+                tp.contact_approved,
+            ),
+            (
+                "Pending",
+                &pending_str,
+                trend_for(pending, prev_pending),
+                tp.contact_pending,
+            ),
+            (
+                "Blocked",
+                &blocked_str,
+                trend_for(blocked, prev_blocked),
+                tp.contact_blocked,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            tile.render(tile_area, frame);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, approved, pending, blocked) = self.contact_counts();
+
+        let total_str = total.to_string();
+        let approved_str = approved.to_string();
+        let pending_str = pending.to_string();
+        let blocked_str = blocked.to_string();
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*total_str, "contacts", tp.metric_agents),
+            (&*approved_str, "approved", tp.contact_approved),
+            (&*pending_str, "pending", tp.contact_pending),
+            (&*blocked_str, "blocked", tp.contact_blocked),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+
+    fn render_contact_detail_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Contact Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(selected_idx) = self.table_state.selected else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f517}",
+                "No Contact Selected",
+                "Select a contact from the table to view details.",
+            );
+            return;
+        };
+
+        let Some(contact) = self.contacts.get(selected_idx) else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f517}",
+                "No Contact Selected",
+                "Select a contact from the table to view details.",
+            );
+            return;
+        };
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
+        lines.push(("From".into(), contact.from_agent.clone(), None));
+        lines.push(("To".into(), contact.to_agent.clone(), None));
+
+        let status_color_val = match contact.status.as_str() {
+            "approved" => tp.contact_approved,
+            "blocked" => tp.contact_blocked,
+            _ => tp.contact_pending,
+        };
+        lines.push((
+            "Status".into(),
+            contact.status.clone(),
+            Some(status_color_val),
+        ));
+
+        if !contact.reason.is_empty() {
+            lines.push(("Reason".into(), contact.reason.clone(), None));
+        }
+
+        if !contact.from_project_slug.is_empty() {
+            lines.push((
+                "From Project".into(),
+                contact.from_project_slug.clone(),
+                None,
+            ));
+        }
+        if !contact.to_project_slug.is_empty() {
+            lines.push(("To Project".into(), contact.to_project_slug.clone(), None));
+        }
+
+        let updated_str = if contact.updated_ts == 0 {
+            "never".to_string()
+        } else {
+            let iso = mcp_agent_mail_db::timestamps::micros_to_iso(contact.updated_ts);
+            let rel = format_relative_ts(contact.updated_ts);
+            format!("{iso} ({rel})")
+        };
+        lines.push(("Updated".into(), updated_str, None));
+
+        let expires_str = contact.expires_ts.map_or_else(
+            || "never".to_string(),
+            |ts| {
+                if ts == 0 {
+                    "never".to_string()
+                } else {
+                    let iso = mcp_agent_mail_db::timestamps::micros_to_iso(ts);
+                    let rel = format_relative_ts(ts);
+                    format!("{iso} ({rel})")
+                }
+            },
+        );
+        lines.push(("Expires".into(), expires_str, None));
+
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
+    }
+
+    fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        // Responsive columns
+        let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            // < 80: From, To, Status only
+            (
+                vec!["From", "To", "Status"],
+                vec![
+                    Constraint::Percentage(38.0),
+                    Constraint::Percentage(38.0),
+                    Constraint::Percentage(24.0),
+                ],
+            )
+        } else if wide {
+            // >= 120: all columns
+            (
+                vec!["From", "To", "Status", "Reason", "Updated", "Expires"],
+                vec![
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(15.0),
+                ],
+            )
+        } else {
+            // 80–119: hide Reason column
+            (
+                vec!["From", "To", "Status", "Updated", "Expires"],
+                vec![
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(14.0),
+                    Constraint::Percentage(21.0),
+                    Constraint::Percentage(21.0),
+                ],
+            )
+        };
+
+        let header = Row::new(header_cells).style(Style::default().bold());
+
+        let rows: Vec<Row> = self
+            .contacts
+            .iter()
+            .enumerate()
+            .map(|(i, contact)| {
+                let status_style = status_color(&contact.status);
+                let row_style = if Some(i) == self.table_state.selected {
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
+                } else {
+                    status_style
+                };
+
+                if narrow {
+                    Row::new([
+                        contact.from_agent.clone(),
+                        contact.to_agent.clone(),
+                        contact.status.clone(),
+                    ])
+                    .style(row_style)
+                } else if wide {
+                    let updated_str = format_relative_ts(contact.updated_ts);
+                    let expires_str = contact
+                        .expires_ts
+                        .map_or_else(|| "never".to_string(), format_relative_ts);
+                    Row::new([
+                        contact.from_agent.clone(),
+                        contact.to_agent.clone(),
+                        contact.status.clone(),
+                        truncate_str(&contact.reason, 20),
+                        updated_str,
+                        expires_str,
+                    ])
+                    .style(row_style)
+                } else {
+                    let updated_str = format_relative_ts(contact.updated_ts);
+                    let expires_str = contact
+                        .expires_ts
+                        .map_or_else(|| "never".to_string(), format_relative_ts);
+                    Row::new([
+                        contact.from_agent.clone(),
+                        contact.to_agent.clone(),
+                        contact.status.clone(),
+                        updated_str,
+                        expires_str,
+                    ])
+                    .style(row_style)
+                }
+            })
+            .collect();
+
+        let block = Block::default()
+            .title("Contacts")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(block)
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+
+        let mut ts = self.table_state.clone();
+        StatefulWidget::render(&table, area, frame, &mut ts);
+    }
+}
+
+fn build_graph_flow_metrics(contacts: &[ContactSummary], events: &[MailEvent]) -> GraphFlowMetrics {
+    let mut metrics = GraphFlowMetrics::default();
+    for contact in contacts {
+        metrics
+            .edge_volume
+            .entry((contact.from_agent.clone(), contact.to_agent.clone()))
+            .or_insert(0);
+    }
+
+    for (from, recipients) in message_flow_iter(events) {
+        if from.trim().is_empty() {
+            continue;
+        }
+        for to in recipients {
+            if to.trim().is_empty() {
+                continue;
+            }
+            *metrics
+                .edge_volume
+                .entry((from.to_string(), to.clone()))
+                .or_insert(0) += 1;
+            *metrics.node_sent.entry(from.to_string()).or_insert(0) += 1;
+            *metrics.node_received.entry(to.clone()).or_insert(0) += 1;
+        }
+    }
+
+    if metrics.max_edge_weight() == 0 {
+        for contact in contacts {
+            *metrics
+                .edge_volume
+                .entry((contact.from_agent.clone(), contact.to_agent.clone()))
+                .or_insert(0) += 1;
+            *metrics
+                .node_sent
+                .entry(contact.from_agent.clone())
+                .or_insert(0) += 1;
+            *metrics
+                .node_received
+                .entry(contact.to_agent.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    metrics
+}
+
+fn contact_row_churn(previous: &[ContactSummary], current: &[ContactSummary]) -> u64 {
+    type ContactSignature = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+    );
+
+    fn signature(contact: &ContactSummary) -> ContactSignature {
+        (
+            contact.from_agent.clone(),
+            contact.to_agent.clone(),
+            contact.from_project_slug.clone(),
+            contact.to_project_slug.clone(),
+            contact.status.clone(),
+            contact.reason.clone(),
+            contact.updated_ts,
+            contact.expires_ts,
+        )
+    }
+
+    let mut deltas: HashMap<ContactSignature, i64> = HashMap::new();
+    for contact in previous {
+        *deltas.entry(signature(contact)).or_insert(0) -= 1;
+    }
+    for contact in current {
+        *deltas.entry(signature(contact)).or_insert(0) += 1;
+    }
+
+    deltas
+        .into_values()
+        .fold(0u64, |acc, delta| acc.saturating_add(delta.unsigned_abs()))
+}
+
+fn message_flow_iter(events: &[MailEvent]) -> impl Iterator<Item = (&str, &[String])> {
+    events.iter().filter_map(|event| match event {
+        MailEvent::MessageSent { from, to, .. } | MailEvent::MessageReceived { from, to, .. } => {
+            Some((from.as_str(), to.as_slice()))
+        }
+        _ => None,
+    })
+}
+
+fn scaled_level(value: u32, max_value: u32, min: i32, max: i32) -> i32 {
+    if min >= max || max_value == 0 {
+        return min;
+    }
+    let clamped = value.min(max_value);
+    let range = i64::from(max) - i64::from(min);
+    let scaled = i64::from(min)
+        + ((i64::from(clamped) * range) + i64::from(max_value / 2)) / i64::from(max_value);
+    i32::try_from(scaled.clamp(i64::from(min), i64::from(max))).unwrap_or(max)
+}
+
+fn draw_weighted_line(
+    painter: &mut Painter,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    thickness: i32,
+    color: ftui::PackedRgba,
+) {
+    painter.line_colored(x1, y1, x2, y2, Some(color));
+    if thickness <= 1 {
+        return;
+    }
+
+    let dx = (x2 - x1).abs();
+    let dy = (y2 - y1).abs();
+    if dx >= dy {
+        painter.line_colored(x1, y1 + 1, x2, y2 + 1, Some(color));
+        if thickness >= 3 {
+            painter.line_colored(x1, y1 - 1, x2, y2 - 1, Some(color));
+        }
+    } else {
+        painter.line_colored(x1 + 1, y1, x2 + 1, y2, Some(color));
+        if thickness >= 3 {
+            painter.line_colored(x1 - 1, y1, x2 - 1, y2, Some(color));
+        }
+    }
+}
+
+fn draw_arrow_head(
+    painter: &mut Painter,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    color: ftui::PackedRgba,
+) {
+    let vx = f64::from(x2 - x1);
+    let vy = f64::from(y2 - y1);
+    let len = vx.hypot(vy);
+    if len < 1.0 {
+        return;
+    }
+    let ux = vx / len;
+    let uy = vy / len;
+    let arrow_len = 3.0;
+    let wing = 1.6;
+    let base_x = ux.mul_add(-arrow_len, f64::from(x2));
+    let base_y = uy.mul_add(-arrow_len, f64::from(y2));
+    let perp_x = -uy;
+    let perp_y = ux;
+    let left_x = round_to_i32(perp_x.mul_add(wing, base_x));
+    let left_y = round_to_i32(perp_y.mul_add(wing, base_y));
+    let right_x = round_to_i32(perp_x.mul_add(-wing, base_x));
+    let right_y = round_to_i32(perp_y.mul_add(-wing, base_y));
+    painter.line_colored(x2, y2, left_x, left_y, Some(color));
+    painter.line_colored(x2, y2, right_x, right_y, Some(color));
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn round_to_i32(value: f64) -> i32 {
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+fn stable_hash<T: Hash>(value: T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn render_mermaid_source_to_buffer(source: &str, width: u16, height: u16) -> Buffer {
+    let mut buffer = Buffer::new(width, height);
+    let config = mermaid::MermaidConfig::from_env();
+    if !config.enabled {
+        for (idx, ch) in "Mermaid disabled via env".chars().enumerate() {
+            if let Ok(x) = u16::try_from(idx) {
+                if x >= width {
+                    break;
+                }
+                buffer.set(x, 0, ftui::Cell::from_char(ch));
+            } else {
+                break;
+            }
+        }
+        return buffer;
+    }
+
+    let matrix = MermaidCompatibilityMatrix::default();
+    let policy = MermaidFallbackPolicy::default();
+    let parsed = mermaid::parse_with_diagnostics(source);
+    let ir_parse = mermaid::normalize_ast_to_ir(&parsed.ast, &config, &matrix, &policy);
+    let mut errors = parsed.errors;
+    errors.extend(ir_parse.errors);
+
+    let render_area = Rect::from_size(width, height);
+    let layout = mermaid_layout::layout_diagram(&ir_parse.ir, &config);
+    let _plan = mermaid_render::render_diagram_adaptive(
+        &layout,
+        &ir_parse.ir,
+        &config,
+        render_area,
+        &mut buffer,
+    );
+
+    if !errors.is_empty() {
+        let has_content = !ir_parse.ir.nodes.is_empty()
+            || !ir_parse.ir.edges.is_empty()
+            || !ir_parse.ir.labels.is_empty()
+            || !ir_parse.ir.clusters.is_empty();
+        if has_content {
+            mermaid_render::render_mermaid_error_overlay(
+                &errors,
+                source,
+                &config,
+                render_area,
+                &mut buffer,
+            );
+        } else {
+            mermaid_render::render_mermaid_error_panel(
+                &errors,
+                source,
+                &config,
+                render_area,
+                &mut buffer,
+            );
+        }
+    }
+
+    buffer
+}
+
+fn blit_buffer_to_frame(frame: &mut Frame<'_>, area: Rect, buffer: &Buffer) {
+    let width = area.width.min(buffer.width());
+    let height = area.height.min(buffer.height());
+    for y in 0..height {
+        for x in 0..width {
+            let Some(src) = buffer.get(x, y) else {
+                continue;
+            };
+            let dst_x = area.x + x;
+            let dst_y = area.y + y;
+            if let Some(dst) = frame.buffer.get_mut(dst_x, dst_y) {
+                *dst = *src;
+            }
+        }
+    }
+}
+
+/// Color style based on contact status.
+fn status_color(status: &str) -> Style {
+    let tp = crate::tui_theme::TuiThemePalette::current();
+    match status {
+        "approved" => Style::default().fg(tp.contact_approved),
+        "pending" => Style::default().fg(tp.contact_pending),
+        "blocked" => Style::default().fg(tp.contact_blocked),
+        _ => Style::default(),
+    }
+}
+
+/// Format a microsecond timestamp as relative time.
+fn format_relative_ts(ts_micros: i64) -> String {
+    if ts_micros == 0 {
+        return "never".to_string();
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    let delta_secs = (now - ts_micros) / 1_000_000;
+    if delta_secs < 0 {
+        return "future".to_string();
+    }
+    let delta = delta_secs.unsigned_abs();
+    if delta < 60 {
+        format!("{delta}s ago")
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86400)
+    }
+}
+
+/// Truncate a string to `max_len` characters, adding "..." suffix if needed.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        s.to_string()
+    } else if max_len < 4 {
+        "...".to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len - 3).collect();
+        format!("{truncated}...")
+    }
+}
+
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let label_w: u16 = 14;
+    let visible = area.height as usize;
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(visible);
+    max_scroll_cell.set(max_scroll);
+    let offset = scroll.min(max_scroll);
+
+    for (i, (label, value, color)) in lines.iter().skip(offset).enumerate() {
+        let row_y = area.y + i as u16;
+        if row_y >= area.bottom() {
+            break;
+        }
+        // Label column
+        let label_display: String = if label.len() > label_w as usize {
+            label.chars().take(label_w as usize).collect()
+        } else {
+            format!("{:<w$}", label, w = label_w as usize)
+        };
+        let label_span =
+            Paragraph::new(label_display).style(Style::default().fg(tp.text_muted).bold());
+        let label_rect = Rect::new(area.x, row_y, label_w.min(area.width), 1);
+        label_span.render(label_rect, frame);
+
+        // Value column
+        let val_x = area.x + label_w;
+        if val_x < area.right() {
+            let val_w = area.right() - val_x;
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            let val_span = Paragraph::new(value.as_str()).style(val_style);
+            val_span.render(Rect::new(val_x, row_y, val_w, 1), frame);
+        }
+    }
+
+    // Scroll indicator
+    if total > visible && area.width > 2 {
+        let indicator = format!("[{}/{}]", offset + 1, total.saturating_sub(visible) + 1);
+        let iw = indicator.len().min(area.width as usize) as u16;
+        let ix = area.right().saturating_sub(iw);
+        let iy = area.bottom().saturating_sub(1);
+        if iy >= area.y {
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(Rect::new(ix, iy, iw, 1), frame);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcp_agent_mail_core::Config;
+
+    fn test_state() -> std::sync::Arc<TuiSharedState> {
+        TuiSharedState::new(&Config::default())
+    }
+
+    #[test]
+    fn new_screen_has_defaults() {
+        let screen = ContactsScreen::new();
+        assert!(screen.contacts.is_empty());
+        assert!(!screen.filter_active);
+        assert_eq!(screen.sort_col, COL_UPDATED);
+        assert!(!screen.sort_asc);
+        assert_eq!(screen.status_filter, StatusFilter::All);
+    }
+
+    #[test]
+    fn renders_without_panic() {
+        let state = test_state();
+        let screen = ContactsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn renders_at_minimum_size() {
+        let state = test_state();
+        let screen = ContactsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(20, 3, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 20, 3), &state);
+    }
+
+    #[test]
+    fn renders_at_tiny_size_without_panic() {
+        let state = test_state();
+        let screen = ContactsScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(10, 2, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 10, 2), &state);
+    }
+
+    #[test]
+    fn title_and_label() {
+        let screen = ContactsScreen::new();
+        assert_eq!(screen.title(), "Contacts");
+        assert_eq!(screen.tab_label(), "Links");
+    }
+
+    #[test]
+    fn keybindings_documented() {
+        let screen = ContactsScreen::new();
+        let bindings = screen.keybindings();
+        assert!(bindings.len() >= 5);
+        assert!(bindings.iter().any(|b| b.key == "j/k"));
+        assert!(bindings.iter().any(|b| b.key == "g"));
+        assert!(bindings.iter().any(|b| b.key == "f"));
+    }
+
+    #[test]
+    fn slash_activates_filter() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        assert!(!screen.consumes_text_input());
+
+        let slash = Event::Key(ftui::KeyEvent::new(KeyCode::Char('/')));
+        screen.update(&slash, &state);
+        assert!(screen.consumes_text_input());
+    }
+
+    #[test]
+    fn f_cycles_status_filter() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        assert_eq!(screen.status_filter, StatusFilter::All);
+
+        let f = Event::Key(ftui::KeyEvent::new(KeyCode::Char('f')));
+        screen.update(&f, &state);
+        assert_eq!(screen.status_filter, StatusFilter::Pending);
+
+        screen.update(&f, &state);
+        assert_eq!(screen.status_filter, StatusFilter::Approved);
+
+        screen.update(&f, &state);
+        assert_eq!(screen.status_filter, StatusFilter::Blocked);
+
+        screen.update(&f, &state);
+        assert_eq!(screen.status_filter, StatusFilter::All);
+    }
+
+    #[test]
+    fn s_cycles_sort_column() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let initial = screen.sort_col;
+
+        let s = Event::Key(ftui::KeyEvent::new(KeyCode::Char('s')));
+        screen.update(&s, &state);
+        assert_ne!(screen.sort_col, initial);
+    }
+
+    #[test]
+    fn deep_link_contact_by_pair() {
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary {
+            from_agent: "GoldFox".into(),
+            to_agent: "RedWolf".into(),
+            status: "approved".into(),
+            ..Default::default()
+        });
+        let handled = screen.receive_deep_link(&DeepLinkTarget::ContactByPair(
+            "GoldFox".into(),
+            "RedWolf".into(),
+        ));
+        assert!(handled);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn deep_link_unknown_contact() {
+        let mut screen = ContactsScreen::new();
+        let handled =
+            screen.receive_deep_link(&DeepLinkTarget::ContactByPair("X".into(), "Y".into()));
+        assert!(!handled);
+    }
+
+    #[test]
+    fn status_filter_matches() {
+        assert!(StatusFilter::All.matches("approved"));
+        assert!(StatusFilter::All.matches("pending"));
+        assert!(StatusFilter::Pending.matches("pending"));
+        assert!(!StatusFilter::Pending.matches("approved"));
+        assert!(StatusFilter::Approved.matches("approved"));
+        assert!(!StatusFilter::Approved.matches("blocked"));
+        assert!(StatusFilter::Blocked.matches("blocked"));
+    }
+
+    #[test]
+    fn format_relative_ts_values() {
+        assert_eq!(format_relative_ts(0), "never");
+        let now = chrono::Utc::now().timestamp_micros();
+        let result = format_relative_ts(now - 30_000_000);
+        assert!(result.contains("s ago"));
+    }
+
+    #[test]
+    fn truncate_str_values() {
+        assert_eq!(truncate_str("short", 20), "short");
+        assert_eq!(truncate_str("this is a long reason", 10), "this is...");
+        assert_eq!(truncate_str("abc", 3), "abc"); // fits exactly
+        assert_eq!(truncate_str("abcd", 3), "..."); // max_len < 4 → "..."
+    }
+
+    #[test]
+    fn default_impl() {
+        let screen = ContactsScreen::default();
+        assert!(screen.contacts.is_empty());
+    }
+
+    #[test]
+    fn status_color_values() {
+        let _ = status_color("approved");
+        let _ = status_color("pending");
+        let _ = status_color("blocked");
+        let _ = status_color("unknown");
+    }
+
+    #[test]
+    fn move_selection_navigation() {
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary::default());
+        screen.contacts.push(ContactSummary::default());
+        screen.table_state.selected = Some(0);
+
+        screen.move_selection(1);
+        assert_eq!(screen.table_state.selected, Some(1));
+
+        screen.move_selection(-1);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn g_toggles_mermaid_panel_and_home_keeps_jump_to_start() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.contacts = vec![ContactSummary::default(), ContactSummary::default()];
+        screen.table_state.selected = Some(1);
+
+        let g = Event::Key(ftui::KeyEvent::new(KeyCode::Char('g')));
+        screen.update(&g, &state);
+        assert!(screen.show_mermaid_panel);
+        screen.update(&g, &state);
+        assert!(!screen.show_mermaid_panel);
+
+        let home = Event::Key(ftui::KeyEvent::new(KeyCode::Home));
+        screen.update(&home, &state);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn escape_closes_mermaid_panel_before_clearing_filter() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.filter = "fox".to_string();
+        screen.show_mermaid_panel = true;
+
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        screen.update(&esc, &state);
+
+        assert!(!screen.show_mermaid_panel);
+        assert_eq!(screen.filter, "fox");
+    }
+
+    #[test]
+    fn mermaid_panel_render_no_panic() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+        screen.show_mermaid_panel = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+    }
+
+    #[test]
+    fn mermaid_cache_refreshes_immediately_when_source_changes() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.show_mermaid_panel = true;
+        screen.contacts.push(ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+        let first_hash = screen
+            .mermaid_cache
+            .borrow()
+            .as_ref()
+            .map(|cached| cached.source_hash)
+            .expect("first render should populate cache");
+
+        screen.contacts.push(ContactSummary {
+            from_agent: "Gamma".to_string(),
+            to_agent: "Delta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+        *screen.mermaid_last_render_at.borrow_mut() = Some(Instant::now());
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(100, 24, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 100, 24), &state);
+        let second_hash = screen
+            .mermaid_cache
+            .borrow()
+            .as_ref()
+            .map(|cached| cached.source_hash)
+            .expect("second render should keep cache");
+
+        assert_ne!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn graph_metrics_track_flow_counts_from_mail_events() {
+        let contacts = vec![
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Gamma".to_string(),
+                status: "approved".to_string(),
+                ..Default::default()
+            },
+        ];
+        let events = vec![
+            MailEvent::message_sent(
+                1,
+                "Alpha",
+                vec!["Beta".to_string(), "Gamma".to_string()],
+                "s",
+                "t",
+                "p",
+                "",
+            ),
+            MailEvent::message_received(2, "Beta", vec!["Alpha".to_string()], "s", "t", "p", ""),
+        ];
+        let metrics = build_graph_flow_metrics(&contacts, &events);
+        assert_eq!(metrics.edge_weight("Alpha", "Beta"), 1);
+        assert_eq!(metrics.edge_weight("Alpha", "Gamma"), 1);
+        assert_eq!(metrics.edge_weight("Beta", "Alpha"), 1);
+        assert_eq!(metrics.node_total("Alpha"), 3);
+        assert_eq!(metrics.node_total("Gamma"), 1);
+    }
+
+    #[test]
+    fn graph_metrics_fallback_to_contact_degree_when_no_message_events() {
+        let contacts = vec![ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        }];
+        let metrics = build_graph_flow_metrics(&contacts, &[]);
+        assert_eq!(metrics.edge_weight("Alpha", "Beta"), 1);
+        assert_eq!(metrics.node_sent.get("Alpha").copied(), Some(1));
+        assert_eq!(metrics.node_received.get("Beta").copied(), Some(1));
+    }
+
+    #[test]
+    fn graph_layout_includes_agents_seen_only_in_recent_events() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "OnlyInEvents",
+            vec!["Beta".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+        screen.rebuild_from_state(&state);
+        assert!(
+            screen
+                .graph_nodes
+                .iter()
+                .any(|(name, _, _)| name == "OnlyInEvents")
+        );
+    }
+
+    #[test]
+    fn graph_layout_populates_lookup_for_all_graph_nodes() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "OnlyInEvents",
+            vec!["Beta".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.graph_node_lookup.len(), screen.graph_nodes.len());
+        for (name, x, y) in &screen.graph_nodes {
+            assert_eq!(screen.graph_node_lookup.get(name), Some(&(*x, *y)));
+        }
+    }
+
+    #[test]
+    fn graph_layout_clears_lookup_when_no_agents_remain() {
+        let mut screen = ContactsScreen::new();
+        screen.contacts.push(ContactSummary {
+            from_agent: "Alpha".to_string(),
+            to_agent: "Beta".to_string(),
+            status: "approved".to_string(),
+            ..Default::default()
+        });
+        screen.layout_graph(&[]);
+        assert!(!screen.graph_nodes.is_empty());
+        assert!(!screen.graph_node_lookup.is_empty());
+
+        screen.contacts.clear();
+        screen.layout_graph(&[]);
+        assert!(screen.graph_nodes.is_empty());
+        assert!(screen.graph_node_lookup.is_empty());
+    }
+
+    #[test]
+    fn contact_row_churn_counts_add_remove_and_mutation() {
+        let previous = vec![
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "pending".to_string(),
+                reason: "needs review".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Gamma".to_string(),
+                to_agent: "Delta".to_string(),
+                status: "approved".to_string(),
+                reason: "ok".to_string(),
+                updated_ts: 2,
+                ..Default::default()
+            },
+        ];
+        let current = vec![
+            ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                reason: "needs review".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Gamma".to_string(),
+                to_agent: "Delta".to_string(),
+                status: "approved".to_string(),
+                reason: "ok".to_string(),
+                updated_ts: 2,
+                ..Default::default()
+            },
+            ContactSummary {
+                from_agent: "Iota".to_string(),
+                to_agent: "Kappa".to_string(),
+                status: "pending".to_string(),
+                reason: "new".to_string(),
+                updated_ts: 3,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(contact_row_churn(&previous, &current), 3);
+        assert_eq!(contact_row_churn(&current, &current), 0);
+    }
+
+    #[test]
+    fn rebuild_diagnostic_includes_contacts_churn_and_recompute_counters() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contacts_list: vec![ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, first) = diagnostics
+            .last()
+            .expect("contacts diagnostic should be emitted");
+        assert!(first.query_params.contains("rebuilds=1"));
+        assert!(first.query_params.contains("table_transforms=1"));
+        assert!(first.query_params.contains("layout_recomputes=1"));
+        assert!(first.query_params.contains("row_churn_last=1"));
+        assert!(first.query_params.contains("row_churn_total=1"));
+
+        screen.rebuild_from_state(&state);
+        let diagnostics = state.screen_diagnostics_since(0);
+        let (_, second) = diagnostics
+            .last()
+            .expect("contacts diagnostic should be emitted");
+        assert!(second.query_params.contains("rebuilds=2"));
+        assert!(second.query_params.contains("table_transforms=2"));
+        assert!(second.query_params.contains("layout_recomputes=2"));
+        assert!(second.query_params.contains("row_churn_last=0"));
+        assert!(second.query_params.contains("row_churn_total=1"));
+    }
+
+    #[test]
+    fn rebuild_populates_cached_graph_metrics_from_recent_events() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "Alpha",
+            vec!["Beta".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+        screen.rebuild_from_state(&state);
+        assert_eq!(screen.graph_metrics.edge_weight("Alpha", "Beta"), 1);
+    }
+
+    #[test]
+    fn rebuild_preserves_stale_contacts_when_db_false_empties_with_same_query() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: vec![ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        let original = screen.contacts.clone();
+
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: Vec::new(),
+            ..Default::default()
+        });
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.contacts, original);
+    }
+
+    #[test]
+    fn rebuild_clears_contacts_when_query_changed_before_db_false_empty() {
+        let state = test_state();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: vec![ContactSummary {
+                from_agent: "Alpha".to_string(),
+                to_agent: "Beta".to_string(),
+                status: "approved".to_string(),
+                updated_ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        screen.filter = "beta".to_string();
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            contact_links: 1,
+            contacts_list: Vec::new(),
+            ..Default::default()
+        });
+        screen.rebuild_from_state(&state);
+
+        assert!(screen.contacts.is_empty());
+    }
+
+    #[test]
+    fn tick_refreshes_graph_metrics_at_refresh_boundary_when_events_change() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.rebuild_from_state(&state);
+        screen.last_data_gen = state.data_generation();
+
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "TickAgent",
+            vec!["Peer".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+
+        // Non-refresh tick should defer expensive rebuild work.
+        screen.tick(9, &state);
+        assert_eq!(screen.graph_metrics.edge_weight("TickAgent", "Peer"), 0);
+
+        // Refresh boundary applies pending dirty-state updates.
+        screen.tick(10, &state);
+        assert_eq!(screen.graph_metrics.edge_weight("TickAgent", "Peer"), 1);
+    }
+
+    #[test]
+    fn enter_on_graph_node_opens_agents_deeplink() {
+        let state = test_state();
+        let mut screen = ContactsScreen::new();
+        screen.view_mode = ViewMode::Graph;
+        let _ = state.push_event(MailEvent::message_sent(
+            1,
+            "GraphAgent",
+            vec!["Peer".to_string()],
+            "subject",
+            "thread",
+            "project",
+            "",
+        ));
+        screen.rebuild_from_state(&state);
+        screen.graph_selected_idx = 0;
+
+        let enter = Event::Key(ftui::KeyEvent::new(KeyCode::Enter));
+        let cmd = screen.update(&enter, &state);
+        assert!(matches!(
+            cmd,
+            Cmd::Msg(MailScreenMsg::DeepLink(DeepLinkTarget::AgentByName(ref name)))
+                if name == "GraphAgent"
+        ));
+    }
+
+    // ── truncate_str UTF-8 safety ────────────────────────────────────
+
+    #[test]
+    fn truncate_str_ascii_short() {
+        assert_eq!(truncate_str("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_str_ascii_over() {
+        assert_eq!(truncate_str("hello world!", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_str_tiny_max() {
+        assert_eq!(truncate_str("hello", 2), "...");
+    }
+
+    #[test]
+    fn truncate_str_3byte_arrow_no_panic() {
+        let s = "foo → bar → baz";
+        let r = truncate_str(s, 8);
+        assert!(r.chars().count() <= 8);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_cjk_no_panic() {
+        let s = "日本語テスト文字列";
+        let r = truncate_str(s, 6);
+        assert!(r.chars().count() <= 6);
+        assert!(r.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_str_emoji_no_panic() {
+        let s = "🔥🚀💡🎯🏆";
+        let r = truncate_str(s, 5);
+        assert!(r.chars().count() <= 5);
+    }
+
+    #[test]
+    fn truncate_str_mixed_multibyte_sweep() {
+        let s = "a→b🔥cé";
+        for max in 1..=s.chars().count() + 2 {
+            let r = truncate_str(s, max);
+            assert!(r.chars().count() <= max.max(3), "max={max}");
+        }
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn status_filter_next_full_cycle() {
+        let f = StatusFilter::All;
+        let f = f.next();
+        assert_eq!(f, StatusFilter::Pending);
+        let f = f.next();
+        assert_eq!(f, StatusFilter::Approved);
+        let f = f.next();
+        assert_eq!(f, StatusFilter::Blocked);
+        let f = f.next();
+        assert_eq!(f, StatusFilter::All);
+    }
+
+    #[test]
+    fn status_filter_labels() {
+        assert_eq!(StatusFilter::All.label(), "All");
+        assert_eq!(StatusFilter::Pending.label(), "Pending");
+        assert_eq!(StatusFilter::Approved.label(), "Approved");
+        assert_eq!(StatusFilter::Blocked.label(), "Blocked");
+    }
+
+    #[test]
+    fn graph_flow_metrics_empty() {
+        let m = GraphFlowMetrics::default();
+        assert_eq!(m.max_node_total(), 0);
+        assert_eq!(m.max_edge_weight(), 0);
+        assert_eq!(m.node_total("nonexistent"), 0);
+        assert_eq!(m.edge_weight("a", "b"), 0);
+    }
+
+    #[test]
+    fn graph_flow_metrics_max_calculations() {
+        let mut m = GraphFlowMetrics::default();
+        m.node_sent.insert("alpha".into(), 10);
+        m.node_received.insert("alpha".into(), 5);
+        m.node_sent.insert("beta".into(), 3);
+        m.node_received.insert("beta".into(), 20);
+        m.edge_volume.insert(("alpha".into(), "beta".into()), 8);
+        m.edge_volume.insert(("beta".into(), "alpha".into()), 12);
+
+        assert_eq!(m.node_total("alpha"), 15);
+        assert_eq!(m.node_total("beta"), 23);
+        assert_eq!(m.max_node_total(), 23);
+        assert_eq!(m.max_edge_weight(), 12);
+        assert_eq!(m.edge_weight("alpha", "beta"), 8);
+        assert_eq!(m.edge_weight("beta", "alpha"), 12);
+    }
+
+    #[test]
+    fn sanitize_diagnostic_value_strips_separators() {
+        assert_eq!(sanitize_diagnostic_value("a\nb;c,d\re"), "a b c d e");
+        assert_eq!(sanitize_diagnostic_value("   "), "");
+    }
+
+    #[test]
+    fn view_mode_is_table_by_default() {
+        let screen = ContactsScreen::new();
+        assert_eq!(screen.view_mode, ViewMode::Table);
+    }
+
+    #[test]
+    fn status_filter_matches_case_sensitive() {
+        assert!(!StatusFilter::Pending.matches("Pending"));
+        assert!(!StatusFilter::Approved.matches("APPROVED"));
+        assert!(!StatusFilter::Blocked.matches("BLOCKED"));
+    }
+
+    #[test]
+    fn b8_contacts_show_explicit_unavailable_after_warmup_failure() {
+        let state = test_state();
+        state.mark_db_warmup_failed();
+        let mut screen = ContactsScreen::new();
+
+        screen.tick(30, &state);
+
+        assert!(screen.db_context_unavailable);
+        assert_eq!(
+            screen.db_context_banner,
+            crate::tui_screens::POLLER_DB_UNAVAILABLE_BANNER
+        );
+    }
+}

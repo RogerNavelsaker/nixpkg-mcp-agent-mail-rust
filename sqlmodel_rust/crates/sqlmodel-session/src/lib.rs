@@ -1,0 +1,5487 @@
+//! Session and Unit of Work for SQLModel Rust.
+//!
+//! `sqlmodel-session` is the **unit-of-work layer**. It coordinates object identity,
+//! change tracking, and transactional persistence in a way that mirrors Python SQLModel
+//! while staying explicit and Rust-idiomatic.
+//!
+//! # Role In The Architecture
+//!
+//! - **Identity map**: ensures a single in-memory instance per primary key.
+//! - **Change tracking**: records inserts, updates, and deletes before flush.
+//! - **Transactional safety**: wraps flush/commit/rollback around a `Connection`.
+//!
+//! # Design Philosophy
+//!
+//! - **Explicit over implicit**: No autoflush by default.
+//! - **Ownership clarity**: Session owns the connection or pooled connection.
+//! - **Type erasure**: Identity map stores `Box<dyn Any>` for heterogeneous models.
+//! - **Cancel-correct**: All async operations use `Cx` + `Outcome` via `sqlmodel-core`.
+//!
+//! # Example
+//!
+//! ```ignore
+//! // Create session from pool
+//! let mut session = Session::new(&pool).await?;
+//!
+//! // Add new objects (will be INSERTed on flush)
+//! session.add(&hero);
+//!
+//! // Get by primary key (uses identity map)
+//! let hero = session.get::<Hero>(1).await?;
+//!
+//! // Mark for deletion
+//! session.delete(&hero);
+//!
+//! // Flush pending changes to DB
+//! session.flush().await?;
+//!
+//! // Commit the transaction
+//! session.commit().await?;
+//! ```
+
+pub mod change_tracker;
+pub mod flush;
+pub mod identity_map;
+pub mod n1_detection;
+pub mod unit_of_work;
+
+pub use change_tracker::{ChangeTracker, ObjectSnapshot};
+pub use flush::{
+    FlushOrderer, FlushPlan, FlushResult, LinkTableOp, PendingOp, execute_link_table_ops,
+};
+pub use identity_map::{IdentityMap, ModelReadGuard, ModelRef, ModelWriteGuard, WeakIdentityMap};
+pub use n1_detection::{CallSite, N1DetectionScope, N1QueryTracker, N1Stats};
+pub use unit_of_work::{PendingCounts, UnitOfWork, UowError};
+
+use asupersync::{Cx, Outcome};
+use serde::{Deserialize, Serialize};
+use sqlmodel_core::{Connection, Error, Lazy, LazyLoader, Model, Value};
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::future::Future;
+use std::hash::{Hash, Hasher};
+
+// ============================================================================
+// Session Events
+// ============================================================================
+
+/// Type alias for session event callbacks.
+///
+/// Callbacks receive no arguments and return `Result<(), Error>`.
+/// Returning `Err` will abort the operation (e.g., prevent commit).
+type SessionEventFn = Box<dyn FnMut() -> Result<(), Error> + Send>;
+
+/// Holds registered session-level event callbacks.
+///
+/// These are fired at key points in the session lifecycle:
+/// before/after flush, commit, and rollback.
+#[derive(Default)]
+pub struct SessionEventCallbacks {
+    before_flush: Vec<SessionEventFn>,
+    after_flush: Vec<SessionEventFn>,
+    before_commit: Vec<SessionEventFn>,
+    after_commit: Vec<SessionEventFn>,
+    after_rollback: Vec<SessionEventFn>,
+}
+
+impl std::fmt::Debug for SessionEventCallbacks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEventCallbacks")
+            .field("before_flush", &self.before_flush.len())
+            .field("after_flush", &self.after_flush.len())
+            .field("before_commit", &self.before_commit.len())
+            .field("after_commit", &self.after_commit.len())
+            .field("after_rollback", &self.after_rollback.len())
+            .finish()
+    }
+}
+
+impl SessionEventCallbacks {
+    #[allow(clippy::result_large_err)]
+    fn fire(&mut self, event: SessionEvent) -> Result<(), Error> {
+        let callbacks = match event {
+            SessionEvent::BeforeFlush => &mut self.before_flush,
+            SessionEvent::AfterFlush => &mut self.after_flush,
+            SessionEvent::BeforeCommit => &mut self.before_commit,
+            SessionEvent::AfterCommit => &mut self.after_commit,
+            SessionEvent::AfterRollback => &mut self.after_rollback,
+        };
+        for cb in callbacks.iter_mut() {
+            cb()?;
+        }
+        Ok(())
+    }
+}
+
+/// Session lifecycle events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// Fired before flush executes pending changes.
+    BeforeFlush,
+    /// Fired after flush completes successfully.
+    AfterFlush,
+    /// Fired before commit (after flush).
+    BeforeCommit,
+    /// Fired after commit completes successfully.
+    AfterCommit,
+    /// Fired after rollback completes.
+    AfterRollback,
+}
+
+// ============================================================================
+// Session Configuration
+// ============================================================================
+
+/// Configuration for Session behavior.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Whether to auto-begin a transaction on first operation.
+    pub auto_begin: bool,
+    /// Whether to auto-flush before queries (not recommended for performance).
+    pub auto_flush: bool,
+    /// Whether to expire objects after commit (reload from DB on next access).
+    pub expire_on_commit: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            auto_begin: true,
+            auto_flush: false,
+            expire_on_commit: true,
+        }
+    }
+}
+
+/// Options for `Session::get_with_options()`.
+#[derive(Debug, Clone, Default)]
+pub struct GetOptions {
+    /// If true, use SELECT ... FOR UPDATE to lock the row.
+    pub with_for_update: bool,
+    /// If true, use SKIP LOCKED with FOR UPDATE (requires `with_for_update`).
+    pub skip_locked: bool,
+    /// If true, use NOWAIT with FOR UPDATE (requires `with_for_update`).
+    pub nowait: bool,
+}
+
+impl GetOptions {
+    /// Create new default options.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the `with_for_update` option (builder pattern).
+    #[must_use]
+    pub fn with_for_update(mut self, value: bool) -> Self {
+        self.with_for_update = value;
+        self
+    }
+
+    /// Set the `skip_locked` option (builder pattern).
+    #[must_use]
+    pub fn skip_locked(mut self, value: bool) -> Self {
+        self.skip_locked = value;
+        self
+    }
+
+    /// Set the `nowait` option (builder pattern).
+    #[must_use]
+    pub fn nowait(mut self, value: bool) -> Self {
+        self.nowait = value;
+        self
+    }
+}
+
+// ============================================================================
+// Object Key and State
+// ============================================================================
+
+/// Unique key for an object in the identity map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectKey {
+    /// Type identifier for the Model type.
+    type_id: TypeId,
+    /// Hash of the primary key value(s).
+    pk_hash: u64,
+}
+
+impl ObjectKey {
+    /// Create an object key from a model instance.
+    pub fn from_model<M: Model + 'static>(obj: &M) -> Self {
+        let pk_values = obj.primary_key_value();
+        Self {
+            type_id: TypeId::of::<M>(),
+            pk_hash: hash_values(&pk_values),
+        }
+    }
+
+    /// Create an object key from type and primary key.
+    pub fn from_pk<M: Model + 'static>(pk: &[Value]) -> Self {
+        Self {
+            type_id: TypeId::of::<M>(),
+            pk_hash: hash_values(pk),
+        }
+    }
+
+    /// Get the primary key hash.
+    pub fn pk_hash(&self) -> u64 {
+        self.pk_hash
+    }
+
+    /// Get the type identifier.
+    pub fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+}
+
+/// Hash a slice of values for use as a primary key hash.
+fn hash_values(values: &[Value]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    for v in values {
+        // Hash based on value variant and content
+        match v {
+            Value::Null => 0u8.hash(&mut hasher),
+            Value::Bool(b) => {
+                1u8.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Value::TinyInt(i) => {
+                2u8.hash(&mut hasher);
+                i.hash(&mut hasher);
+            }
+            Value::SmallInt(i) => {
+                3u8.hash(&mut hasher);
+                i.hash(&mut hasher);
+            }
+            Value::Int(i) => {
+                4u8.hash(&mut hasher);
+                i.hash(&mut hasher);
+            }
+            Value::BigInt(i) => {
+                5u8.hash(&mut hasher);
+                i.hash(&mut hasher);
+            }
+            Value::Float(f) => {
+                6u8.hash(&mut hasher);
+                f.to_bits().hash(&mut hasher);
+            }
+            Value::Double(f) => {
+                7u8.hash(&mut hasher);
+                f.to_bits().hash(&mut hasher);
+            }
+            Value::Decimal(s) => {
+                8u8.hash(&mut hasher);
+                s.hash(&mut hasher);
+            }
+            Value::Text(s) => {
+                9u8.hash(&mut hasher);
+                s.hash(&mut hasher);
+            }
+            Value::Bytes(b) => {
+                10u8.hash(&mut hasher);
+                b.hash(&mut hasher);
+            }
+            Value::Date(d) => {
+                11u8.hash(&mut hasher);
+                d.hash(&mut hasher);
+            }
+            Value::Time(t) => {
+                12u8.hash(&mut hasher);
+                t.hash(&mut hasher);
+            }
+            Value::Timestamp(ts) => {
+                13u8.hash(&mut hasher);
+                ts.hash(&mut hasher);
+            }
+            Value::TimestampTz(ts) => {
+                14u8.hash(&mut hasher);
+                ts.hash(&mut hasher);
+            }
+            Value::Uuid(u) => {
+                15u8.hash(&mut hasher);
+                u.hash(&mut hasher);
+            }
+            Value::Json(j) => {
+                16u8.hash(&mut hasher);
+                // Hash the JSON string representation
+                j.to_string().hash(&mut hasher);
+            }
+            Value::Array(arr) => {
+                17u8.hash(&mut hasher);
+                // Recursively hash array elements
+                arr.len().hash(&mut hasher);
+                for item in arr {
+                    hash_value(item, &mut hasher);
+                }
+            }
+            Value::Default => {
+                18u8.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+/// Hash a single value into the hasher.
+fn hash_value(v: &Value, hasher: &mut impl Hasher) {
+    match v {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::TinyInt(i) => {
+            2u8.hash(hasher);
+            i.hash(hasher);
+        }
+        Value::SmallInt(i) => {
+            3u8.hash(hasher);
+            i.hash(hasher);
+        }
+        Value::Int(i) => {
+            4u8.hash(hasher);
+            i.hash(hasher);
+        }
+        Value::BigInt(i) => {
+            5u8.hash(hasher);
+            i.hash(hasher);
+        }
+        Value::Float(f) => {
+            6u8.hash(hasher);
+            f.to_bits().hash(hasher);
+        }
+        Value::Double(f) => {
+            7u8.hash(hasher);
+            f.to_bits().hash(hasher);
+        }
+        Value::Decimal(s) => {
+            8u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Text(s) => {
+            9u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Bytes(b) => {
+            10u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Date(d) => {
+            11u8.hash(hasher);
+            d.hash(hasher);
+        }
+        Value::Time(t) => {
+            12u8.hash(hasher);
+            t.hash(hasher);
+        }
+        Value::Timestamp(ts) => {
+            13u8.hash(hasher);
+            ts.hash(hasher);
+        }
+        Value::TimestampTz(ts) => {
+            14u8.hash(hasher);
+            ts.hash(hasher);
+        }
+        Value::Uuid(u) => {
+            15u8.hash(hasher);
+            u.hash(hasher);
+        }
+        Value::Json(j) => {
+            16u8.hash(hasher);
+            j.to_string().hash(hasher);
+        }
+        Value::Array(arr) => {
+            17u8.hash(hasher);
+            arr.len().hash(hasher);
+            for item in arr {
+                hash_value(item, hasher);
+            }
+        }
+        Value::Default => {
+            18u8.hash(hasher);
+        }
+    }
+}
+
+/// State of a tracked object in the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectState {
+    /// New object, needs INSERT on flush.
+    New,
+    /// Persistent object loaded from database.
+    Persistent,
+    /// Object marked for deletion, needs DELETE on flush.
+    Deleted,
+    /// Object detached from session.
+    Detached,
+    /// Object expired, needs reload from database.
+    Expired,
+}
+
+/// A tracked object in the session.
+struct TrackedObject {
+    /// The actual object (type-erased).
+    object: Box<dyn Any + Send + Sync>,
+    /// Original serialized state for dirty checking.
+    original_state: Option<Vec<u8>>,
+    /// Current object state.
+    state: ObjectState,
+    /// Table name for this object.
+    table_name: &'static str,
+    /// Column names for this object.
+    column_names: Vec<&'static str>,
+    /// Current values for each column (for INSERT/UPDATE).
+    values: Vec<Value>,
+    /// Primary key column names.
+    pk_columns: Vec<&'static str>,
+    /// Primary key values (for DELETE/UPDATE WHERE clause).
+    pk_values: Vec<Value>,
+    /// Static relationship metadata for this object's model type.
+    relationships: &'static [sqlmodel_core::RelationshipInfo],
+    /// Set of expired attribute names (None = all expired, Some(empty) = none expired).
+    /// When Some(non-empty), only those specific attributes need reload.
+    expired_attributes: Option<std::collections::HashSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CascadeChildDeleteKey {
+    table: &'static str,
+    fk_cols: Vec<&'static str>,
+}
+
+// ============================================================================
+// Session
+// ============================================================================
+
+/// The Session is the central unit-of-work manager.
+///
+/// It tracks objects loaded from or added to the database and coordinates
+/// flushing changes back to the database.
+pub struct Session<C: Connection> {
+    /// The database connection.
+    connection: C,
+    /// Whether we're in a transaction.
+    in_transaction: bool,
+    /// Identity map: ObjectKey -> TrackedObject.
+    identity_map: HashMap<ObjectKey, TrackedObject>,
+    /// Objects marked as new (need INSERT).
+    pending_new: Vec<ObjectKey>,
+    /// Objects marked as deleted (need DELETE).
+    pending_delete: Vec<ObjectKey>,
+    /// Objects that are dirty (need UPDATE).
+    pending_dirty: Vec<ObjectKey>,
+    /// Configuration.
+    config: SessionConfig,
+    /// N+1 query detection tracker (optional).
+    n1_tracker: Option<N1QueryTracker>,
+    /// Session-level event callbacks.
+    event_callbacks: SessionEventCallbacks,
+}
+
+impl<C: Connection> Session<C> {
+    /// Create a new session from an existing connection.
+    pub fn new(connection: C) -> Self {
+        Self::with_config(connection, SessionConfig::default())
+    }
+
+    /// Create a new session with custom configuration.
+    pub fn with_config(connection: C, config: SessionConfig) -> Self {
+        Self {
+            connection,
+            in_transaction: false,
+            identity_map: HashMap::new(),
+            pending_new: Vec::new(),
+            pending_delete: Vec::new(),
+            pending_dirty: Vec::new(),
+            config,
+            n1_tracker: None,
+            event_callbacks: SessionEventCallbacks::default(),
+        }
+    }
+
+    /// Get a reference to the underlying connection.
+    pub fn connection(&self) -> &C {
+        &self.connection
+    }
+
+    /// Get the session configuration.
+    pub fn config(&self) -> &SessionConfig {
+        &self.config
+    }
+
+    // ========================================================================
+    // Session Events
+    // ========================================================================
+
+    /// Register a callback to run before flush.
+    ///
+    /// The callback can abort the flush by returning `Err`.
+    pub fn on_before_flush(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.before_flush.push(Box::new(f));
+    }
+
+    /// Register a callback to run after a successful flush.
+    pub fn on_after_flush(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.after_flush.push(Box::new(f));
+    }
+
+    /// Register a callback to run before commit (after flush).
+    ///
+    /// The callback can abort the commit by returning `Err`.
+    pub fn on_before_commit(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.before_commit.push(Box::new(f));
+    }
+
+    /// Register a callback to run after a successful commit.
+    pub fn on_after_commit(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.after_commit.push(Box::new(f));
+    }
+
+    /// Register a callback to run after rollback.
+    pub fn on_after_rollback(&mut self, f: impl FnMut() -> Result<(), Error> + Send + 'static) {
+        self.event_callbacks.after_rollback.push(Box::new(f));
+    }
+
+    // ========================================================================
+    // Object Tracking
+    // ========================================================================
+
+    /// Add a new object to the session.
+    ///
+    /// The object will be INSERTed on the next `flush()` call.
+    pub fn add<M: Model + Clone + Send + Sync + Serialize + 'static>(&mut self, obj: &M) {
+        let key = ObjectKey::from_model(obj);
+
+        // If already tracked, update the object and its values
+        if let Some(tracked) = self.identity_map.get_mut(&key) {
+            tracked.object = Box::new(obj.clone());
+
+            // Update stored values to match the new object state
+            let row_data = obj.to_row();
+            tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
+            tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
+            tracked.pk_values = obj.primary_key_value();
+
+            if tracked.state == ObjectState::Deleted {
+                // Un-delete: remove from pending_delete and restore state
+                self.pending_delete.retain(|k| k != &key);
+
+                if tracked.original_state.is_some() {
+                    // Was previously persisted - restore to Persistent (will need UPDATE if changed)
+                    tracked.state = ObjectState::Persistent;
+                } else {
+                    // Was never persisted - restore to New and schedule for INSERT
+                    tracked.state = ObjectState::New;
+                    if !self.pending_new.contains(&key) {
+                        self.pending_new.push(key);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Extract column data from the model while we have the concrete type
+        let row_data = obj.to_row();
+        let column_names: Vec<&'static str> = row_data.iter().map(|(name, _)| *name).collect();
+        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+        // Extract primary key info
+        let pk_columns: Vec<&'static str> = M::PRIMARY_KEY.to_vec();
+        let pk_values = obj.primary_key_value();
+
+        let tracked = TrackedObject {
+            object: Box::new(obj.clone()),
+            original_state: None, // New objects have no original state
+            state: ObjectState::New,
+            table_name: M::TABLE_NAME,
+            column_names,
+            values,
+            pk_columns,
+            pk_values,
+            relationships: M::RELATIONSHIPS,
+            expired_attributes: None,
+        };
+
+        self.identity_map.insert(key, tracked);
+        self.pending_new.push(key);
+    }
+
+    /// Add multiple objects to the session at once.
+    ///
+    /// This is equivalent to calling `add()` for each object, but provides a more
+    /// convenient API for bulk operations.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let users = vec![user1, user2, user3];
+    /// session.add_all(&users);
+    ///
+    /// // Or with an iterator
+    /// session.add_all(users.iter());
+    /// ```
+    ///
+    /// All objects will be INSERTed on the next `flush()` call.
+    pub fn add_all<'a, M, I>(&mut self, objects: I)
+    where
+        M: Model + Clone + Send + Sync + Serialize + 'static,
+        I: IntoIterator<Item = &'a M>,
+    {
+        for obj in objects {
+            self.add(obj);
+        }
+    }
+
+    /// Delete an object from the session.
+    ///
+    /// The object will be DELETEd on the next `flush()` call.
+    pub fn delete<M: Model + 'static>(&mut self, obj: &M) {
+        let key = ObjectKey::from_model(obj);
+
+        if let Some(tracked) = self.identity_map.get_mut(&key) {
+            match tracked.state {
+                ObjectState::New => {
+                    // If it's new, just remove it entirely
+                    self.identity_map.remove(&key);
+                    self.pending_new.retain(|k| k != &key);
+                }
+                ObjectState::Persistent | ObjectState::Expired => {
+                    tracked.state = ObjectState::Deleted;
+                    self.pending_delete.push(key);
+                    self.pending_dirty.retain(|k| k != &key);
+                }
+                ObjectState::Deleted | ObjectState::Detached => {
+                    // Already deleted or detached, nothing to do
+                }
+            }
+        }
+    }
+
+    /// Mark an object as dirty (modified) so it will be UPDATEd on flush.
+    ///
+    /// This updates the stored values from the object and schedules an UPDATE.
+    /// Only works for objects that are already tracked as Persistent.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut hero = session.get::<Hero>(1).await?.unwrap();
+    /// hero.name = "New Name".to_string();
+    /// session.mark_dirty(&hero);  // Schedule for UPDATE
+    /// session.flush(cx).await?;   // Execute the UPDATE
+    /// ```
+    pub fn mark_dirty<M: Model + Clone + Send + Sync + Serialize + 'static>(&mut self, obj: &M) {
+        let key = ObjectKey::from_model(obj);
+
+        if let Some(tracked) = self.identity_map.get_mut(&key) {
+            // Only mark persistent objects as dirty
+            if tracked.state != ObjectState::Persistent {
+                return;
+            }
+
+            // Update the stored object and values
+            tracked.object = Box::new(obj.clone());
+            let row_data = obj.to_row();
+            tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
+            tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
+            tracked.pk_values = obj.primary_key_value();
+
+            // Add to pending dirty if not already there
+            if !self.pending_dirty.contains(&key) {
+                self.pending_dirty.push(key);
+            }
+        }
+    }
+
+    /// Get an object by primary key.
+    ///
+    /// First checks the identity map, then queries the database if not found.
+    pub async fn get<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        pk: impl Into<Value>,
+    ) -> Outcome<Option<M>, Error> {
+        let pk_value = pk.into();
+        let pk_values = vec![pk_value.clone()];
+        let key = ObjectKey::from_pk::<M>(&pk_values);
+
+        // Check identity map first (skip if expired - will reload below)
+        if let Some(tracked) = self.identity_map.get(&key) {
+            match tracked.state {
+                ObjectState::Deleted | ObjectState::Detached => {
+                    // Return None for deleted/detached objects
+                }
+                ObjectState::Expired => {
+                    // Skip cache, will reload from DB below
+                    tracing::debug!("Object is expired, reloading from database");
+                }
+                ObjectState::New | ObjectState::Persistent => {
+                    if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                        return Outcome::Ok(Some(obj.clone()));
+                    }
+                }
+            }
+        }
+
+        // Query from database
+        let pk_col = M::PRIMARY_KEY.first().unwrap_or(&"id");
+        let sql = format!(
+            "SELECT * FROM \"{}\" WHERE \"{}\" = $1 LIMIT 1",
+            M::TABLE_NAME,
+            pk_col
+        );
+
+        let rows = match self.connection.query(cx, &sql, &[pk_value]).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        if rows.is_empty() {
+            return Outcome::Ok(None);
+        }
+
+        // Convert row to model
+        let obj = match M::from_row(&rows[0]) {
+            Ok(obj) => obj,
+            Err(e) => return Outcome::Err(e),
+        };
+
+        // Extract column data from the model while we have the concrete type
+        let row_data = obj.to_row();
+        let column_names: Vec<&'static str> = row_data.iter().map(|(name, _)| *name).collect();
+        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+        // Serialize values for dirty checking (must match format used in flush)
+        let serialized = serde_json::to_vec(&values).ok();
+
+        // Extract primary key info
+        let pk_columns: Vec<&'static str> = M::PRIMARY_KEY.to_vec();
+        let obj_pk_values = obj.primary_key_value();
+
+        let tracked = TrackedObject {
+            object: Box::new(obj.clone()),
+            original_state: serialized,
+            state: ObjectState::Persistent,
+            table_name: M::TABLE_NAME,
+            column_names,
+            values,
+            pk_columns,
+            pk_values: obj_pk_values,
+            relationships: M::RELATIONSHIPS,
+            expired_attributes: None,
+        };
+
+        self.identity_map.insert(key, tracked);
+
+        Outcome::Ok(Some(obj))
+    }
+
+    /// Get an object by composite primary key.
+    ///
+    /// First checks the identity map, then queries the database if not found.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Composite PK lookup
+    /// let item = session.get_by_pk::<OrderItem>(&[
+    ///     Value::BigInt(order_id),
+    ///     Value::BigInt(product_id),
+    /// ]).await?;
+    /// ```
+    pub async fn get_by_pk<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        pk_values: &[Value],
+    ) -> Outcome<Option<M>, Error> {
+        self.get_with_options::<M>(cx, pk_values, &GetOptions::default())
+            .await
+    }
+
+    /// Get an object by primary key with options.
+    ///
+    /// This is the most flexible form of `get()` supporting:
+    /// - Composite primary keys via `&[Value]`
+    /// - `with_for_update` for row locking
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let options = GetOptions::default().with_for_update(true);
+    /// let user = session.get_with_options::<User>(&[Value::BigInt(1)], &options).await?;
+    /// ```
+    pub async fn get_with_options<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        pk_values: &[Value],
+        options: &GetOptions,
+    ) -> Outcome<Option<M>, Error> {
+        let key = ObjectKey::from_pk::<M>(pk_values);
+
+        // Check identity map first (unless with_for_update which needs fresh DB state)
+        if !options.with_for_update {
+            if let Some(tracked) = self.identity_map.get(&key) {
+                match tracked.state {
+                    ObjectState::Deleted | ObjectState::Detached => {
+                        // Return None for deleted/detached objects
+                    }
+                    ObjectState::Expired => {
+                        // Skip cache, will reload from DB below
+                        tracing::debug!("Object is expired, reloading from database");
+                    }
+                    ObjectState::New | ObjectState::Persistent => {
+                        if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                            return Outcome::Ok(Some(obj.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build WHERE clause for composite PK
+        let pk_columns = M::PRIMARY_KEY;
+        if pk_columns.len() != pk_values.len() {
+            return Outcome::Err(Error::Custom(format!(
+                "Primary key mismatch: expected {} values, got {}",
+                pk_columns.len(),
+                pk_values.len()
+            )));
+        }
+
+        let where_parts: Vec<String> = pk_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("\"{}\" = ${}", col, i + 1))
+            .collect();
+
+        let mut sql = format!(
+            "SELECT * FROM \"{}\" WHERE {} LIMIT 1",
+            M::TABLE_NAME,
+            where_parts.join(" AND ")
+        );
+
+        // Add FOR UPDATE if requested
+        if options.with_for_update {
+            sql.push_str(" FOR UPDATE");
+            if options.skip_locked {
+                sql.push_str(" SKIP LOCKED");
+            } else if options.nowait {
+                sql.push_str(" NOWAIT");
+            }
+        }
+
+        let rows = match self.connection.query(cx, &sql, pk_values).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        if rows.is_empty() {
+            return Outcome::Ok(None);
+        }
+
+        // Convert row to model
+        let obj = match M::from_row(&rows[0]) {
+            Ok(obj) => obj,
+            Err(e) => return Outcome::Err(e),
+        };
+
+        // Extract column data from the model while we have the concrete type
+        let row_data = obj.to_row();
+        let column_names: Vec<&'static str> = row_data.iter().map(|(name, _)| *name).collect();
+        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+        // Serialize values for dirty checking
+        let serialized = serde_json::to_vec(&values).ok();
+
+        // Extract primary key info
+        let pk_cols: Vec<&'static str> = M::PRIMARY_KEY.to_vec();
+        let obj_pk_values = obj.primary_key_value();
+
+        let tracked = TrackedObject {
+            object: Box::new(obj.clone()),
+            original_state: serialized,
+            state: ObjectState::Persistent,
+            table_name: M::TABLE_NAME,
+            column_names,
+            values,
+            pk_columns: pk_cols,
+            pk_values: obj_pk_values,
+            relationships: M::RELATIONSHIPS,
+            expired_attributes: None,
+        };
+
+        self.identity_map.insert(key, tracked);
+
+        Outcome::Ok(Some(obj))
+    }
+
+    /// Check if an object is tracked by this session.
+    pub fn contains<M: Model + 'static>(&self, obj: &M) -> bool {
+        let key = ObjectKey::from_model(obj);
+        self.identity_map.contains_key(&key)
+    }
+
+    /// Detach an object from the session.
+    pub fn expunge<M: Model + 'static>(&mut self, obj: &M) {
+        let key = ObjectKey::from_model(obj);
+        if let Some(tracked) = self.identity_map.get_mut(&key) {
+            tracked.state = ObjectState::Detached;
+        }
+        self.pending_new.retain(|k| k != &key);
+        self.pending_delete.retain(|k| k != &key);
+        self.pending_dirty.retain(|k| k != &key);
+    }
+
+    /// Detach all objects from the session.
+    pub fn expunge_all(&mut self) {
+        for tracked in self.identity_map.values_mut() {
+            tracked.state = ObjectState::Detached;
+        }
+        self.pending_new.clear();
+        self.pending_delete.clear();
+        self.pending_dirty.clear();
+    }
+
+    // ========================================================================
+    // Dirty Checking
+    // ========================================================================
+
+    /// Check if an object has pending changes.
+    ///
+    /// Returns `true` if:
+    /// - Object is new (pending INSERT)
+    /// - Object has been modified since load (pending UPDATE)
+    /// - Object is marked for deletion (pending DELETE)
+    ///
+    /// Returns `false` if:
+    /// - Object is not tracked
+    /// - Object is clean (unchanged since load)
+    /// - Object is detached or expired
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let user = session.get::<User>(1).await?.unwrap();
+    /// assert!(!session.is_modified(&user));  // Fresh from DB
+    ///
+    /// // Modify and re-check
+    /// let mut user_mut = user.clone();
+    /// user_mut.name = "New Name".to_string();
+    /// session.mark_dirty(&user_mut);
+    /// assert!(session.is_modified(&user_mut));  // Now dirty
+    /// ```
+    pub fn is_modified<M: Model + Serialize + 'static>(&self, obj: &M) -> bool {
+        let key = ObjectKey::from_model(obj);
+
+        let Some(tracked) = self.identity_map.get(&key) else {
+            return false;
+        };
+
+        match tracked.state {
+            // New objects are always "modified" (pending INSERT)
+            ObjectState::New => true,
+
+            // Deleted objects are "modified" (pending DELETE)
+            ObjectState::Deleted => true,
+
+            // Detached/expired objects aren't modified in session context
+            ObjectState::Detached | ObjectState::Expired => false,
+
+            // For persistent objects, compare current values to original
+            ObjectState::Persistent => {
+                // Check if explicitly marked dirty
+                if self.pending_dirty.contains(&key) {
+                    return true;
+                }
+
+                // Compare serialized values
+                let current_state = serde_json::to_vec(&tracked.values).unwrap_or_default();
+                tracked.original_state.as_ref() != Some(&current_state)
+            }
+        }
+    }
+
+    /// Get the list of modified attribute names for an object.
+    ///
+    /// Returns the column names that have changed since the object was loaded.
+    /// Returns an empty vector if:
+    /// - Object is not tracked
+    /// - Object is new (all fields are "modified")
+    /// - Object is clean (no changes)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut user = session.get::<User>(1).await?.unwrap();
+    /// user.name = "New Name".to_string();
+    /// session.mark_dirty(&user);
+    ///
+    /// let changed = session.modified_attributes(&user);
+    /// assert!(changed.contains(&"name"));
+    /// ```
+    pub fn modified_attributes<M: Model + Serialize + 'static>(
+        &self,
+        obj: &M,
+    ) -> Vec<&'static str> {
+        let key = ObjectKey::from_model(obj);
+
+        let Some(tracked) = self.identity_map.get(&key) else {
+            return Vec::new();
+        };
+
+        // Only meaningful for persistent objects
+        if tracked.state != ObjectState::Persistent {
+            return Vec::new();
+        }
+
+        // Need original state for comparison
+        let Some(original_bytes) = &tracked.original_state else {
+            return Vec::new();
+        };
+
+        // Deserialize original values
+        let Ok(original_values): Result<Vec<Value>, _> = serde_json::from_slice(original_bytes)
+        else {
+            return Vec::new();
+        };
+
+        // Compare each column
+        let mut modified = Vec::new();
+        for (i, col) in tracked.column_names.iter().enumerate() {
+            let current = tracked.values.get(i);
+            let original = original_values.get(i);
+
+            if current != original {
+                modified.push(*col);
+            }
+        }
+
+        modified
+    }
+
+    /// Get the state of a tracked object.
+    ///
+    /// Returns `None` if the object is not tracked by this session.
+    pub fn object_state<M: Model + 'static>(&self, obj: &M) -> Option<ObjectState> {
+        let key = ObjectKey::from_model(obj);
+        self.identity_map.get(&key).map(|t| t.state)
+    }
+
+    // ========================================================================
+    // Expiration
+    // ========================================================================
+
+    /// Expire an object's cached attributes, forcing reload on next access.
+    ///
+    /// After calling this method, the next `get()` call for this object will reload
+    /// from the database instead of returning the cached version.
+    ///
+    /// # Arguments
+    ///
+    /// * `obj` - The object to expire.
+    /// * `attributes` - Optional list of attribute names to expire. If `None`, all
+    ///   attributes are expired.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Expire all attributes
+    /// session.expire(&user, None);
+    ///
+    /// // Expire specific attributes
+    /// session.expire(&user, Some(&["name", "email"]));
+    ///
+    /// // Next get() will reload from database
+    /// let refreshed = session.get::<User>(cx, user.id).await?;
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - Expiring an object does not discard pending changes. If the object has been
+    ///   modified but not flushed, those changes remain pending.
+    /// - Expiring a detached or new object has no effect.
+    #[tracing::instrument(level = "debug", skip(self, obj), fields(table = M::TABLE_NAME))]
+    pub fn expire<M: Model + 'static>(&mut self, obj: &M, attributes: Option<&[&str]>) {
+        let key = ObjectKey::from_model(obj);
+
+        let Some(tracked) = self.identity_map.get_mut(&key) else {
+            tracing::debug!("Object not tracked, nothing to expire");
+            return;
+        };
+
+        // Only expire persistent objects
+        match tracked.state {
+            ObjectState::New | ObjectState::Detached | ObjectState::Deleted => {
+                tracing::debug!(state = ?tracked.state, "Cannot expire object in this state");
+                return;
+            }
+            ObjectState::Persistent | ObjectState::Expired => {}
+        }
+
+        match attributes {
+            None => {
+                // Expire all attributes
+                tracked.state = ObjectState::Expired;
+                tracked.expired_attributes = None;
+                tracing::debug!("Expired all attributes");
+            }
+            Some(attrs) => {
+                // Expire specific attributes
+                let mut expired = tracked.expired_attributes.take().unwrap_or_default();
+                for attr in attrs {
+                    expired.insert((*attr).to_string());
+                }
+                tracked.expired_attributes = Some(expired);
+
+                // If any attributes are expired, mark the object as expired
+                if tracked.state == ObjectState::Persistent {
+                    tracked.state = ObjectState::Expired;
+                }
+                tracing::debug!(attributes = ?attrs, "Expired specific attributes");
+            }
+        }
+    }
+
+    /// Expire all objects in the session.
+    ///
+    /// After calling this method, all tracked objects will be marked as expired.
+    /// The next access to any object will reload from the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Expire everything in the session
+    /// session.expire_all();
+    ///
+    /// // All subsequent get() calls will reload from database
+    /// let user = session.get::<User>(cx, 1).await?;  // Reloads from DB
+    /// let team = session.get::<Team>(cx, 1).await?;  // Reloads from DB
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - This does not affect new or deleted objects.
+    /// - Pending changes are not discarded.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub fn expire_all(&mut self) {
+        let mut expired_count = 0;
+        for tracked in self.identity_map.values_mut() {
+            if tracked.state == ObjectState::Persistent {
+                tracked.state = ObjectState::Expired;
+                tracked.expired_attributes = None;
+                expired_count += 1;
+            }
+        }
+        tracing::debug!(count = expired_count, "Expired all session objects");
+    }
+
+    /// Check if an object is expired (needs reload from database).
+    ///
+    /// Returns `true` if the object is marked as expired and will be reloaded
+    /// on the next access.
+    pub fn is_expired<M: Model + 'static>(&self, obj: &M) -> bool {
+        let key = ObjectKey::from_model(obj);
+        self.identity_map
+            .get(&key)
+            .is_some_and(|t| t.state == ObjectState::Expired)
+    }
+
+    /// Get the list of expired attribute names for an object.
+    ///
+    /// Returns:
+    /// - `None` if the object is not tracked or not expired
+    /// - `Some(None)` if all attributes are expired
+    /// - `Some(Some(set))` if only specific attributes are expired
+    pub fn expired_attributes<M: Model + 'static>(
+        &self,
+        obj: &M,
+    ) -> Option<Option<&std::collections::HashSet<String>>> {
+        let key = ObjectKey::from_model(obj);
+        let tracked = self.identity_map.get(&key)?;
+
+        if tracked.state != ObjectState::Expired {
+            return None;
+        }
+
+        Some(tracked.expired_attributes.as_ref())
+    }
+
+    /// Refresh an object by reloading it from the database.
+    ///
+    /// This method immediately reloads the object from the database, updating
+    /// the cached copy in the session. Unlike `expire()`, which defers the reload
+    /// until the next access, `refresh()` performs the reload immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - The async context for database operations.
+    /// * `obj` - The object to refresh.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Some(refreshed))` if the object was found in the database,
+    /// `Ok(None)` if the object no longer exists in the database, or an error.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Immediately reload from database
+    /// let refreshed = session.refresh(&cx, &user).await?;
+    ///
+    /// if let Some(user) = refreshed {
+    ///     println!("Refreshed: {}", user.name);
+    /// } else {
+    ///     println!("User was deleted from database");
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - This discards any changes in the session's cached copy.
+    /// - If the object has pending changes, they will be lost.
+    /// - If the object no longer exists in the database, it is removed from the session.
+    #[tracing::instrument(level = "debug", skip(self, cx, obj), fields(table = M::TABLE_NAME))]
+    pub async fn refresh<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        obj: &M,
+    ) -> Outcome<Option<M>, Error> {
+        let pk_values = obj.primary_key_value();
+        let key = ObjectKey::from_model(obj);
+
+        tracing::debug!(pk = ?pk_values, "Refreshing object from database");
+
+        // Remove from pending queues since we're reloading
+        self.pending_dirty.retain(|k| k != &key);
+
+        // Remove from identity map to force reload
+        self.identity_map.remove(&key);
+
+        // Reload from database
+        let result = self.get_by_pk::<M>(cx, &pk_values).await;
+
+        match &result {
+            Outcome::Ok(Some(_)) => {
+                tracing::debug!("Object refreshed successfully");
+            }
+            Outcome::Ok(None) => {
+                tracing::debug!("Object no longer exists in database");
+            }
+            _ => {}
+        }
+
+        result
+    }
+
+    // ========================================================================
+    // Transaction Management
+    // ========================================================================
+
+    /// Begin a transaction.
+    pub async fn begin(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        if self.in_transaction {
+            return Outcome::Ok(());
+        }
+
+        match self.connection.execute(cx, "BEGIN", &[]).await {
+            Outcome::Ok(_) => {
+                self.in_transaction = true;
+                Outcome::Ok(())
+            }
+            Outcome::Err(e) => Outcome::Err(e),
+            Outcome::Cancelled(r) => Outcome::Cancelled(r),
+            Outcome::Panicked(p) => Outcome::Panicked(p),
+        }
+    }
+
+    /// Flush pending changes to the database.
+    ///
+    /// This executes INSERT, UPDATE, and DELETE statements but does NOT commit.
+    pub async fn flush(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        // Fire before_flush event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeFlush) {
+            return Outcome::Err(e);
+        }
+
+        // Auto-begin transaction if configured
+        if self.config.auto_begin && !self.in_transaction {
+            match self.begin(cx).await {
+                Outcome::Ok(()) => {}
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        let dialect = self.connection.dialect();
+
+        // 1. Execute DELETEs first (to respect FK constraints), including explicit cascades.
+        let deletes: Vec<ObjectKey> = std::mem::take(&mut self.pending_delete);
+
+        // Cascade planning: use relationship metadata on each deleted parent to proactively
+        // delete dependent rows (and clean up link tables) when `passive_deletes` is not set.
+        //
+        // This is intentionally explicit (no hidden queries): we emit concrete DELETE statements.
+        let mut cascade_child_deletes_single: HashMap<(&'static str, &'static str), Vec<Value>> =
+            HashMap::new();
+        let mut cascade_child_deletes_composite: HashMap<CascadeChildDeleteKey, Vec<Vec<Value>>> =
+            HashMap::new();
+        let mut cascade_link_deletes_single: HashMap<(&'static str, &'static str), Vec<Value>> =
+            HashMap::new();
+        let mut cascade_link_deletes_composite: HashMap<CascadeChildDeleteKey, Vec<Vec<Value>>> =
+            HashMap::new();
+
+        for key in &deletes {
+            let Some(tracked) = self.identity_map.get(key) else {
+                continue;
+            };
+            if tracked.state != ObjectState::Deleted {
+                continue;
+            }
+            let parent_pk_values = tracked.pk_values.clone();
+
+            for rel in tracked.relationships {
+                if !rel.cascade_delete || rel.is_passive_deletes_all() {
+                    continue;
+                }
+
+                match rel.kind {
+                    sqlmodel_core::RelationshipKind::OneToMany
+                    | sqlmodel_core::RelationshipKind::OneToOne => {
+                        // With passive_deletes, the DB will delete children when the parent is deleted.
+                        // Orphan tracking for Passive is handled after the parent delete succeeds.
+                        if matches!(rel.passive_deletes, sqlmodel_core::PassiveDeletes::Passive) {
+                            continue;
+                        }
+                        let fk_cols = rel.remote_key_cols();
+                        if fk_cols.is_empty() {
+                            continue;
+                        }
+                        if fk_cols.len() == 1 && parent_pk_values.len() == 1 {
+                            cascade_child_deletes_single
+                                .entry((rel.related_table, fk_cols[0]))
+                                .or_default()
+                                .push(parent_pk_values[0].clone());
+                        } else {
+                            // Composite FK: column order must match parent PK value ordering.
+                            if fk_cols.len() != parent_pk_values.len() {
+                                continue;
+                            }
+                            cascade_child_deletes_composite
+                                .entry(CascadeChildDeleteKey {
+                                    table: rel.related_table,
+                                    fk_cols: fk_cols.to_vec(),
+                                })
+                                .or_default()
+                                .push(parent_pk_values.clone());
+                        }
+                    }
+                    sqlmodel_core::RelationshipKind::ManyToMany => {
+                        if matches!(rel.passive_deletes, sqlmodel_core::PassiveDeletes::Passive) {
+                            continue;
+                        }
+                        let Some(link) = rel.link_table else {
+                            continue;
+                        };
+                        let local_cols = link.local_cols();
+                        if local_cols.is_empty() {
+                            continue;
+                        }
+                        if local_cols.len() == 1 && parent_pk_values.len() == 1 {
+                            cascade_link_deletes_single
+                                .entry((link.table_name, local_cols[0]))
+                                .or_default()
+                                .push(parent_pk_values[0].clone());
+                        } else {
+                            if local_cols.len() != parent_pk_values.len() {
+                                continue;
+                            }
+                            cascade_link_deletes_composite
+                                .entry(CascadeChildDeleteKey {
+                                    table: link.table_name,
+                                    fk_cols: local_cols.to_vec(),
+                                })
+                                .or_default()
+                                .push(parent_pk_values.clone());
+                        }
+                    }
+                    sqlmodel_core::RelationshipKind::ManyToOne => {}
+                }
+            }
+        }
+
+        let dedup_by_hash = |vals: &mut Vec<Value>| {
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            vals.retain(|v| seen.insert(hash_values(std::slice::from_ref(v))));
+        };
+
+        // (a) Delete children first (one-to-many / one-to-one).
+        for ((child_table, fk_col), mut pks) in cascade_child_deletes_single {
+            dedup_by_hash(&mut pks);
+            if pks.is_empty() {
+                continue;
+            }
+
+            let placeholders: Vec<String> =
+                (1..=pks.len()).map(|i| dialect.placeholder(i)).collect();
+            let sql = format!(
+                "DELETE FROM {} WHERE {} IN ({})",
+                dialect.quote_identifier(child_table),
+                dialect.quote_identifier(fk_col),
+                placeholders.join(", ")
+            );
+
+            match self.connection.execute(cx, &sql, &pks).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Panicked(p);
+                }
+            }
+
+            // Remove now-deleted children from the identity map to prevent stale reads.
+            let pk_hashes: std::collections::HashSet<u64> = pks
+                .iter()
+                .map(|v| hash_values(std::slice::from_ref(v)))
+                .collect();
+            let mut to_remove: Vec<ObjectKey> = Vec::new();
+            for (k, t) in &self.identity_map {
+                if t.table_name != child_table {
+                    continue;
+                }
+                let Some(idx) = t.column_names.iter().position(|col| *col == fk_col) else {
+                    continue;
+                };
+                let fk_val = &t.values[idx];
+                if pk_hashes.contains(&hash_values(std::slice::from_ref(fk_val))) {
+                    to_remove.push(*k);
+                }
+            }
+            for k in &to_remove {
+                self.identity_map.remove(k);
+            }
+            self.pending_new.retain(|k| !to_remove.contains(k));
+            self.pending_dirty.retain(|k| !to_remove.contains(k));
+            self.pending_delete.retain(|k| !to_remove.contains(k));
+        }
+
+        // (a2) Delete children for composite foreign keys using row-value IN.
+        for (key, mut tuples) in cascade_child_deletes_composite {
+            if tuples.is_empty() {
+                continue;
+            }
+
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            tuples.retain(|t| seen.insert(hash_values(t)));
+
+            if tuples.is_empty() {
+                continue;
+            }
+
+            let col_list = key
+                .fk_cols
+                .iter()
+                .map(|c| dialect.quote_identifier(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let mut params: Vec<Value> = Vec::with_capacity(tuples.len() * key.fk_cols.len());
+            let mut idx = 1;
+            let tuple_sql: Vec<String> = tuples
+                .iter()
+                .map(|t| {
+                    for v in t {
+                        params.push(v.clone());
+                    }
+                    let inner = (0..key.fk_cols.len())
+                        .map(|_| {
+                            let ph = dialect.placeholder(idx);
+                            idx += 1;
+                            ph
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({})", inner)
+                })
+                .collect();
+
+            let sql = format!(
+                "DELETE FROM {} WHERE ({}) IN ({})",
+                dialect.quote_identifier(key.table),
+                col_list,
+                tuple_sql.join(", ")
+            );
+
+            match self.connection.execute(cx, &sql, &params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Panicked(p);
+                }
+            }
+
+            // Remove now-deleted children from the identity map to prevent stale reads.
+            let tuple_hashes: std::collections::HashSet<u64> =
+                tuples.iter().map(|t| hash_values(t)).collect();
+            let mut to_remove: Vec<ObjectKey> = Vec::new();
+            for (k, t) in &self.identity_map {
+                if t.table_name != key.table {
+                    continue;
+                }
+
+                let mut child_fk: Vec<Value> = Vec::with_capacity(key.fk_cols.len());
+                let mut missing = false;
+                for fk_col in &key.fk_cols {
+                    let Some(idx) = t.column_names.iter().position(|col| col == fk_col) else {
+                        missing = true;
+                        break;
+                    };
+                    child_fk.push(t.values[idx].clone());
+                }
+                if missing {
+                    continue;
+                }
+                if tuple_hashes.contains(&hash_values(&child_fk)) {
+                    to_remove.push(*k);
+                }
+            }
+            for k in &to_remove {
+                self.identity_map.remove(k);
+            }
+            self.pending_new.retain(|k| !to_remove.contains(k));
+            self.pending_dirty.retain(|k| !to_remove.contains(k));
+            self.pending_delete.retain(|k| !to_remove.contains(k));
+        }
+
+        // (b) Clean up link-table rows for many-to-many relationships (association rows only).
+        for ((link_table, local_col), mut pks) in cascade_link_deletes_single {
+            dedup_by_hash(&mut pks);
+            if pks.is_empty() {
+                continue;
+            }
+
+            let placeholders: Vec<String> =
+                (1..=pks.len()).map(|i| dialect.placeholder(i)).collect();
+            let sql = format!(
+                "DELETE FROM {} WHERE {} IN ({})",
+                dialect.quote_identifier(link_table),
+                dialect.quote_identifier(local_col),
+                placeholders.join(", ")
+            );
+
+            match self.connection.execute(cx, &sql, &pks).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Panicked(p);
+                }
+            }
+        }
+
+        // (b2) Clean up link-table rows for composite parent keys using row-value IN.
+        for (key, mut tuples) in cascade_link_deletes_composite {
+            if tuples.is_empty() {
+                continue;
+            }
+
+            let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            tuples.retain(|t| seen.insert(hash_values(t)));
+
+            if tuples.is_empty() {
+                continue;
+            }
+
+            let col_list = key
+                .fk_cols
+                .iter()
+                .map(|c| dialect.quote_identifier(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let mut params: Vec<Value> = Vec::with_capacity(tuples.len() * key.fk_cols.len());
+            let mut idx = 1;
+            let tuple_sql: Vec<String> = tuples
+                .iter()
+                .map(|t| {
+                    for v in t {
+                        params.push(v.clone());
+                    }
+                    let inner = (0..key.fk_cols.len())
+                        .map(|_| {
+                            let ph = dialect.placeholder(idx);
+                            idx += 1;
+                            ph
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({})", inner)
+                })
+                .collect();
+
+            let sql = format!(
+                "DELETE FROM {} WHERE ({}) IN ({})",
+                dialect.quote_identifier(key.table),
+                col_list,
+                tuple_sql.join(", ")
+            );
+
+            match self.connection.execute(cx, &sql, &params).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(e) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Err(e);
+                }
+                Outcome::Cancelled(r) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Cancelled(r);
+                }
+                Outcome::Panicked(p) => {
+                    self.pending_delete = deletes;
+                    return Outcome::Panicked(p);
+                }
+            }
+        }
+
+        let mut actually_deleted: Vec<ObjectKey> = Vec::new();
+        for key in &deletes {
+            if let Some(tracked) = self.identity_map.get(key) {
+                // Skip if object was un-deleted (state changed from Deleted)
+                if tracked.state != ObjectState::Deleted {
+                    continue;
+                }
+
+                // Skip objects without primary keys - cannot safely DELETE without WHERE clause
+                if tracked.pk_columns.is_empty() || tracked.pk_values.is_empty() {
+                    tracing::warn!(
+                        table = tracked.table_name,
+                        "Skipping DELETE for object without primary key - cannot identify row"
+                    );
+                    continue;
+                }
+
+                // Copy needed metadata so we can mutate the identity map after the DB op.
+                let pk_columns = tracked.pk_columns.clone();
+                let pk_values = tracked.pk_values.clone();
+                let table_name = tracked.table_name;
+                let relationships = tracked.relationships;
+
+                // Build WHERE clause from primary key columns and values
+                let where_parts: Vec<String> = pk_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| {
+                        format!(
+                            "{} = {}",
+                            dialect.quote_identifier(col),
+                            dialect.placeholder(i + 1)
+                        )
+                    })
+                    .collect();
+
+                let sql = format!(
+                    "DELETE FROM {} WHERE {}",
+                    dialect.quote_identifier(table_name),
+                    where_parts.join(" AND ")
+                );
+
+                match self.connection.execute(cx, &sql, &pk_values).await {
+                    Outcome::Ok(_) => {
+                        actually_deleted.push(*key);
+
+                        // PassiveDeletes::Passive orphan tracking: the DB will delete children,
+                        // so eagerly detach them from the identity map after the parent delete succeeds.
+                        if !pk_values.is_empty() {
+                            let mut to_remove: Vec<ObjectKey> = Vec::new();
+                            for rel in relationships {
+                                if !rel.cascade_delete
+                                    || !matches!(
+                                        rel.passive_deletes,
+                                        sqlmodel_core::PassiveDeletes::Passive
+                                    )
+                                {
+                                    continue;
+                                }
+                                if !matches!(
+                                    rel.kind,
+                                    sqlmodel_core::RelationshipKind::OneToMany
+                                        | sqlmodel_core::RelationshipKind::OneToOne
+                                ) {
+                                    continue;
+                                }
+
+                                let fk_cols = rel.remote_key_cols();
+                                if fk_cols.is_empty() || fk_cols.len() != pk_values.len() {
+                                    continue;
+                                }
+
+                                for (k, t) in &self.identity_map {
+                                    if t.table_name != rel.related_table {
+                                        continue;
+                                    }
+                                    let mut matches_parent = true;
+                                    for (fk_col, parent_val) in fk_cols.iter().zip(&pk_values) {
+                                        let Some(idx) =
+                                            t.column_names.iter().position(|col| col == fk_col)
+                                        else {
+                                            matches_parent = false;
+                                            break;
+                                        };
+                                        if &t.values[idx] != parent_val {
+                                            matches_parent = false;
+                                            break;
+                                        }
+                                    }
+                                    if matches_parent {
+                                        to_remove.push(*k);
+                                    }
+                                }
+                            }
+
+                            for k in &to_remove {
+                                self.identity_map.remove(k);
+                            }
+                            self.pending_new.retain(|k| !to_remove.contains(k));
+                            self.pending_dirty.retain(|k| !to_remove.contains(k));
+                            self.pending_delete.retain(|k| !to_remove.contains(k));
+                        }
+                    }
+                    Outcome::Err(e) => {
+                        // Only restore deletes that weren't already executed
+                        // (exclude actually_deleted items from restoration)
+                        self.pending_delete = deletes
+                            .into_iter()
+                            .filter(|k| !actually_deleted.contains(k))
+                            .collect();
+                        // Remove successfully deleted objects before returning error
+                        for key in &actually_deleted {
+                            self.identity_map.remove(key);
+                        }
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        // Same handling for cancellation
+                        self.pending_delete = deletes
+                            .into_iter()
+                            .filter(|k| !actually_deleted.contains(k))
+                            .collect();
+                        for key in &actually_deleted {
+                            self.identity_map.remove(key);
+                        }
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        // Same handling for panic
+                        self.pending_delete = deletes
+                            .into_iter()
+                            .filter(|k| !actually_deleted.contains(k))
+                            .collect();
+                        for key in &actually_deleted {
+                            self.identity_map.remove(key);
+                        }
+                        return Outcome::Panicked(p);
+                    }
+                }
+            }
+        }
+
+        // Remove only actually deleted objects from identity map
+        for key in &actually_deleted {
+            self.identity_map.remove(key);
+        }
+
+        // 2. Execute INSERTs
+        let inserts: Vec<ObjectKey> = std::mem::take(&mut self.pending_new);
+        for key in &inserts {
+            if let Some(tracked) = self.identity_map.get_mut(key) {
+                // Skip if already persistent (was inserted in a previous attempt before error)
+                if tracked.state == ObjectState::Persistent {
+                    continue;
+                }
+
+                // Build INSERT statement using stored column names and values
+                let columns = &tracked.column_names;
+                let columns_sql: Vec<String> = columns
+                    .iter()
+                    .map(|c| dialect.quote_identifier(c))
+                    .collect();
+                let placeholders: Vec<String> = (1..=columns.len())
+                    .map(|i| dialect.placeholder(i))
+                    .collect();
+
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    dialect.quote_identifier(tracked.table_name),
+                    columns_sql.join(", "),
+                    placeholders.join(", ")
+                );
+
+                match self.connection.execute(cx, &sql, &tracked.values).await {
+                    Outcome::Ok(_) => {
+                        tracked.state = ObjectState::Persistent;
+                        // Set original_state for future dirty checking (serialize current values)
+                        tracked.original_state =
+                            Some(serde_json::to_vec(&tracked.values).unwrap_or_default());
+                    }
+                    Outcome::Err(e) => {
+                        // Restore pending_new for retry
+                        self.pending_new = inserts;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        // Restore pending_new for retry (same as Err handling)
+                        self.pending_new = inserts;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        // Restore pending_new for retry (same as Err handling)
+                        self.pending_new = inserts;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            }
+        }
+
+        // 3. Execute UPDATEs for dirty objects
+        let dirty: Vec<ObjectKey> = std::mem::take(&mut self.pending_dirty);
+        for key in &dirty {
+            if let Some(tracked) = self.identity_map.get_mut(key) {
+                // Only UPDATE persistent objects
+                if tracked.state != ObjectState::Persistent {
+                    continue;
+                }
+
+                // Skip objects without primary keys - cannot safely UPDATE without WHERE clause
+                if tracked.pk_columns.is_empty() || tracked.pk_values.is_empty() {
+                    tracing::warn!(
+                        table = tracked.table_name,
+                        "Skipping UPDATE for object without primary key - cannot identify row"
+                    );
+                    continue;
+                }
+
+                // Check if actually dirty by comparing serialized state
+                let current_state = serde_json::to_vec(&tracked.values).unwrap_or_default();
+                let is_dirty = tracked.original_state.as_ref() != Some(&current_state);
+
+                if !is_dirty {
+                    continue;
+                }
+
+                // Build UPDATE statement with all non-PK columns
+                let mut set_parts = Vec::new();
+                let mut params = Vec::new();
+                let mut param_idx = 1;
+
+                for (i, col) in tracked.column_names.iter().enumerate() {
+                    // Skip primary key columns in SET clause
+                    if !tracked.pk_columns.contains(col) {
+                        set_parts.push(format!(
+                            "{} = {}",
+                            dialect.quote_identifier(col),
+                            dialect.placeholder(param_idx)
+                        ));
+                        params.push(tracked.values[i].clone());
+                        param_idx += 1;
+                    }
+                }
+
+                // Add WHERE clause for primary key
+                let where_parts: Vec<String> = tracked
+                    .pk_columns
+                    .iter()
+                    .map(|col| {
+                        let clause = format!(
+                            "{} = {}",
+                            dialect.quote_identifier(col),
+                            dialect.placeholder(param_idx)
+                        );
+                        param_idx += 1;
+                        clause
+                    })
+                    .collect();
+
+                // Add PK values to params
+                params.extend(tracked.pk_values.clone());
+
+                if set_parts.is_empty() {
+                    continue; // No non-PK columns to update
+                }
+
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    dialect.quote_identifier(tracked.table_name),
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+
+                match self.connection.execute(cx, &sql, &params).await {
+                    Outcome::Ok(_) => {
+                        // Update original_state to current state
+                        tracked.original_state = Some(current_state);
+                    }
+                    Outcome::Err(e) => {
+                        // Restore pending_dirty for retry
+                        self.pending_dirty = dirty;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        // Restore pending_dirty for retry (same as Err handling)
+                        self.pending_dirty = dirty;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        // Restore pending_dirty for retry (same as Err handling)
+                        self.pending_dirty = dirty;
+                        return Outcome::Panicked(p);
+                    }
+                }
+            }
+        }
+
+        // Fire after_flush event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterFlush) {
+            return Outcome::Err(e);
+        }
+
+        Outcome::Ok(())
+    }
+
+    /// Commit the current transaction.
+    pub async fn commit(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        // Flush any pending changes first
+        match self.flush(cx).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+
+        // Fire before_commit event (can abort)
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::BeforeCommit) {
+            return Outcome::Err(e);
+        }
+
+        if self.in_transaction {
+            match self.connection.execute(cx, "COMMIT", &[]).await {
+                Outcome::Ok(_) => {
+                    self.in_transaction = false;
+                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        // Expire objects if configured
+        if self.config.expire_on_commit {
+            for tracked in self.identity_map.values_mut() {
+                if tracked.state == ObjectState::Persistent {
+                    tracked.state = ObjectState::Expired;
+                }
+            }
+        }
+
+        // Fire after_commit event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterCommit) {
+            return Outcome::Err(e);
+        }
+
+        Outcome::Ok(())
+    }
+
+    /// Rollback the current transaction.
+    pub async fn rollback(&mut self, cx: &Cx) -> Outcome<(), Error> {
+        if self.in_transaction {
+            match self.connection.execute(cx, "ROLLBACK", &[]).await {
+                Outcome::Ok(_) => {
+                    self.in_transaction = false;
+                }
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        // Clear pending operations
+        self.pending_new.clear();
+        self.pending_delete.clear();
+        self.pending_dirty.clear();
+
+        // Revert objects to original state or remove new ones
+        let mut to_remove = Vec::new();
+        for (key, tracked) in &mut self.identity_map {
+            match tracked.state {
+                ObjectState::New => {
+                    to_remove.push(*key);
+                }
+                ObjectState::Deleted => {
+                    tracked.state = ObjectState::Persistent;
+                }
+                _ => {}
+            }
+        }
+
+        for key in to_remove {
+            self.identity_map.remove(&key);
+        }
+
+        // Fire after_rollback event
+        if let Err(e) = self.event_callbacks.fire(SessionEvent::AfterRollback) {
+            return Outcome::Err(e);
+        }
+
+        Outcome::Ok(())
+    }
+
+    // ========================================================================
+    // Lazy Loading
+    // ========================================================================
+
+    /// Load a single lazy relationship.
+    ///
+    /// Fetches the related object from the database and caches it in the Lazy wrapper.
+    /// If the relationship has already been loaded, returns the cached value.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.load_lazy(&hero.team, &cx).await?;
+    /// let team = hero.team.get(); // Now available
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, lazy, cx))]
+    pub async fn load_lazy<
+        T: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        lazy: &Lazy<T>,
+        cx: &Cx,
+    ) -> Outcome<bool, Error> {
+        tracing::debug!(
+            model = std::any::type_name::<T>(),
+            fk = ?lazy.fk(),
+            already_loaded = lazy.is_loaded(),
+            "Loading lazy relationship"
+        );
+
+        // If already loaded, return success
+        if lazy.is_loaded() {
+            tracing::trace!("Already loaded");
+            return Outcome::Ok(lazy.get().is_some());
+        }
+
+        // If no FK, set as empty and return
+        let Some(fk) = lazy.fk() else {
+            let _ = lazy.set_loaded(None);
+            return Outcome::Ok(false);
+        };
+
+        // Fetch from database using get()
+        let obj = match self.get::<T>(cx, fk.clone()).await {
+            Outcome::Ok(obj) => obj,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let found = obj.is_some();
+
+        // Cache the result
+        let _ = lazy.set_loaded(obj);
+
+        tracing::debug!(found = found, "Lazy load complete");
+
+        Outcome::Ok(found)
+    }
+
+    /// Batch load lazy relationships for multiple objects.
+    ///
+    /// This method collects all FK values, executes a single query, and populates
+    /// each Lazy field. This prevents the N+1 query problem when iterating over
+    /// a collection and accessing lazy relationships.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Load 100 heroes
+    /// let mut heroes = session.query::<Hero>().all().await?;
+    ///
+    /// // Without batch loading: 100 queries (N+1 problem)
+    /// // With batch loading: 1 query
+    /// session.load_many(&cx, &mut heroes, |h| &h.team).await?;
+    ///
+    /// // All teams now loaded
+    /// for hero in &heroes {
+    ///     if let Some(team) = hero.team.get() {
+    ///         println!("{} is on {}", hero.name, team.name);
+    ///     }
+    /// }
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor))]
+    pub async fn load_many<P, T, F>(
+        &mut self,
+        cx: &Cx,
+        objects: &[P],
+        accessor: F,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        T: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(&P) -> &Lazy<T>,
+    {
+        // Collect all FK values that need loading
+        let mut fk_values: Vec<Value> = Vec::new();
+        let mut fk_indices: Vec<usize> = Vec::new();
+
+        for (idx, obj) in objects.iter().enumerate() {
+            let lazy = accessor(obj);
+            if !lazy.is_loaded() && !lazy.is_empty() {
+                if let Some(fk) = lazy.fk() {
+                    fk_values.push(fk.clone());
+                    fk_indices.push(idx);
+                }
+            }
+        }
+
+        let fk_count = fk_values.len();
+        tracing::info!(
+            parent_model = std::any::type_name::<P>(),
+            related_model = std::any::type_name::<T>(),
+            parent_count = objects.len(),
+            fk_count = fk_count,
+            "Batch loading lazy relationships"
+        );
+
+        if fk_values.is_empty() {
+            // Nothing to load - mark all empty/loaded Lazy fields
+            for obj in objects {
+                let lazy = accessor(obj);
+                if !lazy.is_loaded() && lazy.is_empty() {
+                    let _ = lazy.set_loaded(None);
+                }
+            }
+            return Outcome::Ok(0);
+        }
+
+        // Build query with IN clause (dialect-correct placeholders/quoting).
+        let dialect = self.connection.dialect();
+        let pk_col = T::PRIMARY_KEY.first().unwrap_or(&"id");
+        let placeholders: Vec<String> = (1..=fk_values.len())
+            .map(|i| dialect.placeholder(i))
+            .collect();
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} IN ({})",
+            dialect.quote_identifier(T::TABLE_NAME),
+            dialect.quote_identifier(pk_col),
+            placeholders.join(", ")
+        );
+
+        let rows = match self.connection.query(cx, &sql, &fk_values).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Convert rows to objects and build PK hash -> object lookup
+        let mut lookup: HashMap<u64, T> = HashMap::new();
+        for row in &rows {
+            match T::from_row(row) {
+                Ok(obj) => {
+                    let pk_values = obj.primary_key_value();
+                    let pk_hash = hash_values(&pk_values);
+
+                    // Add to session identity map
+                    let key = ObjectKey::from_pk::<T>(&pk_values);
+
+                    // Extract column data from the model while we have the concrete type
+                    let row_data = obj.to_row();
+                    let column_names: Vec<&'static str> =
+                        row_data.iter().map(|(name, _)| *name).collect();
+                    let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+                    // Serialize values for dirty checking (must match format used in flush)
+                    let serialized = serde_json::to_vec(&values).ok();
+
+                    let tracked = TrackedObject {
+                        object: Box::new(obj.clone()),
+                        original_state: serialized,
+                        state: ObjectState::Persistent,
+                        table_name: T::TABLE_NAME,
+                        column_names,
+                        values,
+                        pk_columns: T::PRIMARY_KEY.to_vec(),
+                        pk_values: pk_values.clone(),
+                        relationships: T::RELATIONSHIPS,
+                        expired_attributes: None,
+                    };
+                    self.identity_map.insert(key, tracked);
+
+                    // Add to lookup
+                    lookup.insert(pk_hash, obj);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Populate each Lazy field
+        let mut loaded_count = 0;
+        for obj in objects {
+            let lazy = accessor(obj);
+            if !lazy.is_loaded() {
+                if let Some(fk) = lazy.fk() {
+                    let fk_hash = hash_values(std::slice::from_ref(fk));
+                    let related = lookup.get(&fk_hash).cloned();
+                    let found = related.is_some();
+                    let _ = lazy.set_loaded(related);
+                    if found {
+                        loaded_count += 1;
+                    }
+                } else {
+                    let _ = lazy.set_loaded(None);
+                }
+            }
+        }
+
+        tracing::debug!(
+            query_count = 1,
+            loaded_count = loaded_count,
+            "Batch load complete"
+        );
+
+        Outcome::Ok(loaded_count)
+    }
+
+    /// Batch load many-to-many relationships for multiple parent objects.
+    ///
+    /// This method loads related objects via a link table in a single query,
+    /// avoiding the N+1 problem for many-to-many relationships.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Load 100 heroes
+    /// let mut heroes = session.query::<Hero>().all().await?;
+    ///
+    /// // Without batch loading: 100 queries (N+1 problem)
+    /// // With batch loading: 1 query via JOIN
+    /// let link_info = LinkTableInfo::new("hero_powers", "hero_id", "power_id");
+    /// session.load_many_to_many(&cx, &mut heroes, |h| &mut h.powers, |h| h.id.unwrap(), &link_info).await?;
+    ///
+    /// // All powers now loaded
+    /// for hero in &heroes {
+    ///     if let Some(powers) = hero.powers.get() {
+    ///         println!("{} has {} powers", hero.name, powers.len());
+    ///     }
+    /// }
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor, parent_pk))]
+    pub async fn load_many_to_many<P, Child, FA, FP>(
+        &mut self,
+        cx: &Cx,
+        objects: &mut [P],
+        accessor: FA,
+        parent_pk: FP,
+        link_table: &sqlmodel_core::LinkTableInfo,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        Child: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+        FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FP: Fn(&P) -> Value,
+    {
+        self.load_many_to_many_pk(cx, objects, accessor, |p| vec![parent_pk(p)], link_table)
+            .await
+    }
+
+    /// Batch load many-to-many relationships for multiple parent objects using composite keys.
+    ///
+    /// This is the generalized form of `load_many_to_many` that supports composite parent and/or
+    /// child primary keys via `LinkTableInfo::composite(...)`.
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor, parent_pk))]
+    pub async fn load_many_to_many_pk<P, Child, FA, FP>(
+        &mut self,
+        cx: &Cx,
+        objects: &mut [P],
+        accessor: FA,
+        parent_pk: FP,
+        link_table: &sqlmodel_core::LinkTableInfo,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        Child: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+        FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FP: Fn(&P) -> Vec<Value>,
+    {
+        // Collect all parent PK tuples.
+        let mut pk_tuples: Vec<Vec<Value>> = Vec::with_capacity(objects.len());
+        let mut pk_by_index: Vec<(usize, Vec<Value>)> = Vec::new();
+        for (idx, obj) in objects.iter().enumerate() {
+            let pk = parent_pk(obj);
+            pk_tuples.push(pk.clone());
+            pk_by_index.push((idx, pk));
+        }
+
+        tracing::info!(
+            parent_model = std::any::type_name::<P>(),
+            related_model = std::any::type_name::<Child>(),
+            parent_count = pk_tuples.len(),
+            link_table = link_table.table_name,
+            "Batch loading many-to-many relationships"
+        );
+
+        if pk_tuples.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        // Build query with JOIN through link table (dialect-correct placeholders/quoting):
+        // SELECT child.*, link.<local_cols...> as __parent_pk{N}
+        // FROM child
+        // JOIN link ON child.<pk_cols...> = link.<remote_cols...>
+        // WHERE link.<local_cols...> IN (...)
+        let dialect = self.connection.dialect();
+        let local_cols = link_table.local_cols();
+        let remote_cols = link_table.remote_cols();
+        if local_cols.is_empty() || remote_cols.is_empty() {
+            return Outcome::Err(Error::Custom(
+                "link_table must specify local/remote columns".to_string(),
+            ));
+        }
+        if remote_cols.len() != Child::PRIMARY_KEY.len() {
+            return Outcome::Err(Error::Custom(format!(
+                "link_table remote cols count ({}) must match child PRIMARY_KEY len ({})",
+                remote_cols.len(),
+                Child::PRIMARY_KEY.len()
+            )));
+        }
+
+        let child_table = dialect.quote_identifier(Child::TABLE_NAME);
+        let link_table_q = dialect.quote_identifier(link_table.table_name);
+
+        let parent_select_parts: String = local_cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| {
+                format!(
+                    "{link_table_q}.{} AS __parent_pk{}",
+                    dialect.quote_identifier(col),
+                    i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let join_parts: String = remote_cols
+            .iter()
+            .zip(Child::PRIMARY_KEY.iter().copied())
+            .map(|(link_col, child_col)| {
+                format!(
+                    "{child_table}.{} = {link_table_q}.{}",
+                    dialect.quote_identifier(child_col),
+                    dialect.quote_identifier(link_col)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        let (where_sql, params) = if local_cols.len() == 1 {
+            let mut params: Vec<Value> = Vec::with_capacity(pk_tuples.len());
+            for t in &pk_tuples {
+                if let Some(v) = t.first() {
+                    params.push(v.clone());
+                }
+            }
+            let placeholders: Vec<String> =
+                (1..=params.len()).map(|i| dialect.placeholder(i)).collect();
+            let where_sql = format!(
+                "{link_table_q}.{} IN ({})",
+                dialect.quote_identifier(local_cols[0]),
+                placeholders.join(", ")
+            );
+            (where_sql, params)
+        } else {
+            let mut tuples: Vec<Vec<Value>> = Vec::with_capacity(pk_tuples.len());
+            for t in &pk_tuples {
+                if t.len() == local_cols.len() {
+                    tuples.push(t.clone());
+                }
+            }
+
+            let mut params: Vec<Value> = Vec::with_capacity(tuples.len() * local_cols.len());
+            let mut idx = 1;
+            let tuple_sql: Vec<String> = tuples
+                .iter()
+                .map(|t| {
+                    for v in t {
+                        params.push(v.clone());
+                    }
+                    let inner = (0..local_cols.len())
+                        .map(|_| {
+                            let ph = dialect.placeholder(idx);
+                            idx += 1;
+                            ph
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({})", inner)
+                })
+                .collect();
+
+            let col_list = local_cols
+                .iter()
+                .map(|c| format!("{link_table_q}.{}", dialect.quote_identifier(c)))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let where_sql = format!("({}) IN ({})", col_list, tuple_sql.join(", "));
+            (where_sql, params)
+        };
+
+        let sql = format!(
+            "SELECT {child_table}.*, {parent_select_parts} FROM {child_table} \
+             JOIN {link_table_q} ON {join_parts} \
+             WHERE {where_sql}"
+        );
+
+        tracing::trace!(sql = %sql, "Many-to-many batch SQL");
+
+        let rows = match self.connection.query(cx, &sql, &params).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Group children by parent PK
+        let mut by_parent: HashMap<u64, Vec<Child>> = HashMap::new();
+        for row in &rows {
+            // Extract the parent PK tuple from the __parent_pk{N} aliases.
+            let mut parent_tuple: Vec<Value> = Vec::with_capacity(local_cols.len());
+            let mut missing = false;
+            for i in 0..local_cols.len() {
+                let col = format!("__parent_pk{}", i);
+                let Some(v) = row.get_by_name(&col) else {
+                    missing = true;
+                    break;
+                };
+                parent_tuple.push(v.clone());
+            }
+            if missing {
+                continue;
+            }
+            let parent_pk_hash = hash_values(&parent_tuple);
+
+            // Parse the child model
+            match Child::from_row(row) {
+                Ok(child) => {
+                    by_parent.entry(parent_pk_hash).or_default().push(child);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Populate each RelatedMany field
+        let mut loaded_count = 0;
+        for (idx, pk_tuple) in pk_by_index {
+            let pk_hash = hash_values(&pk_tuple);
+            // Don't `remove()` here: callers might pass the same parent more than once.
+            let children = by_parent.get(&pk_hash).cloned().unwrap_or_default();
+            let child_count = children.len();
+
+            let related = accessor(&mut objects[idx]);
+            if pk_tuple.len() == 1 {
+                related.set_parent_pk(pk_tuple[0].clone());
+            } else {
+                related.set_parent_pk(Value::Array(pk_tuple.clone()));
+            }
+            let _ = related.set_loaded(children);
+            loaded_count += child_count;
+        }
+
+        tracing::debug!(
+            query_count = 1,
+            total_children = loaded_count,
+            "Many-to-many batch load complete"
+        );
+
+        Outcome::Ok(loaded_count)
+    }
+
+    /// Batch load one-to-many relationships for multiple parent objects.
+    ///
+    /// This populates `RelatedMany<Child>` where the child table has a foreign key column pointing
+    /// back to the parent. It runs a single query:
+    ///
+    /// `SELECT *, <fk_col> AS __parent_pk FROM <child_table> WHERE <fk_col> IN (...)`
+    ///
+    /// and then groups results per parent PK to populate each `RelatedMany`.
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor, parent_pk))]
+    pub async fn load_one_to_many<P, Child, FA, FP>(
+        &mut self,
+        cx: &Cx,
+        objects: &mut [P],
+        accessor: FA,
+        parent_pk: FP,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        Child: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+        FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FP: Fn(&P) -> Value,
+    {
+        // Collect parent PKs for objects that still need loading.
+        let mut pks: Vec<Value> = Vec::new();
+        let mut pk_by_index: Vec<(usize, Value)> = Vec::new();
+        for (idx, obj) in objects.iter_mut().enumerate() {
+            let pk = parent_pk(&*obj);
+            let related = accessor(obj);
+            if related.is_loaded() {
+                continue;
+            }
+
+            related.set_parent_pk(pk.clone());
+
+            if matches!(pk, Value::Null) {
+                // Unsaved parent: empty collection, mark loaded.
+                let _ = related.set_loaded(Vec::new());
+                continue;
+            }
+
+            pks.push(pk.clone());
+            pk_by_index.push((idx, pk));
+        }
+
+        tracing::info!(
+            parent_model = std::any::type_name::<P>(),
+            related_model = std::any::type_name::<Child>(),
+            parent_count = objects.len(),
+            query_parent_count = pks.len(),
+            "Batch loading one-to-many relationships"
+        );
+
+        if pks.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        // Use the FK column from the RelatedMany field on the first object.
+        let fk_column = accessor(&mut objects[pk_by_index[0].0]).fk_column();
+        let dialect = self.connection.dialect();
+        let placeholders: Vec<String> = (1..=pks.len()).map(|i| dialect.placeholder(i)).collect();
+        let child_table = dialect.quote_identifier(Child::TABLE_NAME);
+        let fk_q = dialect.quote_identifier(fk_column);
+        let sql = format!(
+            "SELECT *, {fk_q} AS __parent_pk FROM {child_table} WHERE {fk_q} IN ({})",
+            placeholders.join(", ")
+        );
+
+        tracing::trace!(sql = %sql, "One-to-many batch SQL");
+
+        let rows = match self.connection.query(cx, &sql, &pks).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        // Group by parent PK
+        let mut by_parent: HashMap<u64, Vec<Child>> = HashMap::new();
+        for row in &rows {
+            let parent_pk_value: Value = match row.get_by_name("__parent_pk") {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let parent_pk_hash = hash_values(std::slice::from_ref(&parent_pk_value));
+            match Child::from_row(row) {
+                Ok(child) => {
+                    // Add to session identity map so later `get()` calls can reuse loaded instances.
+                    let pk_values = child.primary_key_value();
+                    let key = ObjectKey::from_pk::<Child>(&pk_values);
+
+                    self.identity_map.entry(key).or_insert_with(|| {
+                        // Extract column data from the model while we have the concrete type
+                        let row_data = child.to_row();
+                        let column_names: Vec<&'static str> =
+                            row_data.iter().map(|(name, _)| *name).collect();
+                        let values: Vec<Value> = row_data.into_iter().map(|(_, v)| v).collect();
+
+                        // Serialize values for dirty checking (must match format used in flush)
+                        let serialized = serde_json::to_vec(&values).ok();
+
+                        TrackedObject {
+                            object: Box::new(child.clone()),
+                            original_state: serialized,
+                            state: ObjectState::Persistent,
+                            table_name: Child::TABLE_NAME,
+                            column_names,
+                            values,
+                            pk_columns: Child::PRIMARY_KEY.to_vec(),
+                            pk_values: pk_values.clone(),
+                            relationships: Child::RELATIONSHIPS,
+                            expired_attributes: None,
+                        }
+                    });
+
+                    by_parent.entry(parent_pk_hash).or_default().push(child);
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // Populate each RelatedMany.
+        let mut loaded_count = 0;
+        for (idx, pk) in pk_by_index {
+            let pk_hash = hash_values(std::slice::from_ref(&pk));
+            // Don't `remove()` here: callers might pass the same parent more than once.
+            let children = by_parent.get(&pk_hash).cloned().unwrap_or_default();
+            loaded_count += children.len();
+
+            let related = accessor(&mut objects[idx]);
+            let _ = related.set_loaded(children);
+        }
+
+        Outcome::Ok(loaded_count)
+    }
+
+    /// Flush pending link/unlink operations for many-to-many relationships.
+    ///
+    /// This method persists pending link and unlink operations that were tracked
+    /// via `RelatedMany::link()` and `RelatedMany::unlink()` calls.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Add a power to a hero
+    /// hero.powers.link(&fly_power);
+    ///
+    /// // Remove a power from a hero
+    /// hero.powers.unlink(&x_ray_vision);
+    ///
+    /// // Flush the link table operations
+    /// let link_info = LinkTableInfo::new("hero_powers", "hero_id", "power_id");
+    /// session.flush_related_many(&cx, &mut [hero], |h| &mut h.powers, |h| h.id.unwrap(), &link_info).await?;
+    /// ```
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor, parent_pk))]
+    pub async fn flush_related_many<P, Child, FA, FP>(
+        &mut self,
+        cx: &Cx,
+        objects: &mut [P],
+        accessor: FA,
+        parent_pk: FP,
+        link_table: &sqlmodel_core::LinkTableInfo,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        Child: Model + 'static,
+        FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FP: Fn(&P) -> Value,
+    {
+        self.flush_related_many_pk(cx, objects, accessor, |p| vec![parent_pk(p)], link_table)
+            .await
+    }
+
+    /// Flush pending link/unlink operations for many-to-many relationships (composite keys).
+    #[tracing::instrument(level = "debug", skip(self, cx, objects, accessor, parent_pk))]
+    pub async fn flush_related_many_pk<P, Child, FA, FP>(
+        &mut self,
+        cx: &Cx,
+        objects: &mut [P],
+        accessor: FA,
+        parent_pk: FP,
+        link_table: &sqlmodel_core::LinkTableInfo,
+    ) -> Outcome<usize, Error>
+    where
+        P: Model + 'static,
+        Child: Model + 'static,
+        FA: Fn(&mut P) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FP: Fn(&P) -> Vec<Value>,
+    {
+        let mut ops = Vec::new();
+        let local_cols = link_table.local_cols();
+        let remote_cols = link_table.remote_cols();
+        if local_cols.is_empty() || remote_cols.is_empty() {
+            return Outcome::Err(Error::Custom(
+                "link_table must specify local/remote columns".to_string(),
+            ));
+        }
+
+        // Collect pending operations from all objects
+        for obj in objects.iter_mut() {
+            let parent_pk_values = parent_pk(obj);
+            if parent_pk_values.len() != local_cols.len() {
+                return Outcome::Err(Error::Custom(format!(
+                    "parent_pk len ({}) must match link_table local cols len ({})",
+                    parent_pk_values.len(),
+                    local_cols.len()
+                )));
+            }
+            let related = accessor(obj);
+
+            // Collect pending links
+            for child_pk_values in related.take_pending_links() {
+                if child_pk_values.len() != remote_cols.len() {
+                    return Outcome::Err(Error::Custom(format!(
+                        "child pk len ({}) must match link_table remote cols len ({})",
+                        child_pk_values.len(),
+                        remote_cols.len()
+                    )));
+                }
+                ops.push(LinkTableOp::link_multi(
+                    link_table.table_name.to_string(),
+                    local_cols.iter().map(|c| (*c).to_string()).collect(),
+                    parent_pk_values.clone(),
+                    remote_cols.iter().map(|c| (*c).to_string()).collect(),
+                    child_pk_values,
+                ));
+            }
+
+            // Collect pending unlinks
+            for child_pk_values in related.take_pending_unlinks() {
+                if child_pk_values.len() != remote_cols.len() {
+                    return Outcome::Err(Error::Custom(format!(
+                        "child pk len ({}) must match link_table remote cols len ({})",
+                        child_pk_values.len(),
+                        remote_cols.len()
+                    )));
+                }
+                ops.push(LinkTableOp::unlink_multi(
+                    link_table.table_name.to_string(),
+                    local_cols.iter().map(|c| (*c).to_string()).collect(),
+                    parent_pk_values.clone(),
+                    remote_cols.iter().map(|c| (*c).to_string()).collect(),
+                    child_pk_values,
+                ));
+            }
+        }
+
+        if ops.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        tracing::info!(
+            parent_model = std::any::type_name::<P>(),
+            related_model = std::any::type_name::<Child>(),
+            link_count = ops
+                .iter()
+                .filter(|o| matches!(o, LinkTableOp::Link { .. }))
+                .count(),
+            unlink_count = ops
+                .iter()
+                .filter(|o| matches!(o, LinkTableOp::Unlink { .. }))
+                .count(),
+            link_table = link_table.table_name,
+            "Flushing many-to-many relationship changes"
+        );
+
+        flush::execute_link_table_ops(cx, &self.connection, &ops).await
+    }
+
+    // ========================================================================
+    // Bidirectional Relationship Sync (back_populates)
+    // ========================================================================
+
+    /// Relate a child to a parent with bidirectional sync.
+    ///
+    /// Sets the parent on the child (ManyToOne side) and adds the child to the
+    /// parent's collection (OneToMany side) if `back_populates` is defined.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Hero has a ManyToOne relationship to Team (hero.team)
+    /// // Team has a OneToMany relationship to Hero (team.heroes) with back_populates
+    ///
+    /// session.relate_to_one(
+    ///     &mut hero,
+    ///     |h| &mut h.team,
+    ///     |h| h.team_id = team.id,  // Set FK
+    ///     &mut team,
+    ///     |t| &mut t.heroes,
+    /// );
+    /// // Now hero.team is set AND team.heroes includes hero
+    /// ```
+    pub fn relate_to_one<Child, Parent, FC, FP, FK>(
+        &self,
+        child: &mut Child,
+        child_accessor: FC,
+        set_fk: FK,
+        parent: &mut Parent,
+        parent_accessor: FP,
+    ) where
+        Child: Model + Clone + 'static,
+        Parent: Model + Clone + 'static,
+        FC: FnOnce(&mut Child) -> &mut sqlmodel_core::Related<Parent>,
+        FP: FnOnce(&mut Parent) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FK: FnOnce(&mut Child),
+    {
+        // Set the forward direction: child.parent = Related::loaded(parent)
+        let related = child_accessor(child);
+        let _ = related.set_loaded(Some(parent.clone()));
+
+        // Set the FK value
+        set_fk(child);
+
+        // Set the reverse direction: parent.children.link(child)
+        let related_many = parent_accessor(parent);
+        related_many.link(child);
+
+        tracing::debug!(
+            child_model = std::any::type_name::<Child>(),
+            parent_model = std::any::type_name::<Parent>(),
+            "Established bidirectional ManyToOne <-> OneToMany relationship"
+        );
+    }
+
+    /// Unrelate a child from a parent with bidirectional sync.
+    ///
+    /// Clears the parent on the child and removes the child from the parent's collection.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.unrelate_from_one(
+    ///     &mut hero,
+    ///     |h| &mut h.team,
+    ///     |h| h.team_id = None,  // Clear FK
+    ///     &mut team,
+    ///     |t| &mut t.heroes,
+    /// );
+    /// ```
+    pub fn unrelate_from_one<Child, Parent, FC, FP, FK>(
+        &self,
+        child: &mut Child,
+        child_accessor: FC,
+        clear_fk: FK,
+        parent: &mut Parent,
+        parent_accessor: FP,
+    ) where
+        Child: Model + Clone + 'static,
+        Parent: Model + Clone + 'static,
+        FC: FnOnce(&mut Child) -> &mut sqlmodel_core::Related<Parent>,
+        FP: FnOnce(&mut Parent) -> &mut sqlmodel_core::RelatedMany<Child>,
+        FK: FnOnce(&mut Child),
+    {
+        // Clear the forward direction by assigning an empty Related
+        let related = child_accessor(child);
+        *related = sqlmodel_core::Related::empty();
+
+        // Clear the FK value
+        clear_fk(child);
+
+        // Remove from the reverse direction
+        let related_many = parent_accessor(parent);
+        related_many.unlink(child);
+
+        tracing::debug!(
+            child_model = std::any::type_name::<Child>(),
+            parent_model = std::any::type_name::<Parent>(),
+            "Removed bidirectional ManyToOne <-> OneToMany relationship"
+        );
+    }
+
+    /// Relate two objects in a many-to-many relationship with bidirectional sync.
+    ///
+    /// Adds each object to the other's collection.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Hero has ManyToMany to Power via hero_powers link table
+    /// // Power has ManyToMany to Hero via hero_powers link table (back_populates)
+    ///
+    /// session.relate_many_to_many(
+    ///     &mut hero,
+    ///     |h| &mut h.powers,
+    ///     &mut power,
+    ///     |p| &mut p.heroes,
+    /// );
+    /// // Now hero.powers includes power AND power.heroes includes hero
+    /// ```
+    pub fn relate_many_to_many<Left, Right, FL, FR>(
+        &self,
+        left: &mut Left,
+        left_accessor: FL,
+        right: &mut Right,
+        right_accessor: FR,
+    ) where
+        Left: Model + Clone + 'static,
+        Right: Model + Clone + 'static,
+        FL: FnOnce(&mut Left) -> &mut sqlmodel_core::RelatedMany<Right>,
+        FR: FnOnce(&mut Right) -> &mut sqlmodel_core::RelatedMany<Left>,
+    {
+        // Add right to left's collection
+        let left_coll = left_accessor(left);
+        left_coll.link(right);
+
+        // Add left to right's collection (back_populates)
+        let right_coll = right_accessor(right);
+        right_coll.link(left);
+
+        tracing::debug!(
+            left_model = std::any::type_name::<Left>(),
+            right_model = std::any::type_name::<Right>(),
+            "Established bidirectional ManyToMany relationship"
+        );
+    }
+
+    /// Unrelate two objects in a many-to-many relationship with bidirectional sync.
+    ///
+    /// Removes each object from the other's collection.
+    pub fn unrelate_many_to_many<Left, Right, FL, FR>(
+        &self,
+        left: &mut Left,
+        left_accessor: FL,
+        right: &mut Right,
+        right_accessor: FR,
+    ) where
+        Left: Model + Clone + 'static,
+        Right: Model + Clone + 'static,
+        FL: FnOnce(&mut Left) -> &mut sqlmodel_core::RelatedMany<Right>,
+        FR: FnOnce(&mut Right) -> &mut sqlmodel_core::RelatedMany<Left>,
+    {
+        // Remove right from left's collection
+        let left_coll = left_accessor(left);
+        left_coll.unlink(right);
+
+        // Remove left from right's collection (back_populates)
+        let right_coll = right_accessor(right);
+        right_coll.unlink(left);
+
+        tracing::debug!(
+            left_model = std::any::type_name::<Left>(),
+            right_model = std::any::type_name::<Right>(),
+            "Removed bidirectional ManyToMany relationship"
+        );
+    }
+
+    // ========================================================================
+    // N+1 Query Detection
+    // ========================================================================
+
+    /// Enable N+1 query detection with the specified threshold.
+    ///
+    /// When the number of lazy loads for a single relationship reaches the
+    /// threshold, a warning is emitted suggesting batch loading.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.enable_n1_detection(3);  // Warn after 3 lazy loads
+    ///
+    /// // This will trigger a warning:
+    /// for hero in &mut heroes {
+    ///     hero.team.load(&mut session).await?;
+    /// }
+    ///
+    /// // Check stats
+    /// if let Some(stats) = session.n1_stats() {
+    ///     println!("Potential N+1 issues: {}", stats.potential_n1);
+    /// }
+    /// ```
+    pub fn enable_n1_detection(&mut self, threshold: usize) {
+        self.n1_tracker = Some(N1QueryTracker::new().with_threshold(threshold));
+    }
+
+    /// Disable N+1 query detection and clear the tracker.
+    pub fn disable_n1_detection(&mut self) {
+        self.n1_tracker = None;
+    }
+
+    /// Check if N+1 detection is enabled.
+    #[must_use]
+    pub fn n1_detection_enabled(&self) -> bool {
+        self.n1_tracker.is_some()
+    }
+
+    /// Get mutable access to the N+1 tracker (for recording loads).
+    pub fn n1_tracker_mut(&mut self) -> Option<&mut N1QueryTracker> {
+        self.n1_tracker.as_mut()
+    }
+
+    /// Get N+1 detection statistics.
+    #[must_use]
+    pub fn n1_stats(&self) -> Option<N1Stats> {
+        self.n1_tracker.as_ref().map(|t| t.stats())
+    }
+
+    /// Reset N+1 detection counts (call at start of new request/transaction).
+    pub fn reset_n1_tracking(&mut self) {
+        if let Some(tracker) = &mut self.n1_tracker {
+            tracker.reset();
+        }
+    }
+
+    /// Record a lazy load for N+1 detection.
+    ///
+    /// This is called automatically by lazy loading methods.
+    #[track_caller]
+    pub fn record_lazy_load(&mut self, parent_type: &'static str, relationship: &'static str) {
+        if let Some(tracker) = &mut self.n1_tracker {
+            tracker.record_load(parent_type, relationship);
+        }
+    }
+
+    // ========================================================================
+    // Merge (Detached Object Reattachment)
+    // ========================================================================
+
+    /// Merge a detached object back into the session.
+    ///
+    /// This method reattaches a detached or externally-created object to the session,
+    /// copying its state to the session-tracked instance if one exists.
+    ///
+    /// # Behavior
+    ///
+    /// 1. **If object with same PK exists in session**: Updates the tracked object
+    ///    with values from the provided object and returns a clone of the tracked version.
+    ///
+    /// 2. **If `load` is true and object not in session**: Queries the database for
+    ///    an existing row, merges the provided values onto it, and tracks it.
+    ///
+    /// 3. **If object not in session or DB**: Treats it as new (will INSERT on flush).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Object from previous session or external source
+    /// let mut detached_user = User { id: Some(1), name: "Updated Name".into(), .. };
+    ///
+    /// // Merge into current session
+    /// let attached_user = session.merge(&cx, detached_user, true).await?;
+    ///
+    /// // attached_user is now tracked, changes will be persisted on flush
+    /// session.flush(&cx).await?;
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `cx`: The async context for database operations.
+    /// - `model`: The detached model instance to merge.
+    /// - `load`: If true, load from database when not in identity map.
+    ///
+    /// # Returns
+    ///
+    /// The session-attached version of the object. If the object was already tracked,
+    /// returns a clone of the updated tracked object. Otherwise, returns a clone of
+    /// the newly tracked object.
+    #[tracing::instrument(level = "debug", skip(self, cx, model), fields(table = M::TABLE_NAME))]
+    pub async fn merge<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        model: M,
+        load: bool,
+    ) -> Outcome<M, Error> {
+        let pk_values = model.primary_key_value();
+        let key = ObjectKey::from_model(&model);
+
+        tracing::debug!(
+            pk = ?pk_values,
+            load = load,
+            in_identity_map = self.identity_map.contains_key(&key),
+            "Merging object"
+        );
+
+        // 1. Check identity map first
+        if let Some(tracked) = self.identity_map.get_mut(&key) {
+            // Skip if detached - we shouldn't merge into detached objects
+            if tracked.state == ObjectState::Detached {
+                tracing::debug!("Found detached object, treating as new");
+            } else {
+                tracing::debug!(
+                    state = ?tracked.state,
+                    "Found tracked object, updating with merged values"
+                );
+
+                // Update the tracked object with values from the provided model
+                let row_data = model.to_row();
+                tracked.object = Box::new(model.clone());
+                tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
+                tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
+                tracked.pk_values.clone_from(&pk_values);
+
+                // If persistent, mark as dirty for UPDATE
+                if tracked.state == ObjectState::Persistent && !self.pending_dirty.contains(&key) {
+                    self.pending_dirty.push(key);
+                }
+
+                // Return clone of the tracked object
+                if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                    return Outcome::Ok(obj.clone());
+                }
+            }
+        }
+
+        // 2. If load=true, try to fetch from database
+        if load {
+            // Check if we have a valid primary key (not null/default)
+            let has_valid_pk = pk_values
+                .iter()
+                .all(|v| !matches!(v, Value::Null | Value::Default));
+
+            if has_valid_pk {
+                tracing::debug!("Loading from database");
+
+                let db_result = self.get_by_pk::<M>(cx, &pk_values).await;
+                match db_result {
+                    Outcome::Ok(Some(_existing)) => {
+                        // Now update the tracked object (which was added by get_by_pk)
+                        // with the values from our model
+                        if let Some(tracked) = self.identity_map.get_mut(&key) {
+                            let row_data = model.to_row();
+                            tracked.object = Box::new(model.clone());
+                            tracked.column_names = row_data.iter().map(|(name, _)| *name).collect();
+                            tracked.values = row_data.into_iter().map(|(_, v)| v).collect();
+                            // pk_values stay the same from DB
+
+                            // Mark as dirty since we're updating with new values
+                            if !self.pending_dirty.contains(&key) {
+                                self.pending_dirty.push(key);
+                            }
+
+                            tracing::debug!("Merged values onto DB object");
+
+                            if let Some(obj) = tracked.object.downcast_ref::<M>() {
+                                return Outcome::Ok(obj.clone());
+                            }
+                        }
+                    }
+                    Outcome::Ok(None) => {
+                        tracing::debug!("Object not found in database, treating as new");
+                    }
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
+            }
+        }
+
+        // 3. Treat as new - add to session
+        tracing::debug!("Adding as new object");
+        self.add(&model);
+
+        Outcome::Ok(model)
+    }
+
+    /// Merge a detached object without loading from database.
+    ///
+    /// This is a convenience method equivalent to `merge(cx, model, false)`.
+    /// Use this when you know the object doesn't exist in the database or
+    /// you don't want to query the database.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let attached = session.merge_without_load(&cx, detached_user).await?;
+    /// ```
+    pub async fn merge_without_load<
+        M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+    >(
+        &mut self,
+        cx: &Cx,
+        model: M,
+    ) -> Outcome<M, Error> {
+        self.merge(cx, model, false).await
+    }
+
+    // ========================================================================
+    // Debug Diagnostics
+    // ========================================================================
+
+    /// Get count of objects pending INSERT.
+    pub fn pending_new_count(&self) -> usize {
+        self.pending_new.len()
+    }
+
+    /// Get count of objects pending DELETE.
+    pub fn pending_delete_count(&self) -> usize {
+        self.pending_delete.len()
+    }
+
+    /// Get count of dirty objects pending UPDATE.
+    pub fn pending_dirty_count(&self) -> usize {
+        self.pending_dirty.len()
+    }
+
+    /// Get total tracked object count.
+    pub fn tracked_count(&self) -> usize {
+        self.identity_map.len()
+    }
+
+    /// Whether we're in a transaction.
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
+    /// Dump session state for debugging.
+    pub fn debug_state(&self) -> SessionDebugInfo {
+        SessionDebugInfo {
+            tracked: self.tracked_count(),
+            pending_new: self.pending_new_count(),
+            pending_delete: self.pending_delete_count(),
+            pending_dirty: self.pending_dirty_count(),
+            in_transaction: self.in_transaction,
+        }
+    }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Bulk insert multiple model instances without object tracking.
+    ///
+    /// This generates a single multi-row INSERT statement and bypasses
+    /// the identity map entirely, making it much faster for large batches.
+    ///
+    /// Models are inserted in chunks of `batch_size` to avoid excessively
+    /// large SQL statements. The default batch size is 1000.
+    ///
+    /// Returns the total number of rows inserted.
+    pub async fn bulk_insert<M: Model + Clone + Send + Sync + 'static>(
+        &mut self,
+        cx: &Cx,
+        models: &[M],
+    ) -> Outcome<u64, Error> {
+        self.bulk_insert_with_batch_size(cx, models, 1000).await
+    }
+
+    /// Bulk insert with a custom batch size.
+    pub async fn bulk_insert_with_batch_size<M: Model + Clone + Send + Sync + 'static>(
+        &mut self,
+        cx: &Cx,
+        models: &[M],
+        batch_size: usize,
+    ) -> Outcome<u64, Error> {
+        if models.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        let batch_size = batch_size.max(1);
+        let mut total_inserted: u64 = 0;
+
+        for chunk in models.chunks(batch_size) {
+            let builder = sqlmodel_query::InsertManyBuilder::new(chunk);
+            match builder.execute(cx, &self.connection).await {
+                Outcome::Ok(count) => total_inserted += count,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        Outcome::Ok(total_inserted)
+    }
+
+    /// Bulk update multiple model instances without individual tracking.
+    ///
+    /// Each model is updated individually using its primary key, but
+    /// all updates are executed in a single transaction without going
+    /// through the identity map or change tracking.
+    ///
+    /// Returns the total number of rows updated.
+    pub async fn bulk_update<M: Model + Clone + Send + Sync + 'static>(
+        &mut self,
+        cx: &Cx,
+        models: &[M],
+    ) -> Outcome<u64, Error> {
+        if models.is_empty() {
+            return Outcome::Ok(0);
+        }
+
+        let mut total_updated: u64 = 0;
+
+        for model in models {
+            let builder = sqlmodel_query::UpdateBuilder::new(model);
+            let (sql, params) = builder.build_with_dialect(self.connection.dialect());
+
+            if sql.is_empty() {
+                continue;
+            }
+
+            match self.connection.execute(cx, &sql, &params).await {
+                Outcome::Ok(count) => total_updated += count,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            }
+        }
+
+        Outcome::Ok(total_updated)
+    }
+}
+
+impl<C, M> LazyLoader<M> for Session<C>
+where
+    C: Connection,
+    M: Model + Clone + Send + Sync + Serialize + for<'de> Deserialize<'de> + 'static,
+{
+    fn get(
+        &mut self,
+        cx: &Cx,
+        pk: Value,
+    ) -> impl Future<Output = Outcome<Option<M>, Error>> + Send {
+        Session::get(self, cx, pk)
+    }
+}
+
+/// Debug information about session state.
+#[derive(Debug, Clone)]
+pub struct SessionDebugInfo {
+    /// Total tracked objects.
+    pub tracked: usize,
+    /// Objects pending INSERT.
+    pub pending_new: usize,
+    /// Objects pending DELETE.
+    pub pending_delete: usize,
+    /// Objects pending UPDATE.
+    pub pending_dirty: usize,
+    /// Whether in a transaction.
+    pub in_transaction: bool,
+}
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::manual_async_fn)] // Mock trait impls must match trait signatures
+mod tests {
+    use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use sqlmodel_core::Row;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_session_config_defaults() {
+        let config = SessionConfig::default();
+        assert!(config.auto_begin);
+        assert!(!config.auto_flush);
+        assert!(config.expire_on_commit);
+    }
+
+    #[test]
+    fn test_object_key_hash_consistency() {
+        let values1 = vec![Value::BigInt(42)];
+        let values2 = vec![Value::BigInt(42)];
+        let hash1 = hash_values(&values1);
+        let hash2 = hash_values(&values2);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_object_key_hash_different_values() {
+        let values1 = vec![Value::BigInt(42)];
+        let values2 = vec![Value::BigInt(43)];
+        let hash1 = hash_values(&values1);
+        let hash2 = hash_values(&values2);
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_object_key_hash_different_types() {
+        let values1 = vec![Value::BigInt(42)];
+        let values2 = vec![Value::Text("42".to_string())];
+        let hash1 = hash_values(&values1);
+        let hash2 = hash_values(&values2);
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_session_debug_info() {
+        let info = SessionDebugInfo {
+            tracked: 5,
+            pending_new: 2,
+            pending_delete: 1,
+            pending_dirty: 0,
+            in_transaction: true,
+        };
+        assert_eq!(info.tracked, 5);
+        assert_eq!(info.pending_new, 2);
+        assert!(info.in_transaction);
+    }
+
+    fn unwrap_outcome<T: std::fmt::Debug>(outcome: Outcome<T, Error>) -> T {
+        match outcome {
+            Outcome::Ok(v) => v,
+            other => std::panic::panic_any(format!("unexpected outcome: {other:?}")),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct Team {
+        id: Option<i64>,
+        name: String,
+    }
+
+    impl Model for Team {
+        const TABLE_NAME: &'static str = "teams";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("name", Value::Text(self.name.clone())),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            let name: String = row.get_named("name")?;
+            Ok(Self { id: Some(id), name })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Hero {
+        id: Option<i64>,
+        team: Lazy<Team>,
+    }
+
+    impl Model for Hero {
+        const TABLE_NAME: &'static str = "heroes";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(Self {
+                id: None,
+                team: Lazy::empty(),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct MockState {
+        query_calls: usize,
+        last_sql: Option<String>,
+        execute_calls: usize,
+        executed: Vec<(String, Vec<Value>)>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockConnection {
+        state: Arc<Mutex<MockState>>,
+        dialect: sqlmodel_core::Dialect,
+    }
+
+    impl MockConnection {
+        fn new(state: Arc<Mutex<MockState>>) -> Self {
+            Self {
+                state,
+                dialect: sqlmodel_core::Dialect::Postgres,
+            }
+        }
+    }
+
+    impl sqlmodel_core::Connection for MockConnection {
+        type Tx<'conn>
+            = MockTransaction
+        where
+            Self: 'conn;
+
+        fn dialect(&self) -> sqlmodel_core::Dialect {
+            self.dialect
+        }
+
+        fn query(
+            &self,
+            _cx: &Cx,
+            sql: &str,
+            params: &[Value],
+        ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
+            let params = params.to_vec();
+            let state = Arc::clone(&self.state);
+            let sql = sql.to_string();
+            async move {
+                {
+                    let mut guard = state.lock().expect("lock poisoned");
+                    guard.query_calls += 1;
+                    guard.last_sql = Some(sql.clone());
+                }
+
+                let mut rows = Vec::new();
+                let is_teams = sql.contains("teams");
+                let is_heroes = sql.contains("heroes");
+
+                for v in params {
+                    if is_teams {
+                        match v {
+                            Value::BigInt(1) => rows.push(Row::new(
+                                vec!["id".into(), "name".into()],
+                                vec![Value::BigInt(1), Value::Text("Avengers".into())],
+                            )),
+                            Value::BigInt(2) => rows.push(Row::new(
+                                vec!["id".into(), "name".into()],
+                                vec![Value::BigInt(2), Value::Text("X-Men".into())],
+                            )),
+                            _ => {}
+                        }
+                    } else if is_heroes {
+                        // One-to-many child rows keyed by team_id (the query parameter).
+                        match v {
+                            Value::BigInt(1) => {
+                                rows.push(Row::new(
+                                    vec!["id".into(), "team_id".into(), "__parent_pk".into()],
+                                    vec![Value::BigInt(101), Value::BigInt(1), Value::BigInt(1)],
+                                ));
+                                rows.push(Row::new(
+                                    vec!["id".into(), "team_id".into(), "__parent_pk".into()],
+                                    vec![Value::BigInt(102), Value::BigInt(1), Value::BigInt(1)],
+                                ));
+                            }
+                            Value::BigInt(2) => rows.push(Row::new(
+                                vec!["id".into(), "team_id".into(), "__parent_pk".into()],
+                                vec![Value::BigInt(201), Value::BigInt(2), Value::BigInt(2)],
+                            )),
+                            _ => {}
+                        }
+                    }
+                }
+
+                Outcome::Ok(rows)
+            }
+        }
+
+        fn query_one(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
+            async { Outcome::Ok(None) }
+        }
+
+        fn execute(
+            &self,
+            _cx: &Cx,
+            sql: &str,
+            params: &[Value],
+        ) -> impl Future<Output = Outcome<u64, Error>> + Send {
+            let state = Arc::clone(&self.state);
+            let sql = sql.to_string();
+            let params = params.to_vec();
+            async move {
+                let mut guard = state.lock().expect("lock poisoned");
+                guard.execute_calls += 1;
+                guard.executed.push((sql, params));
+                Outcome::Ok(0)
+            }
+        }
+
+        fn insert(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<i64, Error>> + Send {
+            async { Outcome::Ok(0) }
+        }
+
+        fn batch(
+            &self,
+            _cx: &Cx,
+            _statements: &[(String, Vec<Value>)],
+        ) -> impl Future<Output = Outcome<Vec<u64>, Error>> + Send {
+            async { Outcome::Ok(vec![]) }
+        }
+
+        fn begin(&self, _cx: &Cx) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
+            async { Outcome::Ok(MockTransaction) }
+        }
+
+        fn begin_with(
+            &self,
+            _cx: &Cx,
+            _isolation: sqlmodel_core::connection::IsolationLevel,
+        ) -> impl Future<Output = Outcome<Self::Tx<'_>, Error>> + Send {
+            async { Outcome::Ok(MockTransaction) }
+        }
+
+        fn prepare(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+        ) -> impl Future<Output = Outcome<sqlmodel_core::connection::PreparedStatement, Error>> + Send
+        {
+            async {
+                Outcome::Ok(sqlmodel_core::connection::PreparedStatement::new(
+                    0,
+                    String::new(),
+                    0,
+                ))
+            }
+        }
+
+        fn query_prepared(
+            &self,
+            _cx: &Cx,
+            _stmt: &sqlmodel_core::connection::PreparedStatement,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
+            async { Outcome::Ok(vec![]) }
+        }
+
+        fn execute_prepared(
+            &self,
+            _cx: &Cx,
+            _stmt: &sqlmodel_core::connection::PreparedStatement,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<u64, Error>> + Send {
+            async { Outcome::Ok(0) }
+        }
+
+        fn ping(&self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+            async { Outcome::Ok(()) }
+        }
+
+        fn close(self, _cx: &Cx) -> impl Future<Output = sqlmodel_core::Result<()>> + Send {
+            async { Ok(()) }
+        }
+    }
+
+    struct MockTransaction;
+
+    impl sqlmodel_core::connection::TransactionOps for MockTransaction {
+        fn query(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<Vec<Row>, Error>> + Send {
+            async { Outcome::Ok(vec![]) }
+        }
+
+        fn query_one(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<Option<Row>, Error>> + Send {
+            async { Outcome::Ok(None) }
+        }
+
+        fn execute(
+            &self,
+            _cx: &Cx,
+            _sql: &str,
+            _params: &[Value],
+        ) -> impl Future<Output = Outcome<u64, Error>> + Send {
+            async { Outcome::Ok(0) }
+        }
+
+        fn savepoint(
+            &self,
+            _cx: &Cx,
+            _name: &str,
+        ) -> impl Future<Output = Outcome<(), Error>> + Send {
+            async { Outcome::Ok(()) }
+        }
+
+        fn rollback_to(
+            &self,
+            _cx: &Cx,
+            _name: &str,
+        ) -> impl Future<Output = Outcome<(), Error>> + Send {
+            async { Outcome::Ok(()) }
+        }
+
+        fn release(
+            &self,
+            _cx: &Cx,
+            _name: &str,
+        ) -> impl Future<Output = Outcome<(), Error>> + Send {
+            async { Outcome::Ok(()) }
+        }
+
+        fn commit(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+            async { Outcome::Ok(()) }
+        }
+
+        fn rollback(self, _cx: &Cx) -> impl Future<Output = Outcome<(), Error>> + Send {
+            async { Outcome::Ok(()) }
+        }
+    }
+
+    #[test]
+    fn test_load_many_single_query_and_populates_lazy() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let heroes = vec![
+            Hero {
+                id: Some(1),
+                team: Lazy::from_fk(1_i64),
+            },
+            Hero {
+                id: Some(2),
+                team: Lazy::from_fk(2_i64),
+            },
+            Hero {
+                id: Some(3),
+                team: Lazy::from_fk(1_i64),
+            },
+            Hero {
+                id: Some(4),
+                team: Lazy::empty(),
+            },
+            Hero {
+                id: Some(5),
+                team: Lazy::from_fk(999_i64),
+            },
+        ];
+
+        rt.block_on(async {
+            let loaded = unwrap_outcome(
+                session
+                    .load_many::<Hero, Team, _>(&cx, &heroes, |h| &h.team)
+                    .await,
+            );
+            assert_eq!(loaded, 3);
+
+            // Populated / cached
+            assert!(heroes[0].team.is_loaded());
+            assert_eq!(heroes[0].team.get().unwrap().name, "Avengers");
+            assert_eq!(heroes[1].team.get().unwrap().name, "X-Men");
+            assert_eq!(heroes[2].team.get().unwrap().name, "Avengers");
+
+            // Empty FK gets cached as loaded-none
+            assert!(heroes[3].team.is_loaded());
+            assert!(heroes[3].team.get().is_none());
+
+            // Missing object gets cached as loaded-none
+            assert!(heroes[4].team.is_loaded());
+            assert!(heroes[4].team.get().is_none());
+
+            // Identity map populated: get() should not hit the connection again
+            let team1 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await);
+            assert_eq!(
+                team1,
+                Some(Team {
+                    id: Some(1),
+                    name: "Avengers".to_string()
+                })
+            );
+        });
+
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct HeroChild {
+        id: Option<i64>,
+        team_id: i64,
+    }
+
+    impl Model for HeroChild {
+        const TABLE_NAME: &'static str = "heroes";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("team_id", Value::BigInt(self.team_id)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            let team_id: i64 = row.get_named("team_id")?;
+            Ok(Self {
+                id: Some(id),
+                team_id,
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamWithHeroes {
+        id: Option<i64>,
+        heroes: sqlmodel_core::RelatedMany<HeroChild>,
+    }
+
+    impl Model for TeamWithHeroes {
+        const TABLE_NAME: &'static str = "teams";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "heroes",
+                "heroes",
+                sqlmodel_core::RelationshipKind::OneToMany,
+            )
+            .remote_key("team_id")
+            .cascade_delete(true)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![("id", self.id.map_or(Value::Null, Value::BigInt))]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            Ok(Self {
+                id: Some(id),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamWithHeroesPassive {
+        id: Option<i64>,
+        heroes: sqlmodel_core::RelatedMany<HeroChild>,
+    }
+
+    impl Model for TeamWithHeroesPassive {
+        const TABLE_NAME: &'static str = "teams_passive";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "heroes",
+                "heroes",
+                sqlmodel_core::RelationshipKind::OneToMany,
+            )
+            .remote_key("team_id")
+            .cascade_delete(true)
+            .passive_deletes(sqlmodel_core::PassiveDeletes::Passive)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![("id", self.id.map_or(Value::Null, Value::BigInt))]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            Ok(Self {
+                id: Some(id),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct HeroCompositeChild {
+        id: Option<i64>,
+        team_id1: i64,
+        team_id2: i64,
+    }
+
+    impl Model for HeroCompositeChild {
+        const TABLE_NAME: &'static str = "heroes_composite";
+        const PRIMARY_KEY: &'static [&'static str] = &["id"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id", self.id.map_or(Value::Null, Value::BigInt)),
+                ("team_id1", Value::BigInt(self.team_id1)),
+                ("team_id2", Value::BigInt(self.team_id2)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id: i64 = row.get_named("id")?;
+            let team_id1: i64 = row.get_named("team_id1")?;
+            let team_id2: i64 = row.get_named("team_id2")?;
+            Ok(Self {
+                id: Some(id),
+                team_id1,
+                team_id2,
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            self.id
+                .map_or_else(|| vec![Value::Null], |id| vec![Value::BigInt(id)])
+        }
+
+        fn is_new(&self) -> bool {
+            self.id.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamComposite {
+        id1: Option<i64>,
+        id2: Option<i64>,
+    }
+
+    impl Model for TeamComposite {
+        const TABLE_NAME: &'static str = "teams_composite";
+        const PRIMARY_KEY: &'static [&'static str] = &["id1", "id2"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "heroes",
+                "heroes_composite",
+                sqlmodel_core::RelationshipKind::OneToMany,
+            )
+            .remote_keys(&["team_id1", "team_id2"])
+            .cascade_delete(true)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id1", self.id1.map_or(Value::Null, Value::BigInt)),
+                ("id2", self.id2.map_or(Value::Null, Value::BigInt)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id1: i64 = row.get_named("id1")?;
+            let id2: i64 = row.get_named("id2")?;
+            Ok(Self {
+                id1: Some(id1),
+                id2: Some(id2),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            match (self.id1, self.id2) {
+                (Some(a), Some(b)) => vec![Value::BigInt(a), Value::BigInt(b)],
+                _ => vec![Value::Null, Value::Null],
+            }
+        }
+
+        fn is_new(&self) -> bool {
+            self.id1.is_none() || self.id2.is_none()
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TeamCompositePassive {
+        id1: Option<i64>,
+        id2: Option<i64>,
+    }
+
+    impl Model for TeamCompositePassive {
+        const TABLE_NAME: &'static str = "teams_composite_passive";
+        const PRIMARY_KEY: &'static [&'static str] = &["id1", "id2"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "heroes",
+                "heroes_composite",
+                sqlmodel_core::RelationshipKind::OneToMany,
+            )
+            .remote_keys(&["team_id1", "team_id2"])
+            .cascade_delete(true)
+            .passive_deletes(sqlmodel_core::PassiveDeletes::Passive)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id1", self.id1.map_or(Value::Null, Value::BigInt)),
+                ("id2", self.id2.map_or(Value::Null, Value::BigInt)),
+            ]
+        }
+
+        fn from_row(row: &Row) -> sqlmodel_core::Result<Self> {
+            let id1: i64 = row.get_named("id1")?;
+            let id2: i64 = row.get_named("id2")?;
+            Ok(Self {
+                id1: Some(id1),
+                id2: Some(id2),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            match (self.id1, self.id2) {
+                (Some(a), Some(b)) => vec![Value::BigInt(a), Value::BigInt(b)],
+                _ => vec![Value::Null, Value::Null],
+            }
+        }
+
+        fn is_new(&self) -> bool {
+            self.id1.is_none() || self.id2.is_none()
+        }
+    }
+
+    #[test]
+    fn test_load_one_to_many_single_query_and_populates_related_many() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let mut teams = vec![
+            TeamWithHeroes {
+                id: Some(1),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            },
+            TeamWithHeroes {
+                id: Some(2),
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            },
+            TeamWithHeroes {
+                id: None,
+                heroes: sqlmodel_core::RelatedMany::new("team_id"),
+            },
+        ];
+
+        rt.block_on(async {
+            let loaded = unwrap_outcome(
+                session
+                    .load_one_to_many::<TeamWithHeroes, HeroChild, _, _>(
+                        &cx,
+                        &mut teams,
+                        |t| &mut t.heroes,
+                        |t| t.id.map_or(Value::Null, Value::BigInt),
+                    )
+                    .await,
+            );
+            assert_eq!(loaded, 3);
+
+            assert!(teams[0].heroes.is_loaded());
+            assert_eq!(teams[0].heroes.len(), 2);
+            assert_eq!(teams[0].heroes.parent_pk(), Some(&Value::BigInt(1)));
+
+            assert!(teams[1].heroes.is_loaded());
+            assert_eq!(teams[1].heroes.len(), 1);
+            assert_eq!(teams[1].heroes.parent_pk(), Some(&Value::BigInt(2)));
+
+            // Unsaved parent gets an empty, loaded collection without querying.
+            assert!(teams[2].heroes.is_loaded());
+            assert_eq!(teams[2].heroes.len(), 0);
+            assert_eq!(teams[2].heroes.parent_pk(), Some(&Value::Null));
+        });
+
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+        let sql = state
+            .lock()
+            .expect("lock poisoned")
+            .last_sql
+            .clone()
+            .expect("sql captured");
+        assert!(sql.contains("FROM"), "expected SQL to contain FROM");
+        assert!(
+            sql.contains("heroes"),
+            "expected SQL to target heroes table"
+        );
+        assert!(
+            sql.contains("$1"),
+            "expected Postgres-style placeholders ($1, $2, ...)"
+        );
+        assert!(
+            sql.contains("$2"),
+            "expected Postgres-style placeholders ($1, $2, ...)"
+        );
+    }
+
+    #[test]
+    fn test_flush_cascade_delete_one_to_many_deletes_children_first() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        rt.block_on(async {
+            // Load a parent so it's tracked as Persistent (MockConnection returns a row for id=1).
+            let team = unwrap_outcome(session.get::<TeamWithHeroes>(&cx, 1_i64).await).unwrap();
+
+            // Load children into identity map via one-to-many batch loader.
+            let mut teams = vec![team.clone()];
+            let loaded = unwrap_outcome(
+                session
+                    .load_one_to_many::<TeamWithHeroes, HeroChild, _, _>(
+                        &cx,
+                        &mut teams,
+                        |t| &mut t.heroes,
+                        |t| t.id.map_or(Value::Null, Value::BigInt),
+                    )
+                    .await,
+            );
+            assert_eq!(loaded, 2);
+
+            // Mark parent for deletion and flush.
+            session.delete(&team);
+            unwrap_outcome(session.flush(&cx).await);
+
+            // Parent + children should be gone from the identity map after flush.
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert!(
+            guard.execute_calls >= 2,
+            "expected at least cascade + parent delete"
+        );
+        let (sql0, _params0) = &guard.executed[0];
+        let (sql1, _params1) = &guard.executed[1];
+        assert!(
+            sql0.contains("DELETE") && sql0.contains("heroes"),
+            "expected first delete to target child table"
+        );
+        assert!(
+            sql1.contains("DELETE") && sql1.contains("teams"),
+            "expected second delete to target parent table"
+        );
+    }
+
+    #[test]
+    fn test_flush_passive_deletes_does_not_emit_child_delete_but_detaches_children() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        rt.block_on(async {
+            let team =
+                unwrap_outcome(session.get::<TeamWithHeroesPassive>(&cx, 1_i64).await).unwrap();
+
+            // Load children into identity map.
+            let mut teams = vec![team.clone()];
+            let loaded = unwrap_outcome(
+                session
+                    .load_one_to_many::<TeamWithHeroesPassive, HeroChild, _, _>(
+                        &cx,
+                        &mut teams,
+                        |t| &mut t.heroes,
+                        |t| t.id.map_or(Value::Null, Value::BigInt),
+                    )
+                    .await,
+            );
+            assert_eq!(loaded, 2);
+
+            session.delete(&team);
+            unwrap_outcome(session.flush(&cx).await);
+
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert_eq!(guard.execute_calls, 1, "expected only the parent delete");
+        let (sql0, _params0) = &guard.executed[0];
+        assert!(
+            sql0.contains("teams_passive"),
+            "expected delete to target parent table"
+        );
+        assert!(
+            !sql0.contains("heroes"),
+            "did not expect a child-table delete for passive_deletes"
+        );
+    }
+
+    #[test]
+    fn test_flush_cascade_delete_composite_keys_deletes_children_first() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        let team = TeamComposite {
+            id1: Some(1),
+            id2: Some(2),
+        };
+        let team_key = ObjectKey::from_model(&team);
+
+        // Track parent as persistent.
+        session.identity_map.insert(
+            team_key,
+            TrackedObject {
+                object: Box::new(team.clone()),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: TeamComposite::TABLE_NAME,
+                column_names: vec!["id1", "id2"],
+                values: vec![Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id1", "id2"],
+                pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+                relationships: TeamComposite::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        // Track two children that reference the parent via a composite FK.
+        let child1 = HeroCompositeChild {
+            id: Some(10),
+            team_id1: 1,
+            team_id2: 2,
+        };
+        let child2 = HeroCompositeChild {
+            id: Some(11),
+            team_id1: 1,
+            team_id2: 2,
+        };
+        for child in [child1, child2] {
+            let child_id = child.id.expect("child id");
+            let key = ObjectKey::from_model(&child);
+            session.identity_map.insert(
+                key,
+                TrackedObject {
+                    object: Box::new(child),
+                    original_state: None,
+                    state: ObjectState::Persistent,
+                    table_name: HeroCompositeChild::TABLE_NAME,
+                    column_names: vec!["id", "team_id1", "team_id2"],
+                    values: vec![Value::BigInt(child_id), Value::BigInt(1), Value::BigInt(2)],
+                    pk_columns: vec!["id"],
+                    pk_values: vec![Value::BigInt(child_id)],
+                    relationships: HeroCompositeChild::RELATIONSHIPS,
+                    expired_attributes: None,
+                },
+            );
+        }
+
+        rt.block_on(async {
+            session.delete(&team);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert!(
+            guard.execute_calls >= 2,
+            "expected at least composite cascade + parent delete"
+        );
+        let (sql0, _params0) = &guard.executed[0];
+        assert!(sql0.contains("DELETE"), "expected DELETE SQL");
+        assert!(
+            sql0.contains("heroes_composite"),
+            "expected composite cascade to target child table"
+        );
+        assert!(sql0.contains("team_id1"), "expected fk col team_id1");
+        assert!(sql0.contains("team_id2"), "expected fk col team_id2");
+        assert!(
+            sql0.contains("$1") && sql0.contains("$2"),
+            "expected Postgres-style placeholders for composite tuple"
+        );
+    }
+
+    #[test]
+    fn test_flush_passive_deletes_composite_keys_detaches_children_no_child_delete_sql() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        let team = TeamCompositePassive {
+            id1: Some(1),
+            id2: Some(2),
+        };
+        let team_key = ObjectKey::from_model(&team);
+
+        session.identity_map.insert(
+            team_key,
+            TrackedObject {
+                object: Box::new(team.clone()),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: TeamCompositePassive::TABLE_NAME,
+                column_names: vec!["id1", "id2"],
+                values: vec![Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id1", "id2"],
+                pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+                relationships: TeamCompositePassive::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        let child = HeroCompositeChild {
+            id: Some(10),
+            team_id1: 1,
+            team_id2: 2,
+        };
+        session.identity_map.insert(
+            ObjectKey::from_model(&child),
+            TrackedObject {
+                object: Box::new(child),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: HeroCompositeChild::TABLE_NAME,
+                column_names: vec!["id", "team_id1", "team_id2"],
+                values: vec![Value::BigInt(10), Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id"],
+                pk_values: vec![Value::BigInt(10)],
+                relationships: HeroCompositeChild::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        rt.block_on(async {
+            session.delete(&team);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert_eq!(guard.execute_calls, 1, "expected only the parent delete");
+        let (sql0, _params0) = &guard.executed[0];
+        assert!(
+            sql0.contains("teams_composite_passive"),
+            "expected delete to target composite parent table"
+        );
+        assert!(
+            !sql0.contains("heroes_composite"),
+            "did not expect a child-table delete for passive_deletes"
+        );
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct MmChildComposite {
+        id1: i64,
+        id2: i64,
+    }
+
+    impl Model for MmChildComposite {
+        const TABLE_NAME: &'static str = "mm_children";
+        const PRIMARY_KEY: &'static [&'static str] = &["id1", "id2"];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id1", Value::BigInt(self.id1)),
+                ("id2", Value::BigInt(self.id2)),
+            ]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(Self { id1: 0, id2: 0 })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![Value::BigInt(self.id1), Value::BigInt(self.id2)]
+        }
+
+        fn is_new(&self) -> bool {
+            false
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct MmParentComposite {
+        id1: i64,
+        id2: i64,
+        children: sqlmodel_core::RelatedMany<MmChildComposite>,
+    }
+
+    impl Model for MmParentComposite {
+        const TABLE_NAME: &'static str = "mm_parents";
+        const PRIMARY_KEY: &'static [&'static str] = &["id1", "id2"];
+        const RELATIONSHIPS: &'static [sqlmodel_core::RelationshipInfo] =
+            &[sqlmodel_core::RelationshipInfo::new(
+                "children",
+                MmChildComposite::TABLE_NAME,
+                sqlmodel_core::RelationshipKind::ManyToMany,
+            )
+            .link_table(sqlmodel_core::LinkTableInfo::composite(
+                "mm_link",
+                &["parent_id1", "parent_id2"],
+                &["child_id1", "child_id2"],
+            ))
+            .cascade_delete(true)];
+
+        fn fields() -> &'static [sqlmodel_core::FieldInfo] {
+            &[]
+        }
+
+        fn to_row(&self) -> Vec<(&'static str, Value)> {
+            vec![
+                ("id1", Value::BigInt(self.id1)),
+                ("id2", Value::BigInt(self.id2)),
+            ]
+        }
+
+        fn from_row(_row: &Row) -> sqlmodel_core::Result<Self> {
+            Ok(Self {
+                id1: 0,
+                id2: 0,
+                children: sqlmodel_core::RelatedMany::with_link_table(
+                    sqlmodel_core::LinkTableInfo::composite(
+                        "mm_link",
+                        &["parent_id1", "parent_id2"],
+                        &["child_id1", "child_id2"],
+                    ),
+                ),
+            })
+        }
+
+        fn primary_key_value(&self) -> Vec<Value> {
+            vec![Value::BigInt(self.id1), Value::BigInt(self.id2)]
+        }
+
+        fn is_new(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_flush_cascade_delete_many_to_many_composite_parent_keys_deletes_link_rows_first() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        let parent = MmParentComposite {
+            id1: 1,
+            id2: 2,
+            children: sqlmodel_core::RelatedMany::with_link_table(
+                sqlmodel_core::LinkTableInfo::composite(
+                    "mm_link",
+                    &["parent_id1", "parent_id2"],
+                    &["child_id1", "child_id2"],
+                ),
+            ),
+        };
+        let key = ObjectKey::from_model(&parent);
+
+        session.identity_map.insert(
+            key,
+            TrackedObject {
+                object: Box::new(parent.clone()),
+                original_state: None,
+                state: ObjectState::Persistent,
+                table_name: MmParentComposite::TABLE_NAME,
+                column_names: vec!["id1", "id2"],
+                values: vec![Value::BigInt(1), Value::BigInt(2)],
+                pk_columns: vec!["id1", "id2"],
+                pk_values: vec![Value::BigInt(1), Value::BigInt(2)],
+                relationships: MmParentComposite::RELATIONSHIPS,
+                expired_attributes: None,
+            },
+        );
+
+        rt.block_on(async {
+            session.delete(&parent);
+            unwrap_outcome(session.flush(&cx).await);
+            assert_eq!(session.tracked_count(), 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert!(
+            guard.execute_calls >= 2,
+            "expected at least link-table cascade + parent delete"
+        );
+        let (sql0, _params0) = &guard.executed[0];
+        let (sql1, _params1) = &guard.executed[1];
+        assert!(
+            sql0.contains("DELETE") && sql0.contains("mm_link"),
+            "expected first delete to target link table"
+        );
+        assert!(
+            sql0.contains("parent_id1") && sql0.contains("parent_id2"),
+            "expected composite local cols in link delete"
+        );
+        assert!(
+            sql1.contains("DELETE") && sql1.contains("mm_parents"),
+            "expected second delete to target parent table"
+        );
+    }
+
+    #[test]
+    fn test_flush_related_many_composite_link_and_unlink() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::with_config(
+            conn,
+            SessionConfig {
+                auto_begin: false,
+                auto_flush: false,
+                expire_on_commit: true,
+            },
+        );
+
+        let link = sqlmodel_core::LinkTableInfo::composite(
+            "mm_link",
+            &["parent_id1", "parent_id2"],
+            &["child_id1", "child_id2"],
+        );
+
+        let mut parents = vec![MmParentComposite {
+            id1: 1,
+            id2: 2,
+            children: sqlmodel_core::RelatedMany::with_link_table(link),
+        }];
+
+        let child = MmChildComposite { id1: 7, id2: 9 };
+
+        parents[0].children.link(&child);
+        parents[0].children.unlink(&child);
+
+        rt.block_on(async {
+            let n = unwrap_outcome(
+                session
+                    .flush_related_many_pk::<MmParentComposite, MmChildComposite, _, _>(
+                        &cx,
+                        &mut parents,
+                        |p| &mut p.children,
+                        |p| vec![Value::BigInt(p.id1), Value::BigInt(p.id2)],
+                        &link,
+                    )
+                    .await,
+            );
+            assert_eq!(n, 2);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert_eq!(guard.execute_calls, 2);
+        let (sql0, _params0) = &guard.executed[0];
+        let (sql1, _params1) = &guard.executed[1];
+
+        assert!(sql0.contains("INSERT INTO"));
+        assert!(sql0.contains("mm_link"));
+        assert!(sql0.contains("parent_id1"));
+        assert!(sql0.contains("parent_id2"));
+        assert!(sql0.contains("child_id1"));
+        assert!(sql0.contains("child_id2"));
+        assert!(sql0.contains("$1") && sql0.contains("$4"));
+
+        assert!(sql1.contains("DELETE FROM"));
+        assert!(sql1.contains("mm_link"));
+        assert!(sql1.contains("parent_id1"));
+        assert!(sql1.contains("child_id2"));
+        assert!(sql1.contains("$1") && sql1.contains("$4"));
+    }
+
+    #[test]
+    fn test_load_many_to_many_pk_composite_builds_tuple_where_clause() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let link = sqlmodel_core::LinkTableInfo::composite(
+            "mm_link",
+            &["parent_id1", "parent_id2"],
+            &["child_id1", "child_id2"],
+        );
+
+        let mut parents = vec![MmParentComposite {
+            id1: 1,
+            id2: 2,
+            children: sqlmodel_core::RelatedMany::with_link_table(link),
+        }];
+
+        rt.block_on(async {
+            let loaded = unwrap_outcome(
+                session
+                    .load_many_to_many_pk::<MmParentComposite, MmChildComposite, _, _>(
+                        &cx,
+                        &mut parents,
+                        |p| &mut p.children,
+                        |p| vec![Value::BigInt(p.id1), Value::BigInt(p.id2)],
+                        &link,
+                    )
+                    .await,
+            );
+            assert_eq!(loaded, 0);
+        });
+
+        let guard = state.lock().expect("lock poisoned");
+        assert_eq!(guard.query_calls, 1);
+        let sql = guard.last_sql.clone().expect("sql captured");
+        assert!(sql.contains("JOIN"));
+        assert!(sql.contains("mm_link"));
+        assert!(sql.contains("WHERE"));
+        assert!(sql.contains("parent_id1") && sql.contains("parent_id2"));
+        assert!(sql.contains("IN (("), "expected tuple IN clause");
+    }
+
+    #[test]
+    fn test_add_all_with_vec() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        // Each object needs a unique PK for identity tracking
+        // (objects without PKs get the same ObjectKey)
+        let teams = vec![
+            Team {
+                id: Some(100),
+                name: "Team A".to_string(),
+            },
+            Team {
+                id: Some(101),
+                name: "Team B".to_string(),
+            },
+            Team {
+                id: Some(102),
+                name: "Team C".to_string(),
+            },
+        ];
+
+        session.add_all(&teams);
+
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 3);
+        assert_eq!(info.tracked, 3);
+    }
+
+    #[test]
+    fn test_add_all_with_empty_collection() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let teams: Vec<Team> = vec![];
+        session.add_all(&teams);
+
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 0);
+        assert_eq!(info.tracked, 0);
+    }
+
+    #[test]
+    fn test_add_all_with_iterator() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let teams = [
+            Team {
+                id: Some(200),
+                name: "Team X".to_string(),
+            },
+            Team {
+                id: Some(201),
+                name: "Team Y".to_string(),
+            },
+        ];
+
+        // Use iter() explicitly
+        session.add_all(teams.iter());
+
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 2);
+        assert_eq!(info.tracked, 2);
+    }
+
+    #[test]
+    fn test_add_all_with_slice() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let teams = [
+            Team {
+                id: Some(300),
+                name: "Team 1".to_string(),
+            },
+            Team {
+                id: Some(301),
+                name: "Team 2".to_string(),
+            },
+        ];
+
+        session.add_all(&teams);
+
+        let info = session.debug_state();
+        assert_eq!(info.pending_new, 2);
+        assert_eq!(info.tracked, 2);
+    }
+
+    // ==================== Merge Tests ====================
+
+    #[test]
+    fn test_merge_new_object_without_load() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge a new object without loading from DB
+            let team = Team {
+                id: Some(100),
+                name: "New Team".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, team.clone(), false).await);
+
+            // Should be the same object
+            assert_eq!(merged.id, Some(100));
+            assert_eq!(merged.name, "New Team");
+
+            // Should be tracked as new
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+            assert_eq!(info.tracked, 1);
+        });
+
+        // Should not have queried DB (load=false)
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
+    }
+
+    #[test]
+    fn test_merge_updates_existing_tracked_object() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // First add an object
+            let original = Team {
+                id: Some(1),
+                name: "Original".to_string(),
+            };
+            session.add(&original);
+
+            // Now merge an updated version
+            let updated = Team {
+                id: Some(1),
+                name: "Updated".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, updated, false).await);
+
+            // Should have the updated name
+            assert_eq!(merged.id, Some(1));
+            assert_eq!(merged.name, "Updated");
+
+            // Should still be tracked (not duplicated)
+            let info = session.debug_state();
+            assert_eq!(info.tracked, 1);
+        });
+    }
+
+    #[test]
+    fn test_merge_with_load_queries_database() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge an object that exists in the "database" (mock returns it for id=1)
+            let detached = Team {
+                id: Some(1),
+                name: "Detached Update".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, detached, true).await);
+
+            // Should have the name from our detached object (merged onto DB values)
+            assert_eq!(merged.id, Some(1));
+            assert_eq!(merged.name, "Detached Update");
+
+            // Should be tracked and marked as dirty
+            let info = session.debug_state();
+            assert_eq!(info.tracked, 1);
+            assert_eq!(info.pending_dirty, 1);
+        });
+
+        // Should have queried DB once (load=true)
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+    }
+
+    #[test]
+    fn test_merge_with_load_not_found_creates_new() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge an object that doesn't exist in DB (mock returns None for id=999)
+            let detached = Team {
+                id: Some(999),
+                name: "Not In DB".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, detached, true).await);
+
+            // Should keep the values we provided
+            assert_eq!(merged.id, Some(999));
+            assert_eq!(merged.name, "Not In DB");
+
+            // Should be tracked as new
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+            assert_eq!(info.tracked, 1);
+        });
+
+        // Should have queried DB once
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 1);
+    }
+
+    #[test]
+    fn test_merge_without_load_convenience() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            let team = Team {
+                id: Some(42),
+                name: "Test".to_string(),
+            };
+
+            // Use the convenience method
+            let merged = unwrap_outcome(session.merge_without_load(&cx, team).await);
+
+            assert_eq!(merged.id, Some(42));
+            assert_eq!(merged.name, "Test");
+
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+        });
+
+        // Should not have queried DB
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
+    }
+
+    #[test]
+    fn test_merge_null_pk_treated_as_new() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Merge object with null PK (new record)
+            let new_team = Team {
+                id: None,
+                name: "Brand New".to_string(),
+            };
+
+            let merged = unwrap_outcome(session.merge(&cx, new_team, true).await);
+
+            // Should keep the null id
+            assert_eq!(merged.id, None);
+            assert_eq!(merged.name, "Brand New");
+
+            // Should be tracked as new (no DB query for null PK)
+            let info = session.debug_state();
+            assert_eq!(info.pending_new, 1);
+        });
+
+        // Should not have queried DB for null PK
+        assert_eq!(state.lock().expect("lock poisoned").query_calls, 0);
+    }
+
+    // ==================== is_modified Tests ====================
+
+    #[test]
+    fn test_is_modified_new_object_returns_true() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let team = Team {
+            id: Some(100),
+            name: "New Team".to_string(),
+        };
+
+        // Add as new - should be modified
+        session.add(&team);
+        assert!(session.is_modified(&team));
+    }
+
+    #[test]
+    fn test_is_modified_untracked_returns_false() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let session = Session::<MockConnection>::new(conn);
+
+        let team = Team {
+            id: Some(100),
+            name: "Not Tracked".to_string(),
+        };
+
+        // Not tracked - should not be modified
+        assert!(!session.is_modified(&team));
+    }
+
+    #[test]
+    fn test_is_modified_after_load_returns_false() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Load from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // Fresh from DB - should not be modified
+            assert!(!session.is_modified(&team));
+        });
+    }
+
+    #[test]
+    fn test_is_modified_after_mark_dirty_returns_true() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Load from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert!(!session.is_modified(&team));
+
+            // Modify and mark dirty
+            let mut modified_team = team.clone();
+            modified_team.name = "Modified Name".to_string();
+            session.mark_dirty(&modified_team);
+
+            // Should now be modified
+            assert!(session.is_modified(&modified_team));
+        });
+    }
+
+    #[test]
+    fn test_is_modified_deleted_returns_true() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Load from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert!(!session.is_modified(&team));
+
+            // Delete
+            session.delete(&team);
+
+            // Should be modified (pending delete)
+            assert!(session.is_modified(&team));
+        });
+    }
+
+    #[test]
+    fn test_is_modified_detached_returns_false() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Load from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // Detach
+            session.expunge(&team);
+
+            // Detached objects aren't modified in session context
+            assert!(!session.is_modified(&team));
+        });
+    }
+
+    #[test]
+    fn test_object_state_returns_correct_state() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        // Untracked object
+        let untracked = Team {
+            id: Some(999),
+            name: "Untracked".to_string(),
+        };
+        assert_eq!(session.object_state(&untracked), None);
+
+        // New object
+        let new_team = Team {
+            id: Some(100),
+            name: "New".to_string(),
+        };
+        session.add(&new_team);
+        assert_eq!(session.object_state(&new_team), Some(ObjectState::New));
+
+        rt.block_on(async {
+            // Persistent object
+            let persistent = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(
+                session.object_state(&persistent),
+                Some(ObjectState::Persistent)
+            );
+
+            // Deleted object
+            session.delete(&persistent);
+            assert_eq!(
+                session.object_state(&persistent),
+                Some(ObjectState::Deleted)
+            );
+        });
+    }
+
+    #[test]
+    fn test_modified_attributes_returns_changed_columns() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Load from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // No modifications yet
+            let modified = session.modified_attributes(&team);
+            assert!(modified.is_empty());
+
+            // Modify and mark dirty
+            let mut modified_team = team.clone();
+            modified_team.name = "Changed Name".to_string();
+            session.mark_dirty(&modified_team);
+
+            // Should show 'name' as modified
+            let modified = session.modified_attributes(&modified_team);
+            assert!(modified.contains(&"name"));
+        });
+    }
+
+    #[test]
+    fn test_modified_attributes_untracked_returns_empty() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let session = Session::<MockConnection>::new(conn);
+
+        let team = Team {
+            id: Some(100),
+            name: "Not Tracked".to_string(),
+        };
+
+        let modified = session.modified_attributes(&team);
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn test_modified_attributes_new_returns_empty() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        let team = Team {
+            id: Some(100),
+            name: "New".to_string(),
+        };
+        session.add(&team);
+
+        // New objects don't have original values to compare
+        let modified = session.modified_attributes(&team);
+        assert!(modified.is_empty());
+    }
+
+    // ==================== Expire Tests ====================
+
+    #[test]
+    fn test_expire_marks_object_as_expired() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object from DB (creates Persistent state)
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await);
+            assert!(team.is_some());
+            let team = team.unwrap();
+
+            // Verify it's not expired initially
+            assert!(!session.is_expired(&team));
+            assert_eq!(session.object_state(&team), Some(ObjectState::Persistent));
+
+            // Expire all attributes
+            session.expire(&team, None);
+
+            // Should now be expired
+            assert!(session.is_expired(&team));
+            assert_eq!(session.object_state(&team), Some(ObjectState::Expired));
+        });
+    }
+
+    #[test]
+    fn test_expire_specific_attributes() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object from DB
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // Expire specific attributes
+            session.expire(&team, Some(&["name"]));
+
+            // Should be expired
+            assert!(session.is_expired(&team));
+
+            // Check expired attributes
+            let expired = session.expired_attributes(&team);
+            assert!(expired.is_some());
+            let expired_set = expired.unwrap();
+            assert!(expired_set.is_some());
+            assert!(expired_set.unwrap().contains("name"));
+        });
+    }
+
+    #[test]
+    fn test_expire_all_marks_all_objects_expired() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get multiple objects from DB
+            let team1 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            let team2 = unwrap_outcome(session.get::<Team>(&cx, 2_i64).await).unwrap();
+
+            // Verify neither is expired
+            assert!(!session.is_expired(&team1));
+            assert!(!session.is_expired(&team2));
+
+            // Expire all
+            session.expire_all();
+
+            // Both should be expired
+            assert!(session.is_expired(&team1));
+            assert!(session.is_expired(&team2));
+        });
+    }
+
+    #[test]
+    fn test_expire_does_not_affect_new_objects() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        // Add a new object
+        let team = Team {
+            id: Some(100),
+            name: "New Team".to_string(),
+        };
+        session.add(&team);
+
+        // Try to expire it
+        session.expire(&team, None);
+
+        // Should still be New, not Expired
+        assert_eq!(session.object_state(&team), Some(ObjectState::New));
+        assert!(!session.is_expired(&team));
+    }
+
+    #[test]
+    fn test_expired_object_reloads_on_get() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object (query 1)
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(team.name, "Avengers");
+
+            // Get again - should use cache (no additional query)
+            let team2 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(team2.name, "Avengers");
+
+            // Verify only 1 query so far
+            {
+                let s = state.lock().expect("lock poisoned");
+                assert_eq!(s.query_calls, 1);
+            }
+
+            // Expire the object
+            session.expire(&team, None);
+
+            // Get again - should reload from DB (query 2)
+            let team3 = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+            assert_eq!(team3.name, "Avengers");
+
+            // Verify a second query was made
+            {
+                let s = state.lock().expect("lock poisoned");
+                assert_eq!(s.query_calls, 2);
+            }
+
+            // Should no longer be expired after reload
+            assert!(!session.is_expired(&team3));
+            assert_eq!(session.object_state(&team3), Some(ObjectState::Persistent));
+        });
+    }
+
+    #[test]
+    fn test_is_expired_returns_false_for_untracked() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let session = Session::<MockConnection>::new(conn);
+
+        let team = Team {
+            id: Some(999),
+            name: "Not Tracked".to_string(),
+        };
+
+        // Should return false for untracked objects
+        assert!(!session.is_expired(&team));
+    }
+
+    #[test]
+    fn test_expired_attributes_returns_none_for_persistent() {
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("create asupersync runtime");
+        let cx = Cx::for_testing();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let conn = MockConnection::new(Arc::clone(&state));
+        let mut session = Session::new(conn);
+
+        rt.block_on(async {
+            // Get an object (Persistent state)
+            let team = unwrap_outcome(session.get::<Team>(&cx, 1_i64).await).unwrap();
+
+            // Should return None for non-expired objects
+            let expired = session.expired_attributes(&team);
+            assert!(expired.is_none());
+        });
+    }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "frankensearch-rerank"
+version = "0.1.0"
+description = "Cross-encoder reranking for frankensearch (FlashRank + FastEmbed)"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+fastembed-reranker = ["dep:fastembed"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
+ort = { workspace = true }
+tokenizers = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+fastembed = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

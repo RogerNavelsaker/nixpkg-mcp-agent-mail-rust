@@ -1,0 +1,77 @@
+[package]
+name = "mcp-agent-mail-search-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pluggable search engine traits and types for MCP Agent Mail"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+tracing.workspace = true
+
+# Core types (config, models)
+mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
+
+# frankensearch: canonical two-tier hybrid search implementation
+frankensearch = { workspace = true, optional = true }
+frankensearch-core = { workspace = true, optional = true }
+frankensearch-embed = { workspace = true, optional = true }
+frankensearch-fusion = { workspace = true, optional = true }
+
+# Optional: Tantivy lexical search engine
+tantivy = { workspace = true, optional = true }
+
+# Two-tier semantic search dependencies (all optional, enabled by "semantic" feature)
+half = { workspace = true, optional = true }
+wide = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
+
+[features]
+# Enable Tantivy-based lexical search engine
+tantivy-engine = ["dep:tantivy"]
+# Enable legacy FastEmbed quality tier (optional, may pull ONNX Runtime).
+quality-fastembed = ["dep:fastembed"]
+# Enable vector/semantic search engine with two-tier support
+semantic = [
+    "dep:frankensearch",
+    "dep:frankensearch-core",
+    "dep:frankensearch-embed",
+    "dep:frankensearch-fusion",
+    "quality-fastembed",
+    "dep:half",
+    "dep:wide",
+    "dep:safetensors",
+    "dep:tokenizers",
+    "dep:rayon",
+    "dep:dirs",
+]
+# Enable hybrid fusion (requires both tantivy and semantic)
+hybrid = ["tantivy-engine", "semantic"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tantivy.workspace = true
+criterion.workspace = true
+half.workspace = true
+
+[[bench]]
+name = "two_tier_bench"
+harness = false
+required-features = ["semantic"]
+
+[lints]
+workspace = true

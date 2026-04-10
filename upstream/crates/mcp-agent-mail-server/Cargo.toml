@@ -1,0 +1,75 @@
+[package]
+name = "mcp-agent-mail-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MCP server (stdio + HTTP) for MCP Agent Mail"
+
+[dependencies]
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+jsonwebtoken.workspace = true
+base64.workspace = true
+minijinja.workspace = true
+comrak.workspace = true
+ammonia.workspace = true
+include_dir.workspace = true
+ftui.workspace = true
+ftui-extras.workspace = true
+ftui-render.workspace = true
+ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+ftui-tty.workspace = true
+ftui-widgets.workspace = true
+fastmcp.workspace = true
+fastmcp-core.workspace = true
+fastmcp-protocol.workspace = true
+fastmcp-server.workspace = true
+fastmcp-transport.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+glob.workspace = true
+walkdir.workspace = true
+sha2.workspace = true
+fs2.workspace = true
+nix = { workspace = true, features = ["fs"] }
+mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
+mcp-agent-mail-db = { path = "../mcp-agent-mail-db", default-features = false }
+mcp-agent-mail-share = { path = "../mcp-agent-mail-share", default-features = false }
+mcp-agent-mail-storage = { path = "../mcp-agent-mail-storage", default-features = false }
+mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools", default-features = false }
+
+[features]
+default = [
+    "mcp-agent-mail-db/default",
+    "mcp-agent-mail-share/default",
+    "mcp-agent-mail-storage/default",
+    "mcp-agent-mail-tools/default",
+]
+portable = [
+    "mcp-agent-mail-db/portable",
+    "mcp-agent-mail-share/portable",
+    "mcp-agent-mail-storage/portable",
+    "mcp-agent-mail-tools/portable",
+]
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+ftui-harness.workspace = true
+
+[[bench]]
+name = "widget_bench"
+harness = false
+
+[[bench]]
+name = "frame_bench"
+harness = false
+
+[lints]
+workspace = true

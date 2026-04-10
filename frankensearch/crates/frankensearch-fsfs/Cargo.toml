@@ -1,0 +1,66 @@
+[package]
+name = "frankensearch-fsfs"
+version = "1.2.5"
+description = "Standalone fsfs CLI for two-tier hybrid local search"
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+keywords = ["search", "cli", "semantic", "bm25", "hybrid"]
+categories = ["command-line-utilities", "text-processing", "development-tools"]
+
+[features]
+default = ["embedded-models"]
+embedded-models = ["frankensearch-embed/bundled-default-models", "frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
+vendored-openssl = ["openssl"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fsfs"
+path = "src/main.rs"
+
+[dependencies]
+frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
+frankensearch-index = { workspace = true }
+frankensearch-lexical = { workspace = true }
+frankensearch-storage = { workspace = true }
+frankensearch-tui = { workspace = true }
+ftui-core = { workspace = true }
+ftui-layout = { workspace = true }
+ftui-render = { workspace = true }
+ftui-style = { workspace = true }
+ftui-text = { workspace = true }
+ftui-widgets = { workspace = true }
+ftui-tty = { workspace = true }
+ftui-backend = { workspace = true }
+ftui-extras = { workspace = true, features = ["markdown"] }
+asupersync = { workspace = true }
+fsqlite = "0.1.2"
+fsqlite-types = "0.1.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toon-rust = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }
+signal-hook = "0.4"
+libc = "0.2"
+sysinfo = { workspace = true }
+notify = "8.2.0"
+ignore = "0.4"
+sha2 = { workspace = true }
+pdf-extract = { workspace = true }
+ureq = { version = "3", features = ["json"] }
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+tempfile = "3"
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "frankensearch-fusion"
+version = "0.1.0"
+description = "RRF fusion, score blending, and two-tier progressive search for frankensearch"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+lexical = ["dep:frankensearch-lexical"]
+rerank = ["dep:frankensearch-rerank"]
+graph = []
+
+[dependencies]
+frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true }
+frankensearch-index = { workspace = true }
+frankensearch-lexical = { workspace = true, optional = true }
+frankensearch-rerank = { workspace = true, optional = true }
+asupersync = { workspace = true }
+ahash = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+unicode-normalization = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tracing-test = "0.2"
+
+[lints]
+workspace = true

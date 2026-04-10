@@ -1,0 +1,168 @@
+# bv (beads viewer) local config and caches
+.bv/
+
+# Reference libraries cloned for development (synced via scripts/pull_latest_reference_library_repos.sh)
+/legacy_reference_library_code/
+
+# Rust build artifacts
+target/
+target-*/
+target_*/
+Cargo.lock
+fuzz/target/
+fuzz/artifacts/
+
+# Proptest regression files (generated)
+**/proptest-regressions/
+fuzz/corpus/
+
+# Build artifacts
+a.out
+
+# Profiling data (llvm-profdata)
+*.profraw
+
+# perf profiling data
+perf.data
+perf.data.*
+perf_*.data
+
+# NFS temporary files
+.nfs*
+
+# macOS resource fork files
+._*
+
+# Flamegraph output
+flamegraph*.svg
+
+# Test checksums and baselines (ephemeral, machine-dependent)
+golden_checksums.txt
+baseline_results.json
+
+# Local scratch DBs
+storage.sqlite3
+storage.sqlite3-*
+
+# Local scratch dirs (agent/temp)
+.scratch/
+.tmp*/
+
+# One-off scratch scripts (keep local, never commit)
+crates/ftui-extras/src/seq_*.py
+
+# Local agent scratch
+.plan
+
+# MCP Agent Mail local archive
+.mail_repo/
+
+# One-off test scripts and scratch files at repo root
+/test.py
+/test_*.py
+/test_*.rs
+/test_*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Compiler crash reports
+rustc-ice-*.txt
+
+# Beads history snapshots (JSONL export is tracked, history is local)
+.beads/.br_history/
+
+# Beads ephemeral DB artifacts (bad snapshots, rebuilds, recovery)
+.beads/.br_recovery/
+.beads/beads.db.bad_*
+.beads/beads.db-shm.bad_*
+.beads/beads.db-wal.bad_*
+.beads/beads.db.rebuild_*
+.beads/recovery_*/
+
+# Ephemeral debug/test output files (agent artifacts)
+row_skip_dy*
+--graph-format.svg
+
+# Puppeteer/Chrome screenshots (agent artifacts)
+Chrome_*.png
+
+# Font setup scratch scripts (agent artifacts)
+optimize_fonts.py
+setup_fonts.sh
+
+# Local web deploy output (agent artifacts)
+dist/
+saga_of_frankenterm_js.md
+SESSION_REPORT.md
+
+# macOS metadata
+.DS_Store
+
+# Determinism test output (ephemeral, machine-dependent)
+determinism_lab_report.jsonl
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+test_meminfo
+
+# Agent session ephemeral files
+SESSION_TODO.md
+SESSION_*.md
+verify_*.sh
+newfile.txt
+repro_*.rs
+
+# Nested crate build artifacts
+crates/*/target/
+
+# Local scratch DBs
+storage.sqlite3
+storage.sqlite3-*
+
+# FastEmbed model caches
+.fastembed_cache/
+
+# Agent coordination config
+.agent-mail.yaml
+
+# Claude local settings
+.claude/settings.local.json
+.env
+
+# Agent mail project identity
+.agent-mail-project-id
+
+# Remote compilation helper artifacts
+.rch-target/
+.rch-deploy-root/
+rch-bin/
+rch-install/
+
+# SQLite backup/corruption files
+*.sqlite3.bak
+*.sqlite3-wal.bak
+*.sqlite3.corrupt-*
+
+# Core dumps and agent config backups
+core.*
+core
+*.mcp.json.*.bak
+cline.mcp.json
+opencode.json
+windsurf.mcp.json
+clippy.txt
+clippy.json
+clippy_results.json
+clippy_unwrap.json
+clippy_unwrap_clean.txt
+check_output.txt
+.next_backup*/
+storage.sqlite3
+storage.sqlite3-shm
+storage.sqlite3-wal
+storage.sqlite3.bak
+storage.sqlite3.corrupt-*
+storage.sqlite3-shm.corrupt-*
+storage.sqlite3-wal.corrupt-*

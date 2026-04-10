@@ -1,0 +1,12 @@
+# UBS ignore patterns (globs), applied in addition to gitignore.
+#
+# This repository contains large Markdown specs with embedded pseudocode in
+# multiple languages. UBS is a source scanner and produces high-noise findings
+# when run on these documents.
+COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md
+
+# Beads issue store is JSONL with embedded code blocks and is not "source" for UBS.
+.beads/*
+
+# Agent-specific build output dirs (large; non-source).
+target_*

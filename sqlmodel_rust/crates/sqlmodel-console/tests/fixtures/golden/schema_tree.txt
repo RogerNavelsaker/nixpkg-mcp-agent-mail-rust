@@ -1,0 +1,19 @@
+Schema
++-- Table: users [PK: id]
+|   +-- Columns
+|   |   +-- id INTEGER [PK, AUTO, NOT NULL]
+|   |   +-- name TEXT [NOT NULL]
+|   |   +-- email TEXT [NOT NULL]
+|   |   \-- created_at TIMESTAMP [NOT NULL, DEFAULT NOW()]
+|   \-- Indexes
+|       \-- UNIQUE idx_users_email (email)
+\-- Table: posts [PK: id]
+    +-- Columns
+    |   +-- id INTEGER [PK, AUTO, NOT NULL]
+    |   +-- user_id INTEGER [NOT NULL]
+    |   +-- title TEXT [NOT NULL]
+    |   \-- content TEXT
+    +-- Indexes
+    |   \-- idx_posts_user (user_id)
+    \-- Foreign Keys
+        \-- fk_posts_user: user_id -> users.id ON DELETE CASCADE

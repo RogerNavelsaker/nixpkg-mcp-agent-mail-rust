@@ -1,0 +1,44 @@
+[package]
+name = "sqlmodel-mysql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "MySQL driver for SQLModel Rust"
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-mysql"
+readme = "README.md"
+keywords = ["mysql", "sql", "database", "driver", "sqlmodel"]
+categories = ["database", "database-implementations"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+console = ["dep:sqlmodel-console"]
+# TLS support via rustls
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+
+[dependencies]
+sqlmodel-core.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+
+# Optional console support
+sqlmodel-console = { workspace = true, optional = true }
+
+# Optional TLS support
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = { version = "1", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+
+[dev-dependencies]
+sqlmodel-schema.workspace = true

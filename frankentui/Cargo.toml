@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/doctor_frankentui",
+    "crates/ftui",
+    "crates/ftui-a11y",
+    "crates/ftui-backend",
+    "crates/ftui-core",
+    "crates/ftui-demo-showcase",
+    "crates/ftui-extras",
+    "crates/ftui-harness",
+    "crates/ftui-i18n",
+    "crates/ftui-layout",
+    "crates/ftui-pty",
+    "crates/ftui-render",
+    "crates/ftui-runtime",
+    "crates/ftui-showcase-wasm",
+    "crates/ftui-simd",
+    "crates/ftui-style",
+    "crates/ftui-text",
+    "crates/ftui-tty",
+    "crates/ftui-web",
+    "crates/ftui-widgets",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+repository = "https://github.com/Dicklesworthstone/frankentui"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package.ftui-extras]
+opt-level = 3
+
+[profile.bench]
+debug = true
+strip = false

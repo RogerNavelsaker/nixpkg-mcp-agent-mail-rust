@@ -1,0 +1,24 @@
+ 1:Dashboard ┃ 2:Messages │ 3:Threads ┃ 4:Agents ┃ 5:Search ┃ 6:Reservations ┃  
+                             → Sys • System Health                              
+                                                                                
+Web UI:                                                                         
+Auth:      disabled (token: false, len: 0)                                      
+Checked:   (never)                                                              
+Uptime:    0s                                                                   
+                                                                                
+── Connection Diagnostics ──                                                    
+  [OK] TCP :0  0ms                                                              
+                                                                                
+r Refresh  v Dashboard                                                          
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+ System Health api up:0m00s                                                   ? 

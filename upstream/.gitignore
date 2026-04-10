@@ -1,0 +1,285 @@
+# Build artifacts
+/target/
+.cargo-target-*/
+
+# OS junk
+.DS_Store
+**/.DS_Store
+
+# SQLite databases (runtime)
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+storage.sqlite3
+
+# Temp dirs
+_tmp_storage_root/
+
+# Misc build output
+a.out
+
+# Local env (developer machine / CI)
+.env
+
+# Local server logs and PID files
+agent-mail-*.log
+agent-mail-*.pid
+
+# E2E test artifacts (generated per-run)
+tests/artifacts/
+
+# Crate-local test artifacts (generated per-run)
+crates/**/tests/artifacts/
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# Profiling artifacts
+perf.data
+perf.data.*
+flamegraph.svg
+
+# Benchmark results (generated per-run by `am bench`)
+benches/results/
+
+# Conformance scratch runs (legacy python reference generator)
+crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/
+
+# Legacy Python reference code (local-only, not part of Rust workspace)
+legacy_python_mcp_agent_mail_code/
+legacy/
+
+# FastEmbed model caches (downloaded at runtime)
+.fastembed_cache/
+**/.fastembed_cache/
+
+# Database backup and recovery files
+*.sqlite3.bak
+*.sqlite3.bak-*
+*.sqlite3-wal.bak
+*.sqlite3.corrupt-*
+*.sqlite3.archive-*
+
+# Temporary directories
+tmp/
+test_logs/
+
+# bv graph output
+--graph-root.svg
+--graph-format.svg
+
+# Agent coordination config
+.agent-mail.yaml
+
+# Compiler crash reports
+rustc-ice-*.txt
+
+# Codex/agent build artifacts
+target-codex*/
+target_*/
+
+# Archived mailbox state snapshots (ephemeral debug exports)
+**/archived_mailbox_states/
+
+# Ephemeral agent debug/test artifacts (accidental shell output)
+18
+42
+7
+GoldHawk:
+SilverFox:
+
+# Beads history snapshots
+.beads/.br_history/
+
+# Claude Code / AI agent ephemeral files
+.claude/
+
+# MCP config files (contain local bearer tokens — never commit)
+*.mcp.json
+
+# MCP config backup files (auto-generated during config updates)
+*.mcp.json.*.bak
+
+# CASS session mining output
+LIST_OF_INPUT_MESSAGES.md
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+proptest-regressions/
+test_meminfo
+
+# Compiled test binaries (accidentally committed, should never be tracked)
+migrate_bug_test
+parser_bug_test
+s3fifo_test
+s3fifo_leak_test
+test_glob
+test_panic
+ammonia_bug_test
+test_output.txt
+tmp.json
+
+# Remote compilation helper artifacts
+rch-artifacts/
+target-rch-release/
+target-rch*/
+.rch-release-bin/
+.rch-release-root/
+.rch-target/
+.rch-deploy-root/
+rch-bin/
+rch-install/
+
+# Agent mail project identity
+.agent-mail-project-id
+
+# Vendored dependencies (local overrides)
+vendor/
+# But track uring-fs (required for builds; no crates.io release)
+!vendor/uring-fs/
+
+# Beads backup/conflict files
+.beads/*.bak_*
+
+# Beads DB corruption snapshots
+.beads/*.corrupt.*
+.beads/*.corrupt_*
+
+# IDE config (agent-generated)
+.vscode/
+
+# Clippy output files
+clippy.log
+clippy_output.*
+clippy_out.*
+
+# SQLite memory-mode test DB files (leaked by in-memory URI tests)
+crates/mcp-agent-mail-db/file:*
+
+# In-memory test scratch files (leaked by concurrent test runners)
+crates/mcp-agent-mail-db/mem_*
+
+# Agent-generated Python fix scripts
+/fix_*.py
+
+# Dist build output
+dist/
+
+# OpenCode config (local agent config)
+opencode.json
+
+# Python cache
+__pycache__/
+scripts/__pycache__/
+
+# SQLite corruption snapshots (timestamped)
+*.sqlite3.corrupt
+*.sqlite3.corrupt-*
+*.sqlite3-shm.corrupt-*
+*.sqlite3-wal.corrupt-*
+
+# Native TUI test artifacts
+tests/artifacts_native/
+
+# E2E TUI test scripts (ephemeral)
+tests/e2e/test_tui_*.sh
+
+# One-off test scripts at repo root
+/test_*.rs
+
+# Agent session ephemeral files
+SESSION_TODO.md
+SESSION_REPORT.md
+SESSION_*.md
+verify_*.sh
+newfile.txt
+repro_*.rs
+.claude/settings.local.json
+
+# Core dumps and agent config backups
+core.*
+core
+*.mcp.json.*.bak
+cline.mcp.json
+opencode.json
+windsurf.mcp.json
+clippy.txt
+clippy.json
+clippy_results.json
+clippy_unwrap.json
+clippy_unwrap_clean.txt
+check_output.txt
+.next_backup*/
+storage.sqlite3
+storage.sqlite3-shm
+storage.sqlite3-wal
+storage.sqlite3.bak
+storage.sqlite3.corrupt-*
+storage.sqlite3-shm.corrupt-*
+storage.sqlite3-wal.corrupt-*
+
+# ACFS ephemeral patterns (auto-generated agent artifacts)
+codex.mcp.json
+cursor.mcp.json
+gemini.mcp.json
+.opencode.json.*.bak
+.windsurf.mcp.json.*.bak
+*.sqlite3.corrupt*
+.beads/*.corrupt*
+.beads/*.pre_repair_*
+.beads/*.repair_candidate_*
+.beads/*.bak-corrupt
+
+# Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.rebuild_*
+.beads/*.reindex_test_*
+.beads/*.vacuum_test_*
+.beads/recovery*/
+
+.rch-bin/
+.rch-target*/
+
+# Codex IDE cache
+.codex/
+
+# Agent-generated scratch Rust files at repo root
+/*.rs
+
+# Agent-generated scratch Cargo.toml fragments
+/ftui-extras-cargo.toml
+
+# Agent-generated debug/analysis Python scripts
+/debug_*.py
+/restore.py
+/find_*.py
+/parse_*.py
+/fix.py
+
+# Generic error log
+error.log
+
+# Scratch data/widget directories
+/Widget
+/data/
+
+# JSON output artifacts
+/out.json
+
+# Server log files
+server_error*.log
+server_warnings.txt
+
+# UBS scan output
+ubs-output.txt
+
+# Release build artifacts
+release-artifacts/
+
+# Codex CLI ephemeral target directories
+.codex-target-*/
+
+# Codex temp directory
+.codex-tmp/

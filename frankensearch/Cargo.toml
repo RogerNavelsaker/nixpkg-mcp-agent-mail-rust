@@ -1,0 +1,190 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/frankensearch-core",
+    "crates/frankensearch-embed",
+    "crates/frankensearch-index",
+    "crates/frankensearch-lexical",
+    "crates/frankensearch-fusion",
+    "crates/frankensearch-rerank",
+    "crates/frankensearch-storage",
+    "crates/frankensearch-durability",
+    "crates/frankensearch-fsfs",
+    "crates/frankensearch-tui",
+    "crates/frankensearch-ops",
+    "frankensearch",
+    "tools/optimize_params",
+]
+default-members = [
+    "crates/frankensearch-core",
+    "crates/frankensearch-embed",
+    "crates/frankensearch-index",
+    "crates/frankensearch-lexical",
+    "crates/frankensearch-fusion",
+    "crates/frankensearch-rerank",
+    "crates/frankensearch-storage",
+    "crates/frankensearch-durability",
+    "crates/frankensearch-fsfs",
+    "crates/frankensearch-tui",
+    "crates/frankensearch-ops",
+    "frankensearch",
+]
+
+[workspace.package]
+edition = "2024"
+license-file = "LICENSE"
+repository = "https://github.com/Dicklesworthstone/frankensearch"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# Internal crates
+frankensearch-core = { version = "0.1.2", path = "crates/frankensearch-core" }
+frankensearch-embed = { version = "0.1.3", path = "crates/frankensearch-embed", default-features = false }
+frankensearch-index = { version = "0.1.2", path = "crates/frankensearch-index" }
+frankensearch-lexical = { version = "0.1.0", path = "crates/frankensearch-lexical" }
+frankensearch-fusion = { version = "0.1.0", path = "crates/frankensearch-fusion" }
+frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }
+frankensearch-storage = { version = "0.1.0", path = "crates/frankensearch-storage" }
+frankensearch-durability = { version = "0.1.0", path = "crates/frankensearch-durability" }
+frankensearch-fsfs = { version = "1.1.6", path = "crates/frankensearch-fsfs" }
+frankensearch-tui = { version = "0.1.0", path = "crates/frankensearch-tui" }
+frankensearch-ops = { version = "0.1.0", path = "crates/frankensearch-ops" }
+
+# Async runtime (structured concurrency, NO tokio)
+# test-internals enables LabRuntime for deterministic testing
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "08dd31df", features = ["proc-macros", "test-internals"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toon-rust = "0.1.3"
+
+# Error handling
+thiserror = "2"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# Data parallelism (CPU-bound vector ops, NOT an async runtime)
+rayon = "1.10"
+
+# SIMD and f16 quantization (unconditional for frankensearch-index)
+half = "2.4"
+wide = "1.1.1"
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# Embedder dependencies (feature-gated per crate)
+fastembed = "5.11.0"
+safetensors = "0.7.0"
+tokenizers = "0.22.2"
+
+# Full-text search
+tantivy = "0.25.0"
+
+# ONNX Runtime for cross-encoder reranking
+ort = "2.0.0-rc.11"
+ndarray = "0.17"
+
+# HNSW approximate nearest neighbors
+hnsw_rs = "0.3"
+
+# CRC32 checksums for FSVI index integrity
+crc32fast = "1"
+
+# Fast non-cryptographic hashing for hot-path HashMaps (inspired by fff.nvim)
+ahash = "0.8"
+
+# Unicode normalization
+unicode-normalization = "0.1"
+
+# Platform-standard directories for model storage
+dirs = "6"
+
+# TOML parsing for configuration surfaces
+toml = "1.0.3"
+
+# SHA-256 verification for model manifests
+sha2 = "0.10"
+
+# PDF text extraction (digital PDFs with selectable text)
+pdf-extract = "0.10"
+
+# Benchmarking
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.6"
+
+# Date/time formatting/parsing for telemetry RFC3339 timestamps
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
+
+# System information (CPU, memory, etc.)
+sysinfo = "0.38.2"
+
+# FrankenTUI terminal UI framework
+ftui-core = "0.2.1"
+ftui-render = "0.2.1"
+ftui-style = "0.2.1"
+ftui-text = "0.2.1"
+ftui-layout = "0.2.1"
+ftui-widgets = "0.2.1"
+ftui-tty = "0.2.1"
+ftui-backend = "0.2.1"
+ftui-extras = "0.2.1"
+
+[workspace.lints.rust]
+# `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# ── Nightly-unstable pedantic/nursery lints that churn CI ──
+# Nightly clippy adds new collapsible_if/match patterns (let-chains) that churn CI.
+collapsible_if = "allow"
+collapsible_match = "allow"
+# Nightly const-eval expansion causes false positives on match-based fns.
+missing_const_for_fn = "allow"
+# Function length is a design judgement; enforcing in CI is too noisy.
+too_many_lines = "allow"
+# 8-arg async fns with &self are common in download/retry helpers.
+too_many_arguments = "allow"
+# clone-then-into inside branches that return early is a valid pattern.
+redundant_clone = "allow"
+# Intentional same-arm matches improve readability of exhaustive handling.
+match_same_arms = "allow"
+# Missing # Panics for infallible unwraps on static patterns is noise.
+missing_panics_doc = "allow"
+# Use-after-import ordering in test modules and conditional blocks is fine.
+items_after_statements = "allow"
+# map().unwrap_or() is often clearer than map_or() for multi-line closures.
+map_unwrap_or = "allow"
+# Inlined format args style is a preference, not a correctness issue.
+uninlined_format_args = "allow"
+# Closure-based map/filter chains are idiomatic Rust.
+redundant_closure_for_method_calls = "allow"
+# Casting usize to f32/f64 in test helpers and metrics is intentional.
+cast_precision_loss = "allow"
+# Single-pattern match can be clearer than if-let for complex destructuring.
+single_match_else = "allow"
+# Prefixed bindings like `let _guard = ...` are idiomatic for RAII.
+no_effect_underscore_binding = "allow"
+# HashMap generalization over hashers is premature in application code.
+implicit_hasher = "allow"
+# `if !x { ... } else { ... }` is sometimes clearer than inverting branches.
+if_not_else = "allow"
+# `.is_multiple_of()` is nightly-only and not yet stable.
+manual_is_multiple_of = "allow"
+# `Duration::from_secs(120)` is clearer than `from_mins(2)` for timeouts.
+duration_suboptimal_units = "allow"
+# async fns without await are fine as trait implementations / future-proofing.
+unused_async = "allow"
+# Separate multiply-then-add is intentional; fused mul_add changes semantics slightly.
+suboptimal_flops = "allow"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

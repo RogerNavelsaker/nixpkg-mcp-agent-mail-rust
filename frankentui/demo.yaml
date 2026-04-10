@@ -1,0 +1,198 @@
+# FrankenTUI Demo Definitions (bd-2xj.3)
+#
+# Machine-readable demo specifications for reproducible, sub-60-second demos.
+# Each demo validates a specific FrankenTUI claim via deterministic replay.
+#
+# Schema:
+#   demo_id:          unique identifier
+#   title:            human-readable title
+#   claim:            what this demo proves
+#   timeout_seconds:  max execution time (must be <= 60)
+#   terminal_size:    [width, height] for deterministic output
+#   steps:            ordered list of actions
+#     - type:         render | resize | assert_checksum | assert_content | measure_timing
+#   tags:             categorization labels
+
+demos:
+
+  # ===========================================================================
+  # Demo 1: Widget Gallery Render
+  # ===========================================================================
+  - demo_id: widget_gallery
+    title: "Widget Gallery: All Core Widgets"
+    claim: "FrankenTUI renders 12+ widget types correctly in a single frame"
+    timeout_seconds: 10
+    terminal_size: [120, 40]
+    tags: [widgets, rendering, gallery]
+    steps:
+      - type: render
+        widget: block
+        description: "Block with borders and title"
+      - type: render
+        widget: paragraph
+        description: "Paragraph with styled text and wrapping"
+      - type: render
+        widget: list
+        description: "List with selection and scrolling"
+      - type: render
+        widget: table
+        description: "Table with headers and column widths"
+      - type: render
+        widget: tabs
+        description: "Tab bar with active selection"
+      - type: render
+        widget: sparkline
+        description: "Sparkline data visualization"
+      - type: render
+        widget: progress_bar
+        description: "Progress bar with label"
+      - type: render
+        widget: scrollbar
+        description: "Scrollbar with position indicator"
+      - type: render
+        widget: text_input
+        description: "Text input field with cursor"
+      - type: render
+        widget: tree
+        description: "Tree widget with expand/collapse"
+      - type: render
+        widget: status_line
+        description: "Status line with mode indicator"
+      - type: render
+        widget: modal
+        description: "Modal overlay dialog"
+      - type: assert_content
+        contains: ["Block", "List", "Table"]
+        description: "Verify core widget labels are present"
+      - type: measure_timing
+        metric: render_frame_us
+        max_us: 4000
+        description: "Frame renders within SLO p99"
+
+  # ===========================================================================
+  # Demo 2: Galaxy-Brain Decision Card
+  # ===========================================================================
+  - demo_id: galaxy_brain_decision_card
+    title: "Galaxy-Brain: Progressive Disclosure Decision Card"
+    claim: "Bayesian decision transparency renders at all 4 disclosure levels"
+    timeout_seconds: 10
+    terminal_size: [70, 15]
+    tags: [galaxy-brain, transparency, decision-card]
+    steps:
+      - type: render
+        widget: decision_card
+        level: traffic_light
+        signal: green
+        description: "Level 0: Traffic light badge only"
+      - type: assert_content
+        contains: ["OK", "incremental_diff"]
+        description: "Badge and action label visible"
+      - type: render
+        widget: decision_card
+        level: plain_english
+        signal: green
+        description: "Level 1: Plain English explanation"
+      - type: assert_content
+        contains: ["OK", "confidence"]
+        description: "Explanation with confidence visible"
+      - type: render
+        widget: decision_card
+        level: evidence_terms
+        signal: yellow
+        description: "Level 2: Evidence terms with Bayes factors"
+      - type: assert_content
+        contains: ["WARN", "Evidence:", "BF="]
+        description: "Evidence header and Bayes factor visible"
+      - type: render
+        widget: decision_card
+        level: full_bayesian
+        signal: red
+        description: "Level 3: Full Bayesian statistics"
+      - type: assert_content
+        contains: ["ALERT", "log_post", "loss=", "avoided="]
+        description: "Full Bayesian details visible"
+
+  # ===========================================================================
+  # Demo 3: Bayesian Diff Strategy
+  # ===========================================================================
+  - demo_id: bayesian_diff_strategy
+    title: "Bayesian Diff Strategy Selection"
+    claim: "Diff strategy adapts to content patterns using Bayesian evidence"
+    timeout_seconds: 15
+    terminal_size: [120, 40]
+    tags: [diff-strategy, bayesian, performance]
+    steps:
+      - type: render
+        widget: dashboard
+        description: "Render initial dashboard at 120x40"
+      - type: assert_checksum
+        description: "Initial frame is deterministic"
+      - type: resize
+        to: [80, 24]
+        description: "Resize to trigger diff strategy re-evaluation"
+      - type: assert_checksum
+        description: "Post-resize frame is deterministic"
+      - type: resize
+        to: [120, 40]
+        description: "Resize back to original"
+      - type: assert_checksum
+        description: "Restored frame matches initial"
+      - type: measure_timing
+        metric: diff_strategy_us
+        max_us: 1000
+        description: "Diff strategy selection within SLO p99"
+
+  # ===========================================================================
+  # Demo 4: Incremental Layout Speedup
+  # ===========================================================================
+  - demo_id: incremental_layout
+    title: "Incremental Layout Computation"
+    claim: "Layout reuse avoids redundant computation for unchanged constraints"
+    timeout_seconds: 15
+    terminal_size: [120, 40]
+    tags: [layout, incremental, performance]
+    steps:
+      - type: render
+        widget: dashboard
+        description: "Full initial layout computation"
+      - type: measure_timing
+        metric: layout_compute_us
+        description: "Baseline: full layout time"
+      - type: render
+        widget: dashboard
+        description: "Second render with identical constraints"
+      - type: measure_timing
+        metric: layout_compute_us
+        max_us: 800
+        description: "Incremental: should be faster than baseline"
+      - type: assert_checksum
+        description: "Incremental output matches full computation"
+
+  # ===========================================================================
+  # Demo 5: Deterministic Replay
+  # ===========================================================================
+  - demo_id: deterministic_replay
+    title: "Deterministic Frame Replay"
+    claim: "Identical inputs produce identical frame checksums across runs"
+    timeout_seconds: 10
+    terminal_size: [80, 24]
+    tags: [determinism, replay, correctness]
+    steps:
+      - type: render
+        widget: dashboard
+        seed: 42
+        description: "Render with fixed seed (run 1)"
+      - type: assert_checksum
+        description: "Capture checksum from run 1"
+      - type: render
+        widget: dashboard
+        seed: 42
+        description: "Render with same fixed seed (run 2)"
+      - type: assert_checksum
+        description: "Checksum from run 2 must match run 1"
+      - type: render
+        widget: widget_gallery
+        seed: 42
+        description: "Render widget gallery with fixed seed"
+      - type: assert_checksum
+        description: "Widget gallery is also deterministic"

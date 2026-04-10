@@ -1,0 +1,34 @@
+{
+  "schema_version": "fsfs-benchmark-golden-v1",
+  "dataset_version": "2026-02-14",
+  "profile": "small",
+  "corpus": {
+    "files": 5000,
+    "tokens": 1450000,
+    "lines": 230000,
+    "bytes": 18000000
+  },
+  "workload": {
+    "crawl_events": 5200,
+    "index_documents": 5000,
+    "query_cases": 420,
+    "tui_interactions": 640
+  },
+  "baseline_metrics": {
+    "indexing_throughput_docs_per_second": 400,
+    "search_latency_ms": {
+      "p50": 12,
+      "p95": 26,
+      "p99": 44
+    },
+    "fast_tier_latency_ms": 7,
+    "quality_tier_latency_ms": 128,
+    "indexing_peak_memory_mb": 380,
+    "searching_peak_memory_mb": 250,
+    "index_size_bytes_per_document": 2080
+  },
+  "notes": [
+    "Mid-size mono-repo profile",
+    "Primary CI comparator for perf drift"
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "fsqlite-ext-fts3"
+version = "0.1.2"
+description = "FTS3/FTS4 full-text search extension"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-func = { workspace = true }
+
+[lints]
+workspace = true

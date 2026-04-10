@@ -1,0 +1,24 @@
+[package]
+name = "sqlmodel-frankensqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "FrankenSQLite (pure-Rust) driver for SQLModel Rust"
+
+[lints]
+workspace = true
+
+[dependencies]
+sqlmodel-core.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+fsqlite = "0.1.2"
+fsqlite-core = "0.1.2"
+fsqlite-types = "0.1.2"
+fsqlite-error = "0.1.2"
+
+[dev-dependencies]

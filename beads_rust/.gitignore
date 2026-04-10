@@ -1,0 +1,145 @@
+# Build artifacts (all target directories)
+target/
+target*/
+
+# Cargo lock for library crates (keep for binary crates)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Legacy Go reference code (not part of Rust project)
+/legacy_beads/
+
+
+# Added by cargo (covered by target*/ above)
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# Beads ephemeral files (runtime artifacts, not issues.jsonl)
+.beads/last-touched
+.beads/.bv.lock
+
+# Coverage reports
+/coverage/
+
+# Local agent/session artifacts
+SESSION_STATUS.md
+a.out
+
+# Temp directories and crash reports
+temp_test*/
+rustc-ice-*.txt
+
+# Profiling data
+perf.data
+perf.data.old
+
+# Large source images (webp versions are committed)
+*.png
+
+# Claude Code temp files
+claude-upgrade-progress.json
+
+# Shell command artifacts (from malformed redirects like `> =`)
+=
+
+# Local scratch SQLite DBs (never tracked)
+storage.sqlite3
+storage.sqlite3-*
+
+# Local Cargo and Rustup caches (agent workspace artifacts)
+.cargo/
+.rustup/
+
+# Ephemeral/temporary files (agent workflow artifacts)
+RESEARCH_FINDINGS.md
+TOON_INTEGRATION_BRIEF.md
+cov_*.out
+rustc-ice-*.txt
+*.snap.new
+sweep_*.png
+test_screenshot.png
+
+# Nix build outputs (keep flake.lock - it should be committed)
+result
+result-*
+.direnv/
+
+# Private keys and certificates
+*.pem
+
+# ACFS ephemeral patterns (auto-generated agent artifacts)
+core
+core.*
+cline.mcp.json
+codex.mcp.json
+cursor.mcp.json
+gemini.mcp.json
+opencode.json
+windsurf.mcp.json
+*.mcp.json.*.bak
+.opencode.json.*.bak
+.windsurf.mcp.json.*.bak
+.agent-mail-project-id
+.agent-mail.yaml
+*.sqlite3.bak
+*.sqlite3.corrupt*
+storage.sqlite3.corrupt-*
+storage.sqlite3-shm.corrupt-*
+storage.sqlite3-wal.corrupt-*
+.beads/*.corrupt*
+.beads/*.pre_repair_*
+.beads/*.repair_candidate_*
+.beads/*.bak-corrupt
+
+# Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.rebuild_*
+.beads/*.reindex_test_*
+.beads/*.vacuum_test_*
+.beads/recovery*/
+
+# Malformed workspace test directories (br test artifacts)
+br_malformed_*/
+
+# SQLite WAL/SHM files in sample databases
+sample_beads_db_files/**/*.db-shm
+sample_beads_db_files/**/*.db-wal
+
+# Test database files (agent test artifacts)
+-memorytest.db
+*memorytest.db
+
+# Root-level test scratch files (agent-generated)
+/test_file
+/test_file.rs
+/test_lock
+/test_lock.rs
+/test_cycle.rs
+/test_*.sh
+/child.json
+/parent.json
+
+# Beads snapshot backups (timestamped)
+.beads.snapshot_*/
+
+# UBS scan output
+ubs.json
+ubs_output.*
+rust-bug-scan.txt
+report.json
+
+# Codex CLI ephemeral directories
+.codex-local-check/
+.codex-bench/
+.codex-tmp/

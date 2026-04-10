@@ -1,0 +1,892 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/ops-telemetry-storage-v1.schema.json",
+  "title": "FrankenSearch Ops Telemetry Storage Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "database",
+    "supported_windows",
+    "tables",
+    "indexes",
+    "dedup_keys",
+    "migration_strategy",
+    "retention_policy",
+    "query_patterns",
+    "query_api"
+  ],
+  "properties": {
+    "version": {
+      "const": "v1"
+    },
+    "database": {
+      "const": "frankensearch-ops.db"
+    },
+    "supported_windows": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/window_label"
+      }
+    },
+    "tables": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/$defs/table"
+      }
+    },
+    "indexes": {
+      "type": "array",
+      "minItems": 11,
+      "maxItems": 11,
+      "items": {
+        "$ref": "#/$defs/index"
+      }
+    },
+    "dedup_keys": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "$ref": "#/$defs/dedup_key"
+      }
+    },
+    "migration_strategy": {
+      "$ref": "#/$defs/migration_strategy"
+    },
+    "retention_policy": {
+      "$ref": "#/$defs/retention_policy"
+    },
+    "query_patterns": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/query_pattern"
+      }
+    },
+    "query_api": {
+      "$ref": "#/$defs/query_api"
+    }
+  },
+  "allOf": [
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "projects"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "project_key"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "instances"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "state"
+                    },
+                    "check": {
+                      "const": "state IN ('started','healthy','degraded','stale','stopped')"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "search_events"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "phase"
+                    },
+                    "check": {
+                      "const": "phase IN ('initial','refined','failed')"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "search_summaries"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "window"
+                    },
+                    "check": {
+                      "const": "window IN ('1m','15m','1h','6h','24h','3d','1w')"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "embedding_job_snapshots"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "index_inventory_snapshots"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "is_stale"
+                    },
+                    "check": {
+                      "const": "is_stale IN (0,1)"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "resource_samples"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "alerts_timeline"
+              },
+              "columns": {
+                "allOf": [
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "const": "severity"
+                        },
+                        "check": {
+                          "const": "severity IN ('info','warn','error','critical')"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "check"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "const": "state"
+                        },
+                        "check": {
+                          "const": "state IN ('open','acknowledged','resolved')"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "check"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "evidence_links"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ops_schema_migrations"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "reversible"
+                    },
+                    "check": {
+                      "const": "reversible IN (0,1)"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_inst_pk_hb"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_se_pk_ts"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_se_ii_ts"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_se_corr"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_ss_pk_w"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_ejs_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_iis_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_rs_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_at_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_at_open"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_el_aid"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "window_label": {
+      "type": "string",
+      "enum": [
+        "1m",
+        "15m",
+        "1h",
+        "6h",
+        "24h",
+        "3d",
+        "1w"
+      ]
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "nullable"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "TEXT",
+            "INTEGER",
+            "REAL"
+          ]
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": [
+            "string",
+            "number",
+            "boolean"
+          ]
+        },
+        "check": {
+          "type": "string"
+        },
+        "unique": {
+          "type": "boolean"
+        }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "purpose",
+        "primary_key",
+        "columns"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "projects",
+            "instances",
+            "search_events",
+            "search_summaries",
+            "embedding_job_snapshots",
+            "index_inventory_snapshots",
+            "resource_samples",
+            "alerts_timeline",
+            "evidence_links",
+            "ops_schema_migrations"
+          ]
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "primary_key": {
+          "type": "string"
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/column"
+          }
+        },
+        "foreign_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "table",
+        "columns",
+        "query_goal"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "ix_inst_pk_hb",
+            "ix_se_pk_ts",
+            "ix_se_ii_ts",
+            "ix_se_corr",
+            "ix_ss_pk_w",
+            "ix_ejs_pk",
+            "ix_iis_pk",
+            "ix_rs_pk",
+            "ix_at_pk",
+            "ix_at_open",
+            "ix_el_aid"
+          ]
+        },
+        "table": {
+          "type": "string",
+          "enum": [
+            "instances",
+            "search_events",
+            "search_summaries",
+            "embedding_job_snapshots",
+            "index_inventory_snapshots",
+            "resource_samples",
+            "alerts_timeline",
+            "evidence_links"
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "query_goal": {
+          "type": "string"
+        },
+        "partial_predicate": {
+          "type": "string"
+        }
+      }
+    },
+    "dedup_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "table",
+        "key",
+        "strategy"
+      ],
+      "properties": {
+        "table": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "insert_or_ignore",
+            "upsert"
+          ]
+        }
+      }
+    },
+    "migration_strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracking_table",
+        "forward_only_in_production",
+        "reversible_in_dev_test",
+        "checksum_validation",
+        "migration_columns"
+      ],
+      "properties": {
+        "tracking_table": {
+          "const": "ops_schema_migrations"
+        },
+        "forward_only_in_production": {
+          "const": true
+        },
+        "reversible_in_dev_test": {
+          "const": true
+        },
+        "checksum_validation": {
+          "const": true
+        },
+        "migration_columns": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "version",
+              "name",
+              "applied_at_ms",
+              "checksum",
+              "reversible"
+            ]
+          }
+        }
+      }
+    },
+    "query_pattern": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "filters",
+        "sort",
+        "outputs"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "project_search_latency_window",
+            "live_open_alerts",
+            "project_resource_timeline",
+            "instance_heartbeat_health"
+          ]
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sort": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "window": {
+          "$ref": "#/$defs/window_label"
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "retention_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_events_days",
+        "summaries_days",
+        "cleanup_interval_minutes",
+        "cleanup_batch_rows"
+      ],
+      "properties": {
+        "raw_events_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "summaries_days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cleanup_interval_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cleanup_batch_rows": {
+          "type": "integer",
+          "minimum": 100
+        }
+      }
+    },
+    "query_api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "latency_window",
+        "live_alerts",
+        "resource_timeline"
+      ],
+      "properties": {
+        "latency_window": {
+          "type": "string"
+        },
+        "live_alerts": {
+          "type": "string"
+        },
+        "resource_timeline": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+[package]
+name = "sqlmodel-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Session and Unit of Work for SQLModel Rust"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-session"
+readme = "README.md"
+keywords = ["sql", "session", "unit-of-work", "database", "sqlmodel"]
+categories = ["database", "database-implementations", "asynchronous"]
+
+[lints]
+workspace = true
+
+[dependencies]
+sqlmodel-core.workspace = true
+sqlmodel-query.workspace = true
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

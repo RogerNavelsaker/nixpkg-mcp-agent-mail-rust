@@ -1,0 +1,24 @@
+ 1: Tour │ 2: Dash │ 3: Shakes │ 4: Code │ 5: Widgets │ 6: Layout │ 7: Forms    
+╭──────────────────────────────────Dashboard───────────────────────────────────╮
+│FRANKENTUI DASHBOARD  ╭─────────────────────Guided Tour──────────────────────╮│
+│╭──────Plasma──────╮╭─│1/16 · Tour · LIVEe────────╮╭───Code · Rust (1/28)────││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││g│Speed 1.00x · Next 6.2sni b││// runtime.rs            ││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││C│Dashboard▁▄▃▄▂▅▅▅▆▂▄▅▃▆ 46%││use std::{collections::Ha││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││M│This is the home screen. Every tile is meant to be    ││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││N│clicked. ▁   ▇▁▁    ▁ █▁ 14││use ftui_core::event::Eve││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││O│Click a tile (or press Enter) to jump in. Explorer::Ce││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││E│Controls: Space pause · ←/→ step · Esc exit───────────││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││ │Steps:                     │╭──────────Info───────────││
+││⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││ │▶ Tour · Dashboard         ││Status:NOMINAL FPS:0     ││
+││Click → Visual Eff││C│• Tour · Dashboard         ││Click → Performance      ││
+│╰──────────────────╯╰─│• Visuals · Mermaid Showcase╰─────────────────────────││
+│╭Text FX · 2-Up (1│╭──│• Tour · Inline Mode──────│╭Markdown · Streaming… 0%─╮││
+││Sample 1 of 3 · 2││SE╰──────────────────────────────────────────────────────╯│
+││1 · None · S1    ││ INFO  00:02   CPU spike dete││                         │ │
+││2 · FadeIn · S2  ⋮│                             ⋮│                         │ │
+││                 ││                             ││                         │ │
+││drag panes in das││Click → Action Timeline      ││Click → Markdown         │ │
+│╰─────────────────│╰─────────────────────────────│╰─────────────────────────╯ │
+│g:charts c:code e:fx m:md | drag bottom dividers: resize | 1-9:screens | t:the│
+╰──────────────────────────────────────────────────────────────────────────────╯
+ Dashboard [1/45] [h] [cmd] [p] [d]    Tab/Shift+Tab: next/prev     80x24 00:00 

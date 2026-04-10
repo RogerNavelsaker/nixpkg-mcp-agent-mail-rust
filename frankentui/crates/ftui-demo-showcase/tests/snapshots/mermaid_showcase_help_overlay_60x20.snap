@@ -1,0 +1,20 @@
+Mermaid Sh╭───────── Help (? to close) ──────────╮o | Score:
+╭─────────│  Nav──────────Samples────────────────│─────────╮
+│> Flow Ba│         j/k  Sample decision]        │         │
+│  Flow Su│       Enter  Re-renderph, clusters]  │         │
+│  Flow De│  Cfglow, L, dense, dag]              │         │
+│  Flow Lo│           u  Linkslabels, wrap]      │         │
+╰─────────│           I  Init────────────────────│─────────╯
+╭─────────│           e  Errorsort───────────────│─────────╮
+│         │           x  Guard                   │         │
+│         │  View                          ⢀⣀⣀⣀⣀⣀│⣀⣀⣀⣀⣀⣀⣀⣀ │
+│         │           l  Layout          OK   ⣿⣿⣿│⣿⣿⣿⣿⣿⣿⣿⣿ │
+│         │           v  Viewport       ⢀⡨⢻⢻⣿⣿⣿⣿⣿│⣿⣿⣿⣿⣿⣿⣿⣿ │
+│ ⣿⣿⣿⣿⣿⣿⣿⣿│         +/-  Zoom⣾⣿⣶⣶⣤⣄⣀⡀ ⡠⠔⠁        │         │
+│ ⣿⣿⣿⣿⣿⣿⣿⣿│           ?  Help⣿⣿⡿⠿⠿⠛⠛⠉⠉⠢⢄         │         │
+│         │  Panels                     ⠑⠢⣰⣸⣿⣿⣿⣿⣿│⣿⣿⣿⣿⣿⣿⣿⣿ │
+│         │           m  Metrics         Fix  ⣿⣿⣿│⣿⣿⣿⣿⣿⣿⣿⣿ │
+│         │         Esc  Collapse          ⠈⠉⠉⠉⠉⠉│⠉⠉⠉⠉⠉⠉⠉⠉ │
+│         │                                      │         │
+╰─────────│──────────────────────────────────────│─────────╯
+j/k sample╰──────────────────────────────────────╯          

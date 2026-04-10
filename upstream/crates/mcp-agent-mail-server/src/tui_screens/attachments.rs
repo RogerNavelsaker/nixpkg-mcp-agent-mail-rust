@@ -1,0 +1,2098 @@
+//! Attachments screen — browse attachments across messages with provenance trails.
+
+use ftui::layout::{Breakpoint, Constraint, Flex, Rect, ResponsiveLayout};
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
+use ftui::widgets::block::Block;
+use ftui::widgets::borders::BorderType;
+use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::table::{Row, Table, TableState};
+use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
+use ftui_runtime::program::Cmd;
+
+use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::sqlmodel::Value;
+use mcp_agent_mail_db::timestamps::micros_to_iso;
+
+use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_widgets::fancy::SummaryFooter;
+use crate::tui_widgets::{MetricTile, MetricTrend};
+
+// ──────────────────────────────────────────────────────────────────────
+// Constants
+// ──────────────────────────────────────────────────────────────────────
+
+const COL_MEDIA: usize = 0;
+const COL_SIZE: usize = 1;
+const COL_SENDER: usize = 2;
+const COL_SUBJECT: usize = 3;
+const COL_DATE: usize = 4;
+const COL_PROJECT: usize = 5;
+
+const SORT_LABELS: &[&str] = &["Type", "Size", "Sender", "Subject", "Date", "Project"];
+
+/// Debounce ticks before reloading data.
+const RELOAD_INTERVAL_TICKS: u64 = 50;
+
+/// Maximum attachments to fetch from DB.
+const FETCH_LIMIT: usize = 500;
+
+fn sanitize_diagnostic_value(value: &str) -> String {
+    value
+        .replace(['\n', '\r', ';', ','], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+const ATTACHMENTS_DETAIL_GAP_THRESHOLD: u16 = 24;
+
+fn attachment_media_type(att: &serde_json::Value) -> String {
+    att.get("media_type")
+        .or_else(|| att.get("content_type"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            att.get("type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| !matches!(*kind, "file" | "inline" | "auto"))
+        })
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+fn attachment_bytes(att: &serde_json::Value) -> u64 {
+    att.get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| att.get("size").and_then(serde_json::Value::as_u64))
+        .or_else(|| {
+            att.get("size")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|raw| raw.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn attachment_path(att: &serde_json::Value) -> Option<String> {
+    att.get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            att.get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AttachmentEntry — parsed attachment with provenance
+// ──────────────────────────────────────────────────────────────────────
+
+/// A single attachment with its source message provenance.
+#[derive(Debug, Clone)]
+struct AttachmentEntry {
+    /// Media type (e.g. "image/webp", "application/pdf").
+    media_type: String,
+    /// Size in bytes.
+    bytes: u64,
+    /// SHA-1 hash of the attachment content.
+    sha1: String,
+    /// Dimensions (width x height), zero if not an image.
+    width: u32,
+    height: u32,
+    /// Storage mode: "inline" or "file".
+    mode: String,
+    /// Relative path in archive (file mode only).
+    path: Option<String>,
+
+    // Provenance fields
+    message_id: i64,
+    sender_name: String,
+    subject: String,
+    thread_id: Option<String>,
+    created_ts: i64,
+    project_slug: String,
+}
+
+impl AttachmentEntry {
+    /// Human-readable size string.
+    #[allow(clippy::cast_precision_loss)]
+    fn size_display(&self) -> String {
+        if self.bytes < 1024 {
+            format!("{} B", self.bytes)
+        } else if self.bytes < 1_048_576 {
+            format!("{:.1} KB", self.bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", self.bytes as f64 / 1_048_576.0)
+        }
+    }
+
+    /// Short type label from `media_type`.
+    fn type_label(&self) -> &str {
+        // Show subtype only (e.g. "webp" from "image/webp")
+        self.media_type
+            .split('/')
+            .nth(1)
+            .unwrap_or(&self.media_type)
+    }
+
+    /// Dimensions display, if available.
+    fn dims_display(&self) -> String {
+        if self.width > 0 && self.height > 0 {
+            format!("{}x{}", self.width, self.height)
+        } else {
+            String::new()
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Filter for media type categories
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaFilter {
+    All,
+    Images,
+    Documents,
+    Other,
+}
+
+impl MediaFilter {
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Images,
+            Self::Images => Self::Documents,
+            Self::Documents => Self::Other,
+            Self::Other => Self::All,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Images => "Images",
+            Self::Documents => "Docs",
+            Self::Other => "Other",
+        }
+    }
+
+    fn matches(self, media_type: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Images => media_type.starts_with("image/"),
+            Self::Documents => {
+                media_type.starts_with("application/pdf")
+                    || media_type.starts_with("text/")
+                    || media_type.contains("document")
+            }
+            Self::Other => {
+                !media_type.starts_with("image/")
+                    && !media_type.starts_with("application/pdf")
+                    && !media_type.starts_with("text/")
+                    && !media_type.contains("document")
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// AttachmentExplorerScreen
+// ──────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::struct_excessive_bools)]
+pub struct AttachmentExplorerScreen {
+    table_state: TableState,
+    /// All loaded attachment entries.
+    entries: Vec<AttachmentEntry>,
+    /// Filtered + sorted display indices into `entries`.
+    display_indices: Vec<usize>,
+    sort_col: usize,
+    sort_asc: bool,
+    media_filter: MediaFilter,
+    text_filter: String,
+    text_filter_active: bool,
+    /// Detail panel scroll offset.
+    detail_scroll: usize,
+    /// Maximum scroll offset observed during the last render pass.
+    last_detail_max_scroll: std::cell::Cell<usize>,
+
+    // DB state
+    db_conn: Option<DbConn>,
+    db_conn_attempted: bool,
+    db_context_unavailable: bool,
+    last_error: Option<String>,
+    data_dirty: bool,
+    last_reload_tick: u64,
+
+    /// Last observed data generation for dirty-state tracking.
+    last_data_gen: super::DataGeneration,
+
+    /// Synthetic event for the focused attachment's source message.
+    focused_synthetic: Option<crate::tui_events::MailEvent>,
+    /// Previous attachment counts for `MetricTrend` computation.
+    prev_attachment_counts: (u64, u64, u64, u64),
+    /// Holds the temp snapshot directory alive when this screen binds to an archive snapshot.
+    _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
+}
+
+impl AttachmentExplorerScreen {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            table_state: TableState::default(),
+            entries: Vec::new(),
+            display_indices: Vec::new(),
+            sort_col: COL_DATE,
+            sort_asc: false,
+            media_filter: MediaFilter::All,
+            text_filter: String::new(),
+            text_filter_active: false,
+            detail_scroll: 0,
+            last_detail_max_scroll: std::cell::Cell::new(0),
+            db_conn: None,
+            db_conn_attempted: false,
+            db_context_unavailable: false,
+            last_error: None,
+            data_dirty: true,
+            last_reload_tick: 0,
+            last_data_gen: super::DataGeneration::stale(),
+            focused_synthetic: None,
+            prev_attachment_counts: (0, 0, 0, 0),
+            _db_snapshot_dir: None,
+        }
+    }
+
+    fn ensure_db_conn(&mut self, state: &TuiSharedState) {
+        if self.db_conn.is_some() || self.db_conn_attempted {
+            return;
+        }
+        self.db_conn_attempted = true;
+        let cfg = state.config_snapshot();
+        match crate::open_observability_sync_db_connection(
+            &cfg.raw_database_url,
+            std::path::Path::new(&cfg.storage_root),
+            "attachments screen",
+        ) {
+            Ok(Some(db)) => {
+                let (conn, _, snapshot_dir) = db.into_parts();
+                self.db_conn = Some(conn);
+                self._db_snapshot_dir = snapshot_dir;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "attachments screen db bind failed");
+            }
+        }
+        self.db_context_unavailable = self.db_conn.is_none();
+    }
+
+    fn load_attachments(&mut self, state: &TuiSharedState) {
+        self.ensure_db_conn(state);
+        let Some(conn) = self.db_conn.take() else {
+            // Connection open can fail transiently (startup race, WAL recovery in
+            // progress, temporary FS hiccup). Allow future retries.
+            let preserved_stale = !self.entries.is_empty() || !self.display_indices.is_empty();
+            self.db_conn_attempted = false;
+            self.db_context_unavailable = true;
+            self.data_dirty = false;
+            self.emit_db_unavailable_diagnostic(
+                state,
+                "database connection unavailable",
+                preserved_stale,
+            );
+            return;
+        };
+        self.db_context_unavailable = false;
+
+        let sql = "SELECT m.id AS message_id, m.subject, m.attachments, m.created_ts, \
+                   m.thread_id, m.sender_id AS raw_sender_id, m.project_id AS raw_project_id, \
+                   a.name AS sender_name, p.slug AS project_slug \
+                   FROM messages m \
+                   LEFT JOIN agents a ON a.id = m.sender_id \
+                   LEFT JOIN projects p ON p.id = m.project_id \
+                   WHERE m.attachments != '[]' AND length(m.attachments) > 2 \
+                   ORDER BY m.created_ts DESC \
+                   LIMIT ?1";
+
+        #[allow(clippy::cast_possible_wrap)]
+        let params = [Value::BigInt(FETCH_LIMIT as i64)];
+
+        match conn.query_sync(sql, &params) {
+            Ok(rows) => {
+                self.entries.clear();
+                for row in &rows {
+                    let message_id: i64 = row.get_named("message_id").unwrap_or(0);
+                    let subject: String = row.get_named("subject").unwrap_or_default();
+                    let attachments_json: String = row.get_named("attachments").unwrap_or_default();
+                    let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
+                    let thread_id: Option<String> = row.get_named("thread_id").ok();
+                    let sender_id: i64 = row.get_named("raw_sender_id").unwrap_or(0);
+                    let project_id: i64 = row.get_named("raw_project_id").unwrap_or(0);
+                    let sender_name = row
+                        .get_named::<String>("sender_name")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| format!("[unknown-agent-{sender_id}]"));
+                    let project_slug = row
+                        .get_named::<String>("project_slug")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
+
+                    // Parse attachment JSON array
+                    if let Ok(attachments) =
+                        serde_json::from_str::<Vec<serde_json::Value>>(&attachments_json)
+                    {
+                        for att in &attachments {
+                            let media_type = attachment_media_type(att);
+                            let bytes = attachment_bytes(att);
+                            let sha1 = att
+                                .get("sha1")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            #[allow(clippy::cast_possible_truncation)]
+                            let width = att
+                                .get("width")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0) as u32;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let height = att
+                                .get("height")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0) as u32;
+                            let mode = att
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let path = attachment_path(att);
+
+                            self.entries.push(AttachmentEntry {
+                                media_type,
+                                bytes,
+                                sha1,
+                                width,
+                                height,
+                                mode,
+                                path,
+                                message_id,
+                                sender_name: sender_name.clone(),
+                                subject: subject.clone(),
+                                thread_id: thread_id.clone(),
+                                created_ts,
+                                project_slug: project_slug.clone(),
+                            });
+                        }
+                    }
+                }
+                self.last_error = None;
+                self.rebuild_display();
+                self.emit_load_diagnostic(state);
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Query failed: {e}"));
+            }
+        }
+
+        self.db_conn = Some(conn);
+        self.data_dirty = false;
+    }
+
+    fn emit_load_diagnostic(&self, state: &TuiSharedState) {
+        let raw_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let rendered_count = u64::try_from(self.display_indices.len()).unwrap_or(u64::MAX);
+        let dropped_count = raw_count.saturating_sub(rendered_count);
+        let sort_label = SORT_LABELS.get(self.sort_col).copied().unwrap_or("unknown");
+        let text_filter = sanitize_diagnostic_value(&self.text_filter);
+        let text_filter = if text_filter.is_empty() {
+            "all".to_string()
+        } else {
+            text_filter
+        };
+
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "attachments".to_string(),
+            scope: "attachment_explorer.results".to_string(),
+            query_params: format!(
+                "filter={text_filter};media_filter={};sort_col={sort_label};sort_asc={};fetch_limit={FETCH_LIMIT}",
+                self.media_filter.label(),
+                self.sort_asc,
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count,
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
+    }
+
+    #[allow(clippy::unused_self)] // consistent signature across screens
+    fn emit_db_unavailable_diagnostic(
+        &self,
+        state: &TuiSharedState,
+        reason: &str,
+        preserved_stale: bool,
+    ) {
+        let reason = sanitize_diagnostic_value(reason);
+        let raw_count = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let rendered_count = u64::try_from(self.display_indices.len()).unwrap_or(u64::MAX);
+        let cfg = state.config_snapshot();
+        let transport_mode = cfg.transport_mode().to_string();
+        state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
+            screen: "attachments".to_string(),
+            scope: "attachment_explorer.db_unavailable".to_string(),
+            query_params: format!(
+                "filter=db_context_unavailable;reason={reason};preserved_stale={preserved_stale}"
+            ),
+            raw_count,
+            rendered_count,
+            dropped_count: raw_count.saturating_sub(rendered_count),
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            db_url: cfg.database_url,
+            storage_root: cfg.storage_root,
+            transport_mode,
+            auth_enabled: cfg.auth_enabled,
+        });
+    }
+
+    fn rebuild_display(&mut self) {
+        let filter = &self.text_filter;
+        let media = self.media_filter;
+        let lower_filter = if filter.is_empty() {
+            String::new()
+        } else {
+            filter.to_lowercase()
+        };
+
+        self.display_indices = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                if !media.matches(&e.media_type) {
+                    return false;
+                }
+                if !lower_filter.is_empty() {
+                    let matches = crate::tui_screens::contains_ci(&e.media_type, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.sender_name, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.subject, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.project_slug, &lower_filter)
+                        || crate::tui_screens::contains_ci(&e.sha1, &lower_filter);
+                    if !matches {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        // Sort
+        let col = self.sort_col;
+        let asc = self.sort_asc;
+        let entries = &self.entries;
+        self.display_indices.sort_by(|&a, &b| {
+            let ea = &entries[a];
+            let eb = &entries[b];
+            let cmp = match col {
+                COL_MEDIA => ea.media_type.cmp(&eb.media_type),
+                COL_SIZE => ea.bytes.cmp(&eb.bytes),
+                COL_SENDER => super::cmp_ci(&ea.sender_name, &eb.sender_name),
+                COL_SUBJECT => super::cmp_ci(&ea.subject, &eb.subject),
+                COL_DATE => ea.created_ts.cmp(&eb.created_ts),
+                COL_PROJECT => super::cmp_ci(&ea.project_slug, &eb.project_slug),
+                _ => std::cmp::Ordering::Equal,
+            };
+            if asc { cmp } else { cmp.reverse() }
+        });
+
+        // Clamp selection
+        if let Some(sel) = self.table_state.selected
+            && sel >= self.display_indices.len()
+        {
+            self.table_state.selected = if self.display_indices.is_empty() {
+                None
+            } else {
+                Some(self.display_indices.len() - 1)
+            };
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.display_indices.is_empty() {
+            return;
+        }
+        let len = self.display_indices.len();
+        let Some(current) = self.table_state.selected else {
+            self.table_state.selected = Some(0);
+            self.detail_scroll = 0;
+            return;
+        };
+        let next = if delta > 0 {
+            current.saturating_add(delta.unsigned_abs()).min(len - 1)
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
+        self.table_state.selected = Some(next);
+        self.detail_scroll = 0;
+    }
+
+    fn selected_entry(&self) -> Option<&AttachmentEntry> {
+        self.table_state
+            .selected
+            .and_then(|i| self.display_indices.get(i))
+            .map(|&idx| &self.entries[idx])
+    }
+
+    fn sync_focused_event(&mut self) {
+        self.focused_synthetic = self.selected_entry().map(|e| {
+            crate::tui_events::MailEvent::message_sent(
+                e.message_id,
+                &e.sender_name,
+                Vec::new(),
+                &e.subject,
+                e.thread_id.as_deref().unwrap_or(""),
+                &e.project_slug,
+                "",
+            )
+        });
+    }
+
+    /// Summary statistics for the header line.
+    fn summary(&self) -> (usize, u64) {
+        let total = self.display_indices.len();
+        let total_bytes: u64 = self
+            .display_indices
+            .iter()
+            .map(|&i| self.entries[i].bytes)
+            .sum();
+        (total, total_bytes)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn format_total_size(bytes: u64) -> String {
+        if bytes < 1024 {
+            format!("{bytes} B")
+        } else if bytes < 1_048_576 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else if bytes < 1_073_741_824 {
+            format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+        } else {
+            format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+        }
+    }
+
+    /// Build table rows with responsive column selection.
+    fn build_table_rows_responsive(&self, wide: bool, narrow: bool) -> Vec<Row> {
+        self.display_indices
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| {
+                let e = &self.entries[idx];
+                let subject_trunc: String = if e.subject.chars().count() > 40 {
+                    let head: String = e.subject.chars().take(37).collect();
+                    format!("{head}...")
+                } else {
+                    e.subject.clone()
+                };
+
+                let tp = crate::tui_theme::TuiThemePalette::current();
+                let style = if Some(i) == self.table_state.selected {
+                    Style::default().fg(tp.selection_fg).bg(tp.selection_bg)
+                } else {
+                    Style::default()
+                };
+
+                if narrow {
+                    Row::new([
+                        e.type_label().to_string(),
+                        e.size_display(),
+                        e.sender_name.clone(),
+                        subject_trunc,
+                    ])
+                    .style(style)
+                } else if wide {
+                    let date = micros_to_iso(e.created_ts);
+                    let date_short = if date.len() > 19 { &date[..19] } else { &date };
+                    Row::new([
+                        e.type_label().to_string(),
+                        e.size_display(),
+                        e.sender_name.clone(),
+                        subject_trunc,
+                        date_short.to_string(),
+                        e.project_slug.clone(),
+                    ])
+                    .style(style)
+                } else {
+                    let date = micros_to_iso(e.created_ts);
+                    let date_short = if date.len() > 19 { &date[..19] } else { &date };
+                    Row::new([
+                        e.type_label().to_string(),
+                        e.size_display(),
+                        e.sender_name.clone(),
+                        subject_trunc,
+                        date_short.to_string(),
+                    ])
+                    .style(style)
+                }
+            })
+            .collect()
+    }
+
+    /// Render the summary header line.
+    fn render_header(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (count, total_bytes) = self.summary();
+        let sort_indicator = if self.sort_asc {
+            "\u{25b2}"
+        } else {
+            "\u{25bc}"
+        };
+        let sort_label = SORT_LABELS.get(self.sort_col).unwrap_or(&"?");
+        let filter_label = self.media_filter.label();
+        let filter_text = if self.text_filter.is_empty() {
+            String::new()
+        } else if self.text_filter_active {
+            format!("  Search: {}|", self.text_filter)
+        } else {
+            format!("  Search: {}", self.text_filter)
+        };
+
+        let summary = format!(
+            " {count} attachments ({})  Filter: {filter_label}  Sort: {sort_label}{sort_indicator}{filter_text}",
+            Self::format_total_size(total_bytes),
+        );
+
+        let summary_style = if self.text_filter_active {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            crate::tui_theme::text_facet_active(&tp)
+        } else {
+            Style::default()
+        };
+        let p = Paragraph::new(summary).style(summary_style);
+        p.render(area, frame);
+    }
+
+    /// Render the full table content column: summary + header + table + optional bottom detail + footer.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    fn render_table_content(&self, frame: &mut Frame<'_>, area: Rect, show_bottom_detail: bool) {
+        let wide = area.width >= 120;
+        let narrow = area.width < 80;
+
+        let summary_h: u16 = if area.height >= 10 { 2 } else { 0 };
+        let header_h: u16 = 1;
+        let footer_h: u16 = u16::from(area.height >= 6);
+        let has_detail = show_bottom_detail && self.selected_entry().is_some();
+        let remaining_for_content = area
+            .height
+            .saturating_sub(summary_h)
+            .saturating_sub(header_h)
+            .saturating_sub(footer_h);
+        let detail_h = if has_detail && remaining_for_content > 12 {
+            remaining_for_content.min(40) / 3
+        } else {
+            0
+        };
+        let section_gap =
+            u16::from(detail_h > 0 && remaining_for_content >= ATTACHMENTS_DETAIL_GAP_THRESHOLD);
+        let table_h = remaining_for_content
+            .saturating_sub(detail_h)
+            .saturating_sub(section_gap);
+
+        let mut y = area.y;
+
+        if summary_h > 0 {
+            let summary_area = Rect::new(area.x, y, area.width, summary_h);
+            self.render_summary_band(frame, summary_area);
+            y += summary_h;
+        }
+
+        let header_area = Rect::new(area.x, y, area.width, header_h);
+        y += header_h;
+        self.render_header(frame, header_area);
+
+        let table_area = Rect::new(area.x, y, area.width, table_h);
+        y += table_h;
+
+        if self.db_context_unavailable {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let err_p = Paragraph::new(
+                " Database context unavailable. Check DB URL/project scope and refresh.",
+            )
+            .style(Style::default().fg(tp.severity_error));
+            err_p.render(table_area, frame);
+            return;
+        }
+        if let Some(err) = &self.last_error {
+            let tp = crate::tui_theme::TuiThemePalette::current();
+            let err_p = Paragraph::new(format!(" Error: {err}"))
+                .style(Style::default().fg(tp.severity_error));
+            err_p.render(table_area, frame);
+            return;
+        }
+
+        let (header_cells, col_widths): (Vec<&str>, Vec<Constraint>) = if narrow {
+            (
+                vec!["Type", "Size", "Sender", "Subject"],
+                vec![
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(12.0),
+                    Constraint::Percentage(26.0),
+                    Constraint::Percentage(50.0),
+                ],
+            )
+        } else if wide {
+            (
+                vec!["Type", "Size", "Sender", "Subject", "Date", "Project"],
+                vec![
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(15.0),
+                ],
+            )
+        } else {
+            (
+                vec!["Type", "Size", "Sender", "Subject", "Date"],
+                vec![
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(10.0),
+                    Constraint::Percentage(18.0),
+                    Constraint::Percentage(37.0),
+                    Constraint::Percentage(25.0),
+                ],
+            )
+        };
+
+        let header_row = Row::new(header_cells).style(Style::default().bold());
+        let rows = self.build_table_rows_responsive(wide, narrow);
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Attachments")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+
+        let table = Table::new(rows, col_widths)
+            .header(header_row)
+            .block(block)
+            .highlight_style(Style::default().fg(tp.selection_fg).bg(tp.selection_bg));
+
+        let mut ts = self.table_state.clone();
+        StatefulWidget::render(&table, table_area, frame, &mut ts);
+
+        if section_gap > 0 {
+            let gap_area = Rect::new(area.x, y, area.width, section_gap);
+            for gy in gap_area.y..gap_area.y.saturating_add(gap_area.height) {
+                for gx in gap_area.x..gap_area.x.saturating_add(gap_area.width) {
+                    if let Some(cell) = frame.buffer.get_mut(gx, gy) {
+                        cell.bg = tp.panel_bg;
+                    }
+                }
+            }
+            y += section_gap;
+        }
+
+        if detail_h > 0 {
+            let detail_area = Rect::new(area.x, y, area.width, detail_h);
+            y += detail_h;
+            if let Some(entry) = self.selected_entry() {
+                self.render_detail(frame, detail_area, entry);
+            }
+        }
+
+        if footer_h > 0 {
+            let footer_area = Rect::new(area.x, y, area.width, footer_h);
+            self.render_footer(frame, footer_area);
+        }
+    }
+
+    /// Render the right-side detail panel using structured key-value layout.
+    fn render_side_detail(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = crate::tui_panel_helpers::panel_block(" Attachment Detail ");
+        let inner = block.inner(area);
+        block.render(area, frame);
+
+        let Some(entry) = self.selected_entry() else {
+            crate::tui_panel_helpers::render_empty_state(
+                frame,
+                inner,
+                "\u{1f4ce}",
+                "No Attachment Selected",
+                "Select an attachment from the table to view details.",
+            );
+            return;
+        };
+
+        let mut lines: Vec<(String, String, Option<PackedRgba>)> = vec![
+            ("Type".into(), entry.media_type.clone(), None),
+            ("Size".into(), entry.size_display(), None),
+            ("Mode".into(), entry.mode.clone(), None),
+            ("SHA-1".into(), entry.sha1.clone(), None),
+        ];
+        let dims = entry.dims_display();
+        if !dims.is_empty() {
+            lines.push(("Dimensions".into(), dims, None));
+        }
+        if let Some(p) = &entry.path {
+            lines.push(("Path".into(), p.clone(), None));
+        }
+        lines.push((String::new(), String::new(), None));
+        lines.push(("Provenance".into(), String::new(), Some(tp.text_muted)));
+        lines.push(("Message ID".into(), entry.message_id.to_string(), None));
+        lines.push(("Sender".into(), entry.sender_name.clone(), None));
+        lines.push(("Subject".into(), entry.subject.clone(), None));
+        if let Some(tid) = &entry.thread_id {
+            lines.push(("Thread".into(), tid.clone(), None));
+        }
+        lines.push(("Date".into(), micros_to_iso(entry.created_ts), None));
+        lines.push(("Project".into(), entry.project_slug.clone(), None));
+
+        render_kv_lines(
+            frame,
+            inner,
+            &lines,
+            self.detail_scroll,
+            &self.last_detail_max_scroll,
+            &tp,
+        );
+    }
+
+    /// Render the detail panel for the selected attachment.
+    fn render_detail(&self, frame: &mut Frame<'_>, area: Rect, entry: &AttachmentEntry) {
+        if area.height < 2 || area.width < 20 {
+            return;
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!("Type: {}", entry.media_type));
+        lines.push(format!("Size: {}", entry.size_display()));
+        lines.push(format!("Mode: {}", entry.mode));
+        lines.push(format!("SHA-1: {}", entry.sha1));
+        let dims = entry.dims_display();
+        if !dims.is_empty() {
+            lines.push(format!("Dimensions: {dims}"));
+        }
+        if let Some(p) = &entry.path {
+            lines.push(format!("Path: {p}"));
+        }
+        lines.push(String::new());
+        lines.push("--- Provenance ---".to_string());
+        lines.push(format!("Message ID: {}", entry.message_id));
+        lines.push(format!("Sender: {}", entry.sender_name));
+        lines.push(format!("Subject: {}", entry.subject));
+        if let Some(tid) = &entry.thread_id {
+            lines.push(format!("Thread: {tid}"));
+        }
+        lines.push(format!("Date: {}", micros_to_iso(entry.created_ts)));
+        lines.push(format!("Project: {}", entry.project_slug));
+
+        let visible_height = usize::from(area.height.saturating_sub(2)); // Account for borders
+        let total_lines = lines.len();
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        self.last_detail_max_scroll.set(max_scroll);
+        let clamped_scroll = self.detail_scroll.min(max_scroll);
+
+        // Apply scroll offset
+        let visible: Vec<String> = lines
+            .into_iter()
+            .skip(clamped_scroll)
+            .take(visible_height)
+            .collect();
+        let text = visible.join("\n");
+
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let block = Block::default()
+            .title("Attachment Detail")
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(tp.panel_border));
+        let p = Paragraph::new(text).block(block);
+        p.render(area, frame);
+    }
+
+    /// Count attachments by type (total, images, docs, other).
+    fn type_counts(&self) -> (u64, u64, u64, u64) {
+        let total = self.display_indices.len() as u64;
+        let images = self
+            .display_indices
+            .iter()
+            .filter(|&&i| self.entries[i].media_type.starts_with("image/"))
+            .count() as u64;
+        let docs = self
+            .display_indices
+            .iter()
+            .filter(|&&i| MediaFilter::Documents.matches(&self.entries[i].media_type))
+            .count() as u64;
+        let other = total.saturating_sub(images).saturating_sub(docs);
+        (total, images, docs, other)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, images, docs, other) = self.type_counts();
+        let (prev_total, prev_images, prev_docs, prev_other) = self.prev_attachment_counts;
+
+        let (_, total_bytes) = self.summary();
+        let size_str = Self::format_total_size(total_bytes);
+        let total_str = total.to_string();
+        let images_str = images.to_string();
+        let docs_str = docs.to_string();
+
+        // Use "other" count but show size as 2nd tile instead of "other"
+        let _ = other;
+        let _ = prev_other;
+
+        let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
+            (
+                "Files",
+                &total_str,
+                trend_for(total, prev_total),
+                tp.metric_messages,
+            ),
+            (
+                "Size",
+                &size_str,
+                trend_for(total_bytes, 0), // size trend not meaningful with prev
+                tp.metric_latency,
+            ),
+            (
+                "Images",
+                &images_str,
+                trend_for(images, prev_images),
+                tp.metric_agents,
+            ),
+            (
+                "Docs",
+                &docs_str,
+                trend_for(docs, prev_docs),
+                tp.metric_projects,
+            ),
+        ];
+
+        let tile_count = tiles.len();
+        if tile_count == 0 || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let tile_w = area.width / tile_count as u16;
+
+        for (i, (label, value, trend, color)) in tiles.iter().enumerate() {
+            let x = area.x + (i as u16) * tile_w;
+            let w = if i == tile_count - 1 {
+                area.width.saturating_sub(x - area.x)
+            } else {
+                tile_w
+            };
+            let tile_area = Rect::new(x, area.y, w, area.height);
+            let tile = MetricTile::new(label, value, *trend)
+                .value_color(*color)
+                .sparkline_color(*color);
+            tile.render(tile_area, frame);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let (total, images, docs, other) = self.type_counts();
+        let (_, total_bytes) = self.summary();
+
+        let total_str = total.to_string();
+        let size_str = Self::format_total_size(total_bytes);
+        let images_str = images.to_string();
+        let docs_str = docs.to_string();
+        let other_str = other.to_string();
+
+        let items: Vec<(&str, &str, PackedRgba)> = vec![
+            (&*total_str, "files", tp.metric_messages),
+            (&*size_str, "", tp.metric_latency),
+            (&*images_str, "images", tp.metric_agents),
+            (&*docs_str, "docs", tp.metric_projects),
+            (&*other_str, "other", tp.text_muted),
+        ];
+
+        SummaryFooter::new(&items, tp.text_muted).render(area, frame);
+    }
+}
+
+impl Default for AttachmentExplorerScreen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MailScreen for AttachmentExplorerScreen {
+    fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+        if let Event::Key(key) = event {
+            if key.kind != KeyEventKind::Press {
+                return Cmd::None;
+            }
+
+            // Text filter input mode
+            if self.text_filter_active {
+                match key.code {
+                    KeyCode::Escape => {
+                        self.text_filter_active = false;
+                    }
+                    KeyCode::Enter => {
+                        self.text_filter_active = false;
+                        self.rebuild_display();
+                    }
+                    KeyCode::Backspace => {
+                        self.text_filter.pop();
+                        self.rebuild_display();
+                    }
+                    KeyCode::Char(c) => {
+                        self.text_filter.push(c);
+                        self.rebuild_display();
+                    }
+                    _ => {}
+                }
+                return Cmd::None;
+            }
+
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+                KeyCode::Char('G') | KeyCode::End if !self.display_indices.is_empty() => {
+                    self.table_state.selected = Some(self.display_indices.len() - 1);
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('g') | KeyCode::Home if !self.display_indices.is_empty() => {
+                    self.table_state.selected = Some(0);
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('/') => {
+                    self.text_filter_active = true;
+                }
+                KeyCode::Char('s') => {
+                    self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
+                    self.rebuild_display();
+                }
+                KeyCode::Char('S') => {
+                    self.sort_asc = !self.sort_asc;
+                    self.rebuild_display();
+                }
+                KeyCode::Char('f') => {
+                    self.media_filter = self.media_filter.next();
+                    self.rebuild_display();
+                }
+                KeyCode::Char('r') => {
+                    self.data_dirty = true;
+                }
+                KeyCode::Char('J') => {
+                    let max = self.last_detail_max_scroll.get();
+                    self.detail_scroll = self.detail_scroll.saturating_add(1).min(max);
+                }
+                KeyCode::Char('K') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    // Deep-link to source message
+                    if let Some(entry) = self.selected_entry() {
+                        return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::MessageById(
+                            entry.message_id,
+                        )));
+                    }
+                }
+                KeyCode::Char('t') => {
+                    // Deep-link to source thread
+                    if let Some(entry) = self.selected_entry()
+                        && let Some(tid) = &entry.thread_id
+                    {
+                        return Cmd::msg(MailScreenMsg::DeepLink(DeepLinkTarget::ThreadById(
+                            tid.clone(),
+                        )));
+                    }
+                }
+                KeyCode::Escape if !self.text_filter.is_empty() => {
+                    self.text_filter.clear();
+                    self.rebuild_display();
+                }
+                _ => {}
+            }
+        }
+        Cmd::None
+    }
+
+    fn tick(&mut self, tick_count: u64, state: &TuiSharedState) {
+        let interval_elapsed =
+            tick_count.saturating_sub(self.last_reload_tick) >= RELOAD_INTERVAL_TICKS;
+
+        // User-driven dirty flag always triggers a reload immediately.
+        // Interval-based reload only fires when data actually changed.
+        let should_reload = if self.data_dirty {
+            true
+        } else if interval_elapsed {
+            let current_gen = state.data_generation();
+            let dirty = super::dirty_since(&self.last_data_gen, &current_gen);
+            self.last_data_gen = current_gen;
+            dirty.db_stats
+                || dirty.events
+                || self.db_context_unavailable
+                || self.last_error.is_some()
+        } else {
+            false
+        };
+
+        if should_reload {
+            // Save previous counts for trend computation before reload
+            self.prev_attachment_counts = self.type_counts();
+            self.load_attachments(state);
+            self.last_reload_tick = tick_count;
+        }
+        self.sync_focused_event();
+    }
+
+    fn focused_event(&self) -> Option<&crate::tui_events::MailEvent> {
+        self.focused_synthetic.as_ref()
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn view(&self, frame: &mut Frame<'_>, area: Rect, _state: &TuiSharedState) {
+        if area.height < 3 || area.width < 40 {
+            return;
+        }
+
+        // Outer bordered panel
+        let outer_block = crate::tui_panel_helpers::panel_block(" Attachments ");
+        let inner = outer_block.inner(area);
+        outer_block.render(area, frame);
+        let area = inner;
+
+        // Responsive layout: Lg+ puts detail on the right side
+        let layout = ResponsiveLayout::new(Flex::vertical().constraints([Constraint::Fill]))
+            .at(
+                Breakpoint::Lg,
+                Flex::horizontal().constraints([Constraint::Percentage(55.0), Constraint::Fill]),
+            )
+            .at(
+                Breakpoint::Xl,
+                Flex::horizontal().constraints([Constraint::Percentage(50.0), Constraint::Fill]),
+            );
+
+        let split = layout.split(area);
+        let main_area = split.rects[0];
+        let side_detail = split.rects.len() >= 2;
+
+        // Render table content into main area (with bottom detail fallback on narrow)
+        self.render_table_content(frame, main_area, !side_detail);
+
+        // Render right-side detail panel on wide screens
+        if side_detail {
+            self.render_side_detail(frame, split.rects[1]);
+        }
+    }
+
+    fn keybindings(&self) -> Vec<HelpEntry> {
+        vec![
+            HelpEntry {
+                key: "j/k",
+                action: "Navigate attachments",
+            },
+            HelpEntry {
+                key: "/",
+                action: "Search/filter",
+            },
+            HelpEntry {
+                key: "s",
+                action: "Cycle sort column",
+            },
+            HelpEntry {
+                key: "S",
+                action: "Toggle sort order",
+            },
+            HelpEntry {
+                key: "f",
+                action: "Cycle media filter",
+            },
+            HelpEntry {
+                key: "Enter",
+                action: "Go to source message",
+            },
+            HelpEntry {
+                key: "t",
+                action: "Go to source thread",
+            },
+            HelpEntry {
+                key: "J/K",
+                action: "Scroll detail panel",
+            },
+            HelpEntry {
+                key: "r",
+                action: "Reload data",
+            },
+        ]
+    }
+
+    fn context_help_tip(&self) -> Option<&'static str> {
+        Some("Message attachments with preview. Enter to view, / to filter by name.")
+    }
+
+    fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
+        if let DeepLinkTarget::MessageById(msg_id) = target {
+            // Find the first attachment from this message
+            if let Some(pos) = self
+                .display_indices
+                .iter()
+                .position(|&idx| self.entries[idx].message_id == *msg_id)
+            {
+                self.table_state.selected = Some(pos);
+                self.detail_scroll = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn consumes_text_input(&self) -> bool {
+        self.text_filter_active
+    }
+
+    fn copyable_content(&self) -> Option<String> {
+        let entry = self.selected_entry()?;
+        Some(entry.path.clone().unwrap_or_else(|| entry.sha1.clone()))
+    }
+
+    fn title(&self) -> &'static str {
+        "Attachments"
+    }
+
+    fn tab_label(&self) -> &'static str {
+        "Attach"
+    }
+}
+
+const fn trend_for(current: u64, previous: u64) -> MetricTrend {
+    if current > previous {
+        MetricTrend::Up
+    } else if current < previous {
+        MetricTrend::Down
+    } else {
+        MetricTrend::Flat
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+/// Render key-value lines with a label column and a value column, supporting scroll.
+#[allow(clippy::cast_possible_truncation)]
+fn render_kv_lines(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: &[(String, String, Option<PackedRgba>)],
+    scroll: usize,
+    max_scroll_cell: &std::cell::Cell<usize>,
+    tp: &crate::tui_theme::TuiThemePalette,
+) {
+    let visible_height = usize::from(inner.height);
+    let total_lines = lines.len();
+    let max_scroll = total_lines.saturating_sub(visible_height);
+    max_scroll_cell.set(max_scroll);
+    let scroll = scroll.min(max_scroll);
+    let label_w = 12u16;
+
+    for (i, (label, value, color)) in lines.iter().skip(scroll).take(visible_height).enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+
+        let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
+        let label_text = format!("{label}:");
+        Paragraph::new(label_text)
+            .style(Style::default().fg(tp.text_muted).bold())
+            .render(label_area, frame);
+
+        let val_x = inner.x + label_w + 1;
+        if val_x < inner.x + inner.width {
+            let val_w = (inner.x + inner.width).saturating_sub(val_x);
+            let val_area = Rect::new(val_x, y, val_w, 1);
+            let val_style = color.map_or_else(
+                || Style::default().fg(tp.text_primary),
+                |c| Style::default().fg(c),
+            );
+            Paragraph::new(value.as_str())
+                .style(val_style)
+                .render(val_area, frame);
+        }
+    }
+
+    if total_lines > visible_height {
+        let indicator = format!(
+            " {}/{} ",
+            scroll + 1,
+            total_lines.saturating_sub(visible_height) + 1
+        );
+        let ind_w = indicator.len() as u16;
+        if ind_w < inner.width {
+            let ind_area = Rect::new(
+                inner.x + inner.width - ind_w,
+                inner.y + inner.height.saturating_sub(1),
+                ind_w,
+                1,
+            );
+            Paragraph::new(indicator)
+                .style(Style::default().fg(tp.text_muted))
+                .render(ind_area, frame);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mcp_agent_mail_core::Config;
+
+    fn test_state() -> std::sync::Arc<TuiSharedState> {
+        TuiSharedState::new(&Config::default())
+    }
+
+    #[test]
+    fn new_screen_defaults() {
+        let screen = AttachmentExplorerScreen::new();
+        assert!(screen.entries.is_empty());
+        assert!(screen.display_indices.is_empty());
+        assert_eq!(screen.sort_col, COL_DATE);
+        assert!(!screen.sort_asc);
+        assert_eq!(screen.media_filter, MediaFilter::All);
+        assert!(screen.text_filter.is_empty());
+        assert!(!screen.text_filter_active);
+    }
+
+    #[test]
+    fn default_impl() {
+        let screen = AttachmentExplorerScreen::default();
+        assert!(screen.entries.is_empty());
+    }
+
+    #[test]
+    fn title_and_label() {
+        let screen = AttachmentExplorerScreen::new();
+        assert_eq!(screen.title(), "Attachments");
+        assert_eq!(screen.tab_label(), "Attach");
+    }
+
+    #[test]
+    fn keybindings_documented() {
+        let screen = AttachmentExplorerScreen::new();
+        let bindings = screen.keybindings();
+        assert!(bindings.len() >= 5);
+        assert!(bindings.iter().any(|b| b.key == "/"));
+        assert!(bindings.iter().any(|b| b.key == "f"));
+        assert!(bindings.iter().any(|b| b.key == "Enter"));
+    }
+
+    #[test]
+    fn renders_without_panic() {
+        let state = test_state();
+        let screen = AttachmentExplorerScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 120, 30), &state);
+    }
+
+    #[test]
+    fn renders_at_minimum_size() {
+        let state = test_state();
+        let screen = AttachmentExplorerScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(40, 3, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 40, 3), &state);
+    }
+
+    #[test]
+    fn renders_tiny_without_panic() {
+        let state = test_state();
+        let screen = AttachmentExplorerScreen::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(10, 2, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 10, 2), &state);
+    }
+
+    #[test]
+    fn media_filter_cycles() {
+        assert_eq!(MediaFilter::All.next(), MediaFilter::Images);
+        assert_eq!(MediaFilter::Images.next(), MediaFilter::Documents);
+        assert_eq!(MediaFilter::Documents.next(), MediaFilter::Other);
+        assert_eq!(MediaFilter::Other.next(), MediaFilter::All);
+    }
+
+    #[test]
+    fn media_filter_matches() {
+        assert!(MediaFilter::All.matches("image/webp"));
+        assert!(MediaFilter::All.matches("application/pdf"));
+        assert!(MediaFilter::Images.matches("image/webp"));
+        assert!(MediaFilter::Images.matches("image/png"));
+        assert!(!MediaFilter::Images.matches("application/pdf"));
+        assert!(MediaFilter::Documents.matches("application/pdf"));
+        assert!(MediaFilter::Documents.matches("text/plain"));
+        assert!(!MediaFilter::Documents.matches("image/webp"));
+        assert!(MediaFilter::Other.matches("application/octet-stream"));
+        assert!(!MediaFilter::Other.matches("image/webp"));
+    }
+
+    #[test]
+    fn media_filter_labels() {
+        assert_eq!(MediaFilter::All.label(), "All");
+        assert_eq!(MediaFilter::Images.label(), "Images");
+        assert_eq!(MediaFilter::Documents.label(), "Docs");
+        assert_eq!(MediaFilter::Other.label(), "Other");
+    }
+
+    #[test]
+    fn attachment_metadata_helpers_accept_content_type_size_and_name() {
+        let value = serde_json::json!({
+            "name": "artifact.txt",
+            "content_type": "text/plain",
+            "size": "128"
+        });
+
+        assert_eq!(attachment_media_type(&value), "text/plain");
+        assert_eq!(attachment_bytes(&value), 128);
+        assert_eq!(attachment_path(&value).as_deref(), Some("artifact.txt"));
+    }
+
+    #[test]
+    fn size_display_formatting() {
+        let entry = AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 500,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.size_display(), "500 B");
+
+        let kb_entry = AttachmentEntry {
+            bytes: 2048,
+            ..entry.clone()
+        };
+        assert_eq!(kb_entry.size_display(), "2.0 KB");
+
+        let mb_entry = AttachmentEntry {
+            bytes: 2_097_152,
+            ..entry
+        };
+        assert_eq!(mb_entry.size_display(), "2.0 MB");
+    }
+
+    #[test]
+    fn type_label_extraction() {
+        let entry = AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 0,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.type_label(), "webp");
+
+        let pdf = AttachmentEntry {
+            media_type: "application/pdf".to_string(),
+            ..entry
+        };
+        assert_eq!(pdf.type_label(), "pdf");
+    }
+
+    #[test]
+    fn dims_display() {
+        let entry = AttachmentEntry {
+            media_type: String::new(),
+            bytes: 0,
+            sha1: String::new(),
+            width: 800,
+            height: 600,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.dims_display(), "800x600");
+
+        let no_dims = AttachmentEntry {
+            width: 0,
+            height: 0,
+            ..entry
+        };
+        assert_eq!(no_dims.dims_display(), "");
+    }
+
+    #[test]
+    fn f_cycles_media_filter() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        assert_eq!(screen.media_filter, MediaFilter::All);
+        let f = Event::Key(ftui::KeyEvent::new(KeyCode::Char('f')));
+        screen.update(&f, &state);
+        assert_eq!(screen.media_filter, MediaFilter::Images);
+        screen.update(&f, &state);
+        assert_eq!(screen.media_filter, MediaFilter::Documents);
+    }
+
+    #[test]
+    fn s_cycles_sort_column() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        let initial = screen.sort_col;
+        let s = Event::Key(ftui::KeyEvent::new(KeyCode::Char('s')));
+        screen.update(&s, &state);
+        assert_ne!(screen.sort_col, initial);
+    }
+
+    #[test]
+    fn slash_activates_text_filter() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        assert!(!screen.text_filter_active);
+        assert!(!screen.consumes_text_input());
+        let slash = Event::Key(ftui::KeyEvent::new(KeyCode::Char('/')));
+        screen.update(&slash, &state);
+        assert!(screen.text_filter_active);
+        assert!(screen.consumes_text_input());
+    }
+
+    #[test]
+    fn text_filter_input_and_escape() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        let slash = Event::Key(ftui::KeyEvent::new(KeyCode::Char('/')));
+        screen.update(&slash, &state);
+
+        let a = Event::Key(ftui::KeyEvent::new(KeyCode::Char('a')));
+        screen.update(&a, &state);
+        assert_eq!(screen.text_filter, "a");
+
+        let esc = Event::Key(ftui::KeyEvent::new(KeyCode::Escape));
+        screen.update(&esc, &state);
+        assert!(!screen.text_filter_active);
+    }
+
+    #[test]
+    fn rebuild_display_with_entries() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.entries.push(AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 1000,
+            sha1: "abc123".to_string(),
+            width: 100,
+            height: 100,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: "TestAgent".to_string(),
+            subject: "Test subject".to_string(),
+            thread_id: Some("thread-1".to_string()),
+            created_ts: 1_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.entries.push(AttachmentEntry {
+            media_type: "application/pdf".to_string(),
+            bytes: 5000,
+            sha1: "def456".to_string(),
+            width: 0,
+            height: 0,
+            mode: "file".to_string(),
+            path: Some("docs/test.pdf".to_string()),
+            message_id: 2,
+            sender_name: "OtherAgent".to_string(),
+            subject: "Another subject".to_string(),
+            thread_id: None,
+            created_ts: 2_000_000,
+            project_slug: "proj2".to_string(),
+        });
+
+        screen.rebuild_display();
+        assert_eq!(screen.display_indices.len(), 2);
+
+        // Filter to images only
+        screen.media_filter = MediaFilter::Images;
+        screen.rebuild_display();
+        assert_eq!(screen.display_indices.len(), 1);
+        assert_eq!(
+            screen.entries[screen.display_indices[0]].media_type,
+            "image/webp"
+        );
+    }
+
+    #[test]
+    fn text_filter_narrows_results() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.entries.push(AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 1000,
+            sha1: "abc".to_string(),
+            width: 0,
+            height: 0,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: "Alice".to_string(),
+            subject: "Hello".to_string(),
+            thread_id: None,
+            created_ts: 1_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.entries.push(AttachmentEntry {
+            media_type: "image/png".to_string(),
+            bytes: 2000,
+            sha1: "def".to_string(),
+            width: 0,
+            height: 0,
+            mode: "file".to_string(),
+            path: None,
+            message_id: 2,
+            sender_name: "Bob".to_string(),
+            subject: "World".to_string(),
+            thread_id: None,
+            created_ts: 2_000_000,
+            project_slug: "proj".to_string(),
+        });
+
+        screen.text_filter = "alice".to_string();
+        screen.rebuild_display();
+        assert_eq!(screen.display_indices.len(), 1);
+    }
+
+    #[test]
+    fn format_total_size_values() {
+        assert_eq!(AttachmentExplorerScreen::format_total_size(500), "500 B");
+        assert_eq!(AttachmentExplorerScreen::format_total_size(2048), "2.0 KB");
+        assert_eq!(
+            AttachmentExplorerScreen::format_total_size(2_097_152),
+            "2.0 MB"
+        );
+        assert_eq!(
+            AttachmentExplorerScreen::format_total_size(2_147_483_648),
+            "2.00 GB"
+        );
+    }
+
+    #[test]
+    fn deep_link_message_by_id() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.entries.push(AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 100,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 42,
+            sender_name: "Agent".to_string(),
+            subject: "Test".to_string(),
+            thread_id: None,
+            created_ts: 1_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.display_indices = vec![0];
+
+        let handled = screen.receive_deep_link(&DeepLinkTarget::MessageById(42));
+        assert!(handled);
+        assert_eq!(screen.table_state.selected, Some(0));
+
+        let not_handled = screen.receive_deep_link(&DeepLinkTarget::MessageById(99));
+        assert!(!not_handled);
+    }
+
+    #[test]
+    fn move_selection_clamps() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.display_indices = vec![0, 1, 2];
+        screen.table_state.selected = Some(0);
+
+        screen.move_selection(-1);
+        assert_eq!(screen.table_state.selected, Some(0));
+
+        screen.move_selection(10);
+        assert_eq!(screen.table_state.selected, Some(2));
+    }
+
+    #[test]
+    fn move_selection_empty() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.move_selection(1);
+        assert_eq!(screen.table_state.selected, None);
+    }
+
+    #[test]
+    fn move_selection_sets_first_row_when_unselected() {
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.display_indices = vec![0, 1, 2];
+        assert_eq!(screen.table_state.selected, None);
+
+        screen.move_selection(1);
+        assert_eq!(screen.table_state.selected, Some(0));
+    }
+
+    #[test]
+    fn load_attachments_clears_attempt_flag_when_no_connection() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.db_conn_attempted = true;
+
+        screen.load_attachments(&state);
+        assert!(!screen.db_conn_attempted);
+    }
+
+    #[test]
+    fn load_attachments_keeps_rows_with_missing_sender_or_project_join() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                sender_id INTEGER,
+                project_id INTEGER,
+                subject TEXT,
+                attachments TEXT,
+                thread_id TEXT,
+                created_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT
+            )",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT
+            )",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "INSERT INTO messages
+                (id, sender_id, project_id, subject, attachments, thread_id, created_ts)
+             VALUES
+                (
+                    7,
+                    101,
+                    202,
+                    'Missing joins',
+                    '[{\"type\":\"file\",\"path\":\"docs/test.txt\",\"sha1\":\"abc123\",\"bytes\":12}]',
+                    'thread-7',
+                    1000
+                )",
+            &[],
+        )
+        .expect("insert message");
+
+        screen.db_conn = Some(conn);
+        screen.load_attachments(&state);
+
+        assert_eq!(screen.entries.len(), 1);
+        assert_eq!(screen.entries[0].sender_name, "[unknown-agent-101]");
+        assert_eq!(screen.entries[0].project_slug, "[unknown-project-202]");
+        assert_eq!(screen.entries[0].path.as_deref(), Some("docs/test.txt"));
+    }
+
+    // ── B8: DB context binding guardrail regression tests ─────────────
+
+    fn broken_db_state() -> std::sync::Arc<TuiSharedState> {
+        TuiSharedState::new(&Config {
+            database_url: "sqlite:////nonexistent/path/b8_test.sqlite3".to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn b8_attachments_db_unavailable_on_load_failure() {
+        let state = broken_db_state();
+        let mut screen = AttachmentExplorerScreen::new();
+
+        screen.load_attachments(&state);
+
+        assert!(
+            screen.db_context_unavailable,
+            "load_attachments without connection should set db_context_unavailable"
+        );
+
+        // Verify diagnostic was emitted
+        let diags = state.screen_diagnostics_since(0);
+        let att_diag = diags
+            .iter()
+            .find(|(_, d)| d.screen == "attachments" && d.scope.contains("db_unavailable"));
+        let (_, diag) = att_diag.expect("should emit db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=false"),
+            "fresh unavailable diagnostic should report preserved_stale=false: {}",
+            diag.query_params
+        );
+        assert_eq!(diag.raw_count, 0);
+        assert_eq!(diag.rendered_count, 0);
+    }
+
+    #[test]
+    fn b8_attachments_db_unavailable_preserves_truthful_stale_counts() {
+        let state = broken_db_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.entries.push(AttachmentEntry {
+            media_type: "image/webp".to_string(),
+            bytes: 100,
+            sha1: "abc".to_string(),
+            width: 16,
+            height: 16,
+            mode: "inline".to_string(),
+            path: None,
+            message_id: 1,
+            sender_name: "Alice".to_string(),
+            subject: "Hello".to_string(),
+            thread_id: None,
+            created_ts: 1_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.entries.push(AttachmentEntry {
+            media_type: "application/pdf".to_string(),
+            bytes: 200,
+            sha1: "def".to_string(),
+            width: 0,
+            height: 0,
+            mode: "file".to_string(),
+            path: Some("docs/file.pdf".to_string()),
+            message_id: 2,
+            sender_name: "Bob".to_string(),
+            subject: "World".to_string(),
+            thread_id: None,
+            created_ts: 2_000_000,
+            project_slug: "proj".to_string(),
+        });
+        screen.display_indices = vec![1];
+
+        screen.load_attachments(&state);
+
+        let diags = state.screen_diagnostics_since(0);
+        let (_, diag) = diags
+            .iter()
+            .find(|(_, d)| d.screen == "attachments" && d.scope.contains("db_unavailable"))
+            .expect("should emit db_unavailable diagnostic");
+        assert!(
+            diag.query_params.contains("preserved_stale=true"),
+            "stale unavailable diagnostic should report preserved_stale=true: {}",
+            diag.query_params
+        );
+        assert_eq!(diag.raw_count, 2);
+        assert_eq!(diag.rendered_count, 1);
+        assert_eq!(diag.dropped_count, 1);
+    }
+
+    #[test]
+    fn b8_attachments_tick_retries_after_unavailable_without_data_change() {
+        let broken = broken_db_state();
+        let healthy = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+
+        screen.tick(1, &broken);
+        assert!(
+            screen.db_context_unavailable,
+            "initial failed tick should mark db_context_unavailable"
+        );
+
+        screen.tick(RELOAD_INTERVAL_TICKS + 2, &healthy);
+        assert!(
+            !screen.db_context_unavailable,
+            "interval retry should recover once healthy even without new data generation"
+        );
+    }
+
+    #[test]
+    fn b8_attachments_banner_renders_when_unavailable() {
+        let state = test_state();
+        let mut screen = AttachmentExplorerScreen::new();
+        screen.db_context_unavailable = true;
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 30, &mut pool);
+        screen.view(&mut frame, ftui::layout::Rect::new(0, 0, 120, 30), &state);
+
+        let mut text = String::new();
+        for y in 0..frame.buffer.height() {
+            for x in 0..frame.buffer.width() {
+                if let Some(cell) = frame.buffer.get(x, y) {
+                    if let Some(ch) = cell.content.as_char() {
+                        text.push(ch);
+                    } else if !cell.is_continuation() {
+                        text.push(' ');
+                    }
+                }
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains("Database context unavailable"),
+            "should render degraded banner: {text}"
+        );
+    }
+
+    // ── br-2e9jp.5.1: additional coverage (JadePine) ───────────────
+
+    #[test]
+    fn sanitize_diagnostic_value_collapses_whitespace() {
+        assert_eq!(sanitize_diagnostic_value("a\nb\rc;d,e"), "a b c d e");
+        assert_eq!(sanitize_diagnostic_value(""), "");
+        assert_eq!(sanitize_diagnostic_value("  ok  "), "ok");
+    }
+
+    #[test]
+    fn type_label_no_slash_returns_full() {
+        let entry = AttachmentEntry {
+            media_type: "octetstream".into(),
+            bytes: 0,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.type_label(), "octetstream");
+    }
+
+    #[test]
+    fn type_label_empty_string() {
+        let entry = AttachmentEntry {
+            media_type: String::new(),
+            bytes: 0,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.type_label(), "");
+    }
+
+    #[test]
+    fn dims_display_one_dimension_zero() {
+        let entry = AttachmentEntry {
+            media_type: "image/png".into(),
+            bytes: 1024,
+            sha1: String::new(),
+            width: 100,
+            height: 0,
+            mode: "file".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+        assert_eq!(entry.dims_display(), "");
+    }
+
+    #[test]
+    fn media_filter_documents_matches_various_doc_types() {
+        assert!(MediaFilter::Documents.matches("application/pdf"));
+        assert!(MediaFilter::Documents.matches("text/plain"));
+        assert!(MediaFilter::Documents.matches("text/html"));
+        assert!(
+            MediaFilter::Documents
+                .matches("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+        assert!(!MediaFilter::Documents.matches("image/png"));
+        assert!(!MediaFilter::Documents.matches("audio/mp3"));
+    }
+
+    #[test]
+    fn media_filter_other_excludes_images_and_docs() {
+        assert!(!MediaFilter::Other.matches("image/webp"));
+        assert!(!MediaFilter::Other.matches("application/pdf"));
+        assert!(!MediaFilter::Other.matches("text/csv"));
+        assert!(MediaFilter::Other.matches("audio/mp3"));
+        assert!(MediaFilter::Other.matches("video/mp4"));
+        assert!(MediaFilter::Other.matches("application/zip"));
+    }
+
+    #[test]
+    fn media_filter_full_cycle() {
+        let f = MediaFilter::All;
+        let f = f.next();
+        assert_eq!(f, MediaFilter::Images);
+        let f = f.next();
+        assert_eq!(f, MediaFilter::Documents);
+        let f = f.next();
+        assert_eq!(f, MediaFilter::Other);
+        let f = f.next();
+        assert_eq!(f, MediaFilter::All);
+    }
+
+    #[test]
+    fn size_display_exact_boundaries() {
+        let make = |bytes: u64| AttachmentEntry {
+            media_type: "x/y".into(),
+            bytes,
+            sha1: String::new(),
+            width: 0,
+            height: 0,
+            mode: "inline".into(),
+            path: None,
+            message_id: 0,
+            sender_name: String::new(),
+            subject: String::new(),
+            thread_id: None,
+            created_ts: 0,
+            project_slug: String::new(),
+        };
+
+        assert_eq!(make(0).size_display(), "0 B");
+        assert_eq!(make(1023).size_display(), "1023 B");
+        assert_eq!(make(1024).size_display(), "1.0 KB");
+        assert_eq!(make(1_048_575).size_display(), "1024.0 KB");
+        assert_eq!(make(1_048_576).size_display(), "1.0 MB");
+        assert_eq!(make(10_485_760).size_display(), "10.0 MB");
+    }
+}

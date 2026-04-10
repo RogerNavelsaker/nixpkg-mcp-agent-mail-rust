@@ -1,0 +1,39 @@
+[package]
+name = "sqlmodel-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Beautiful terminal output for SQLModel Rust - automatically adapts to agents vs humans"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sqlmodel-console"
+readme = "README.md"
+keywords = ["sql", "console", "terminal", "formatting", "sqlmodel"]
+categories = ["value-formatting"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Rich formatted output with colors, tables, panels
+rich = ["dep:rich_rust"]
+# SQL syntax highlighting
+syntax = ["rich", "rich_rust/syntax"]
+# All features enabled
+full = ["rich", "syntax"]
+
+[dependencies]
+# Serialization for JSON output
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Optional: rich terminal output library
+rich_rust = { workspace = true, optional = true }
+
+[dev-dependencies]
+sqlmodel-schema = { workspace = true }
+
+[[bench]]
+name = "console_bench"

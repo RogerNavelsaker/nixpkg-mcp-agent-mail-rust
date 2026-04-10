@@ -1,0 +1,239 @@
+# FrankenTUI Service Level Objectives
+#
+# Machine-readable SLO definition for data-plane and decision-plane budgets.
+# CI validates this schema and runs deterministic replay exercising safe-mode.
+#
+# Metric types:
+#   latency    - microseconds (p50/p95/p99/p999)
+#   memory     - bytes (RSS ceiling, allocation counts)
+#   error_rate - fraction 0.0-1.0
+#
+# Fields per metric:
+#   metric_type:       latency | memory | error_rate
+#   max_value:         absolute ceiling (breach if exceeded)
+#   max_ratio:         max ratio vs baseline (breach if exceeded)
+#   safe_mode_trigger: true = breach triggers safe-mode immediately
+
+# Global thresholds
+regression_threshold: 0.10
+noise_tolerance: 0.05
+safe_mode_breach_count: 3
+safe_mode_error_rate: 0.10
+
+metrics:
+
+  # ===========================================================================
+  # Data Plane: Frame Rendering Pipeline
+  # ===========================================================================
+
+  render_frame_p50_us:
+    metric_type: latency
+    max_value: 500.0
+    max_ratio: 1.15
+    safe_mode_trigger: false
+
+  render_frame_p95_us:
+    metric_type: latency
+    max_value: 2000.0
+    max_ratio: 1.20
+    safe_mode_trigger: false
+
+  render_frame_p99_us:
+    metric_type: latency
+    max_value: 4000.0
+    max_ratio: 1.25
+    safe_mode_trigger: true
+
+  render_frame_p999_us:
+    metric_type: latency
+    max_value: 8000.0
+    max_ratio: 1.50
+    safe_mode_trigger: true
+
+  # ===========================================================================
+  # Data Plane: Layout Computation
+  # ===========================================================================
+
+  layout_compute_p50_us:
+    metric_type: latency
+    max_value: 200.0
+    max_ratio: 1.15
+    safe_mode_trigger: false
+
+  layout_compute_p95_us:
+    metric_type: latency
+    max_value: 800.0
+    max_ratio: 1.20
+    safe_mode_trigger: false
+
+  layout_compute_p99_us:
+    metric_type: latency
+    max_value: 1500.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Data Plane: Diff Strategy
+  # ===========================================================================
+
+  diff_strategy_p50_us:
+    metric_type: latency
+    max_value: 100.0
+    max_ratio: 1.15
+    safe_mode_trigger: false
+
+  diff_strategy_p95_us:
+    metric_type: latency
+    max_value: 500.0
+    max_ratio: 1.25
+    safe_mode_trigger: false
+
+  diff_strategy_p99_us:
+    metric_type: latency
+    max_value: 1000.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Data Plane: ANSI Emit / Presenter
+  # ===========================================================================
+
+  ansi_present_p50_us:
+    metric_type: latency
+    max_value: 150.0
+    max_ratio: 1.15
+    safe_mode_trigger: false
+
+  ansi_present_p95_us:
+    metric_type: latency
+    max_value: 600.0
+    max_ratio: 1.25
+    safe_mode_trigger: false
+
+  ansi_present_p99_us:
+    metric_type: latency
+    max_value: 1200.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Data Plane: Memory
+  # ===========================================================================
+
+  heap_rss_bytes:
+    metric_type: memory
+    max_value: 104857600.0
+    max_ratio: 1.50
+    safe_mode_trigger: true
+
+  allocations_per_frame:
+    metric_type: memory
+    max_value: 500.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Data Plane: Error Budget
+  # ===========================================================================
+
+  false_positive_strategy_switch_rate:
+    metric_type: error_rate
+    max_value: 0.05
+    safe_mode_trigger: true
+
+  malformed_ansi_rate:
+    metric_type: error_rate
+    max_value: 0.01
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Decision Plane: Posterior Update (Bayesian decision core)
+  # ===========================================================================
+
+  posterior_update_p50_us:
+    metric_type: latency
+    max_value: 50.0
+    max_ratio: 1.20
+    safe_mode_trigger: false
+
+  posterior_update_p95_us:
+    metric_type: latency
+    max_value: 200.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  posterior_update_p99_us:
+    metric_type: latency
+    max_value: 500.0
+    max_ratio: 1.50
+    safe_mode_trigger: true
+
+  # ===========================================================================
+  # Decision Plane: VOI Computation
+  # ===========================================================================
+
+  voi_computation_p50_us:
+    metric_type: latency
+    max_value: 30.0
+    max_ratio: 1.20
+    safe_mode_trigger: false
+
+  voi_computation_p95_us:
+    metric_type: latency
+    max_value: 150.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  voi_computation_p99_us:
+    metric_type: latency
+    max_value: 400.0
+    max_ratio: 1.50
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Decision Plane: Conformal Prediction
+  # ===========================================================================
+
+  conformal_predict_p50_us:
+    metric_type: latency
+    max_value: 20.0
+    max_ratio: 1.20
+    safe_mode_trigger: false
+
+  conformal_predict_p95_us:
+    metric_type: latency
+    max_value: 100.0
+    max_ratio: 1.30
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Decision Plane: E-Process / BOCPD
+  # ===========================================================================
+
+  eprocess_update_p50_us:
+    metric_type: latency
+    max_value: 10.0
+    max_ratio: 1.25
+    safe_mode_trigger: false
+
+  bocpd_update_p50_us:
+    metric_type: latency
+    max_value: 25.0
+    max_ratio: 1.25
+    safe_mode_trigger: false
+
+  # ===========================================================================
+  # Decision Plane: Degradation Cascade
+  # ===========================================================================
+
+  cascade_decision_p50_us:
+    metric_type: latency
+    max_value: 15.0
+    max_ratio: 1.20
+    safe_mode_trigger: false
+
+  cascade_decision_p99_us:
+    metric_type: latency
+    max_value: 100.0
+    max_ratio: 1.50
+    safe_mode_trigger: false

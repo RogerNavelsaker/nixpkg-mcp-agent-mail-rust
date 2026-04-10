@@ -1,0 +1,110 @@
+[package]
+name = "mcp-agent-mail-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Database layer for MCP Agent Mail"
+
+[dependencies]
+mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
+tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+# frankensearch: two-tier hybrid search implementation (optional, for hybrid feature)
+frankensearch = { workspace = true, optional = true }
+frankensearch-core = { workspace = true, optional = true }
+frankensearch-embed = { workspace = true, optional = true }
+frankensearch-fusion = { workspace = true, optional = true }
+frankensearch-index = { workspace = true, optional = true }
+
+# Two-tier semantic search dependencies (optional, enabled by "hybrid" feature)
+half = { workspace = true, optional = true }
+wide = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
+
+# sqlmodel dependencies
+sqlmodel.workspace = true
+sqlmodel-core.workspace = true
+sqlmodel-query.workspace = true
+sqlmodel-schema.workspace = true
+sqlmodel-session.workspace = true
+sqlmodel-pool.workspace = true
+sqlmodel-frankensqlite.workspace = true
+sqlmodel-sqlite.workspace = true
+
+# LRU cache
+indexmap.workspace = true
+
+# Async runtime
+asupersync.workspace = true
+
+[features]
+default = ["hybrid", "s3fifo", "tantivy-engine"]
+# Portable build: everything except hybrid/fastembed (avoids ONNX Runtime AVX2 SIGILL
+# on machines without AVX2).  Used by CI release builds.
+portable = ["s3fifo", "tantivy-engine"]
+# Enable Tantivy-based lexical search (moved from search-core)
+tantivy-engine = []
+# Enable hybrid search (lexical + semantic + frankensearch)
+hybrid = [
+    "tantivy-engine",
+    "quality-fastembed",
+    "dep:frankensearch",
+    "dep:frankensearch-core",
+    "dep:frankensearch-embed",
+    "dep:frankensearch-fusion",
+    "dep:frankensearch-index",
+    "dep:half",
+    "dep:wide",
+    "dep:safetensors",
+    "dep:tokenizers",
+    "dep:rayon",
+    "dep:dirs",
+]
+# Enable legacy FastEmbed quality tier
+quality-fastembed = ["dep:fastembed"]
+# Enable loom model-checking tests (run with `cargo test --features loom-tests`)
+loom-tests = []
+# Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)
+s3fifo = []
+
+[dev-dependencies]
+criterion.workspace = true
+loom.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "coalesce_bench"
+harness = false
+
+[[bench]]
+name = "search_v3_bench"
+harness = false
+
+[[bench]]
+name = "two_tier_bench"
+harness = false
+required-features = ["hybrid"]
+
+[lints]
+workspace = true

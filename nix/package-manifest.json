@@ -1,0 +1,30 @@
+{
+  "source": {
+    "path": "upstream",
+    "channel": "github-head",
+    "defaultBranch": "main",
+    "version": "0.2.38",
+    "rev": "8643c633b2f9ace6e9882c178c701681d175de5c",
+    "siblings": {
+      "asupersync": "55501ebb67c63c210f5b4bcae123599f27f4f539",
+      "beads_rust": "f42b61cb369cf79aeff2db9c184588ad77462817",
+      "frankensearch": "ccc9063c6d61d5cf11a1b2c6c4f1bf6f40f78aae",
+      "frankensqlite": "55762bb52fcc4f5f47b8d4b3d520b7cf6fc10672",
+      "frankentui": "5c9be28e52c0f04aea5fe1a2ad80abed0b8b258c",
+      "sqlmodel_rust": "57d81595995e9cb7e56d4768f2abd62887fc5b0e"
+    }
+  },
+  "package": {
+    "repo": "mcp-agent-mail-rust",
+    "version": "0.2.38"
+  },
+  "binary": {
+    "name": "am",
+    "package": "mcp-agent-mail-cli"
+  },
+  "meta": {
+    "description": "MCP agent mail CLI",
+    "homepage": "https://github.com/Dicklesworthstone/mcp_agent_mail_rust",
+    "licenseSpdx": "LicenseRef-MIT-Rider"
+  }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "frankensearch-storage"
+version = "0.1.0"
+description = "FrankenSQLite-backed metadata and embedding job storage for frankensearch"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
+fsqlite = "0.1.2"
+fsqlite-types = "0.1.2"
+fsqlite-ext-fts5 = { version = "0.1.2", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tracing = { workspace = true }
+
+[features]
+fts5 = ["dep:fsqlite-ext-fts5"]
+
+[dev-dependencies]
+tempfile = "3.25"
+tracing-subscriber = "0.3"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
+[lints]
+workspace = true

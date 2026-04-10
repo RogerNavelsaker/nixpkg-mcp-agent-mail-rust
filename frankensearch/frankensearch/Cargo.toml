@@ -1,0 +1,59 @@
+[package]
+name = "frankensearch"
+version = "0.1.0"
+description = "Two-tier hybrid search for Rust: sub-millisecond initial results, quality-refined rankings in 150ms"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+default = ["hash"]
+hash = ["frankensearch-embed/hash"]
+model2vec = ["frankensearch-embed/model2vec"]
+fastembed = ["frankensearch-embed/fastembed"]
+lexical = ["dep:frankensearch-lexical"]
+graph = ["frankensearch-fusion/graph"]
+storage = ["dep:frankensearch-storage"]
+durability = ["dep:frankensearch-durability"]
+fts5 = ["storage", "frankensearch-storage/fts5"]
+rerank = ["dep:frankensearch-rerank", "frankensearch-fusion/rerank"]
+fastembed-reranker = ["rerank", "frankensearch-rerank/fastembed-reranker"]
+ann = ["frankensearch-index/ann"]
+download = ["frankensearch-embed/download"]
+api = ["frankensearch-embed/api"]
+semantic = ["hash", "model2vec", "fastembed"]
+hybrid = ["semantic", "lexical"]
+persistent = ["hybrid", "storage"]
+durable = ["persistent", "durability"]
+full = ["durable", "rerank", "ann", "download", "graph", "api"]
+full-fts5 = ["full", "fts5"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true }
+frankensearch-index = { workspace = true }
+frankensearch-lexical = { workspace = true, optional = true }
+frankensearch-fusion = { workspace = true }
+frankensearch-rerank = { workspace = true, optional = true }
+frankensearch-storage = { workspace = true, optional = true }
+frankensearch-durability = { workspace = true, optional = true }
+asupersync = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+tempfile = "3"
+frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true }
+frankensearch-index = { workspace = true }
+frankensearch-fusion = { workspace = true }
+serde_json = { workspace = true }
+criterion = { workspace = true }
+toml = { workspace = true }
+
+[[bench]]
+name = "search_bench"
+harness = false
+
+[lints]
+workspace = true

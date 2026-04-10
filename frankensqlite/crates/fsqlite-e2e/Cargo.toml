@@ -1,0 +1,109 @@
+[package]
+name = "fsqlite-e2e"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+autobins = false
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "End-to-end differential testing and benchmark harness for FrankenSQLite"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+tui = ["dep:ftui"]
+linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring", "fsqlite-core/linux-asupersync-uring", "fsqlite/linux-asupersync-uring"]
+
+[dependencies]
+asupersync = { workspace = true }
+fsqlite = { path = "../fsqlite", version = "0.1.2", default-features = false, features = ["json", "fts5", "rtree"] }
+fsqlite-btree = { workspace = true }
+fsqlite-core = { path = "../fsqlite-core", version = "0.1.2", default-features = false }
+fsqlite-error = { workspace = true }
+fsqlite-harness = { workspace = true }
+fsqlite-parser = { workspace = true }
+fsqlite-vdbe = { workspace = true }
+fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.3", default-features = false }
+fsqlite-types = { workspace = true }
+fsqlite-wal = { workspace = true }
+ftui = { workspace = true, features = ["crossterm"], optional = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+jsonschema = { version = "0.41.0", default-features = false }
+fsqlite-ext-session = { workspace = true }
+fsqlite-mvcc = { workspace = true }
+
+[[bin]]
+name = "realdb-e2e"
+path = "src/bin/realdb_e2e.rs"
+
+[[bin]]
+name = "profile-db"
+path = "src/bin/profile_db.rs"
+
+[[bin]]
+name = "e2e-dashboard"
+path = "src/bin/e2e_dashboard.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "e2e-runner"
+path = "src/bin/e2e_runner.rs"
+
+[[bin]]
+name = "e2e-viewer"
+path = "src/bin/e2e_viewer.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "corruption-demo"
+path = "src/bin/corruption_demo.rs"
+
+[[bench]]
+name = "e2e_bench"
+harness = false
+
+[[bench]]
+name = "write_throughput_bench"
+harness = false
+
+[[bench]]
+name = "read_heavy_bench"
+harness = false
+
+[[bench]]
+name = "large_txn_bench"
+harness = false
+
+[[bench]]
+name = "mixed_oltp_bench"
+harness = false
+
+[[bench]]
+name = "concurrent_write_bench"
+harness = false
+
+[[bench]]
+name = "operation_baseline_bench"
+harness = false
+
+[[bench]]
+name = "concurrent_write_persistent_bench"
+harness = false
+
+[[bin]]
+name = "comprehensive-bench"
+path = "src/bin/comprehensive_bench.rs"

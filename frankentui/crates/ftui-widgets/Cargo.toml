@@ -1,0 +1,56 @@
+[package]
+name = "ftui-widgets"
+version = "0.2.1"
+edition = "2024"
+license-file = "../../LICENSE"
+description = "Widget library built on FrankenTUI render and layout."
+repository = "https://github.com/Dicklesworthstone/frankentui"
+homepage = "https://github.com/Dicklesworthstone/frankentui"
+documentation = "https://docs.rs/ftui-widgets"
+readme = "../../README.md"
+keywords = ["tui", "terminal", "ui", "ftui", "frankentui"]
+categories = ["command-line-interface", "gui"]
+
+[features]
+default = []
+debug-overlay = []
+regex-search = ["dep:regex"]
+state-persistence = ["dep:serde"]
+tracing = ["dep:tracing", "ftui-render/tracing"]
+
+[dependencies]
+ahash = "0.8"
+bitflags = "2.11.0"
+ftui-a11y = { path = "../ftui-a11y", version = "0.1.0" }
+ftui-core = { path = "../ftui-core", version = "0.2.1" }
+ftui-layout = { path = "../ftui-layout", version = "0.2.1" }
+ftui-render = { path = "../ftui-render", version = "0.2.1" }
+ftui-style = { path = "../ftui-style", version = "0.2.1" }
+ftui-runtime = { path = "../ftui-runtime", version = "0.2.1" }
+ftui-text = { path = "../ftui-text", version = "0.2.1", features = ["markup"] }
+web-time = "1.1.0"
+regex = { version = "1.12.3", optional = true }
+serde = { version = "1.0.227", features = ["derive"], optional = true }
+tracing = { version = "0.1.41", optional = true }
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.7.0"
+serde = { version = "1.0.227", features = ["derive"] }
+serde_json = "1.0.145"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["registry"] }
+
+[[bench]]
+name = "widget_bench"
+harness = false
+
+[[bench]]
+name = "hashmap_bench"
+harness = false
+
+[[bench]]
+name = "succinct_bench"
+harness = false

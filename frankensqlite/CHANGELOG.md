@@ -1,0 +1,837 @@
+# Changelog
+
+All notable changes to FrankenSQLite are documented in this file.
+
+FrankenSQLite is an independent ground-up Rust reimplementation of SQLite with
+page-level MVCC concurrent writers, Serializable Snapshot Isolation (SSI), and
+RaptorQ-pervasive durability. The project is organized as a 26-member Cargo
+workspace under `crates/`.
+
+> **No releases or tags exist yet.** The project is pre-release (all crates at
+> 0.1.2). This changelog is organized by capability area rather than raw diff
+> order, covering all 2,520 commits from project inception (2026-02-06) through
+> 2026-03-21.
+
+Repository: <https://github.com/Dicklesworthstone/frankensqlite>
+
+---
+
+## [0.1.2] -- 2026-03-21
+
+Version bump across all 26 workspace crates for crates.io republish.
+
+[`93f1f55f`](https://github.com/Dicklesworthstone/frankensqlite/commit/93f1f55f34a377eb8615172d7985bb5140780b2e)
+
+## [0.1.1] -- 2026-02-21
+
+Initial version bump from 0.1.0 across all crates. Added crates.io metadata and
+version specifiers for publishing.
+
+[`8ae63da9`](https://github.com/Dicklesworthstone/frankensqlite/commit/8ae63da9e812cc0fb4dc70a24dd624f3ae126cd4),
+[`508d2cd8`](https://github.com/Dicklesworthstone/frankensqlite/commit/508d2cd8d39d3eaadea5a32229f1ea020c0b6cf0)
+
+## [0.1.0] -- 2026-02-06
+
+Project inception. Workspace infrastructure, foundation crates (`fsqlite-types`
+with 64 tests, `fsqlite-error` with 13 tests), and stub crates for all 23
+subsystems.
+
+[`a137671e`](https://github.com/Dicklesworthstone/frankensqlite/commit/a137671e2e7c4b25547d24e540d72f69a5c9efe1)
+through
+[`b559f58e`](https://github.com/Dicklesworthstone/frankensqlite/commit/b559f58e426d995f4ba101ecd80096977b9834f4)
+
+---
+
+## Development Log (pre-release, by capability)
+
+### Specification and Architecture Design
+
+A comprehensive specification was developed and evolved through 10+ deep audit
+rounds before any engine code was written (2026-02-06 through 2026-02-25).
+
+- **Formal MVCC specification** with proofs and implementation order.
+  [`8841a3ec`](https://github.com/Dicklesworthstone/frankensqlite/commit/8841a3ec70cac0eec5ea626186d435ffd4287795)
+- **Comprehensive specification documents** (8,628 + 1,206 lines).
+  [`c08f1602`](https://github.com/Dicklesworthstone/frankensqlite/commit/c08f1602d03b1833a4f91c8f77347f8f196bac9d)
+- **RFC 6330 (RaptorQ)** reference document.
+  [`c293739f`](https://github.com/Dicklesworthstone/frankensqlite/commit/c293739fccb9d88a948f1d151b8fcf877424760d)
+- **Spec V1.3**: scope doctrine, ECS substrate, multi-process MVCC, encryption.
+  [`9800b17d`](https://github.com/Dicklesworthstone/frankensqlite/commit/9800b17df4a56c2dc065cf566c2810d4ed2e576c)
+- **Spec V1.4**: Codex synthesis -- RaptorQ everywhere, WAL sidecar overhaul,
+  ECS layout, replication.
+  [`5ad34871`](https://github.com/Dicklesworthstone/frankensqlite/commit/5ad34871f7242de61378843c6c1e8311e35d9fa3)
+- **Spec V1.5**: alien-artifact discipline -- decision-theoretic SSI, BOCPD,
+  monitoring stack, native mode.
+  [`7b2c677c`](https://github.com/Dicklesworthstone/frankensqlite/commit/7b2c677cf61adda977e71524b59d7ec234137962)
+- **Spec V1.6a-h**: SSI detection algorithm with proof-carrying commit, arena
+  allocators, CAR cache, RaptorQ-native SSI witness plane, native mode commit
+  protocol.
+  [`bf042641`](https://github.com/Dicklesworthstone/frankensqlite/commit/bf0426417685504bb2b2f5acfc4de2c2f087ef8b)
+  through
+  [`0404e42c`](https://github.com/Dicklesworthstone/frankensqlite/commit/0404e42c9a46cc2e82e1e77e16af18e1a4c2fb80)
+- **Spec V1.7a-j**: 10 deep audit rounds covering MVCC formal model (Sec 5),
+  buffer pool ARC cache (Sec 6), checksums/integrity (Sec 7), BtreeCursorOps
+  (Sec 9), lexer/cost model (Sec 10), SQL coverage (Sec 12), strftime/aggregate
+  ORDER BY (Sec 13), FTS5 (Sec 14), Asupersync e-process math (Sec 4), and
+  RaptorQ MTU/sub-blocking (Sec 3).
+  [`d7b38efe`](https://github.com/Dicklesworthstone/frankensqlite/commit/d7b38efea49b120b3f7f24e80e6e35eae1f6b7e2)
+  through
+  [`a3e7ae52`](https://github.com/Dicklesworthstone/frankensqlite/commit/a3e7ae52dc8cbe12b2da444e0ac4e90bf7a66ba4)
+- **Spec evolution visualization** -- interactive viewer deployed to Cloudflare
+  Pages with dataset tooling, clustering, heat stripes, and story mode.
+  [`311b7db9`](https://github.com/Dicklesworthstone/frankensqlite/commit/311b7db917a6e97e99f09e78e5e6a45cff9a61f1)
+- **Beads issue tracker** initialized with 92 work items, grew to 458+ tracked
+  tasks across all phases.
+  [`be5dc72e`](https://github.com/Dicklesworthstone/frankensqlite/commit/be5dc72edf86b3f831eea68d729cb5aed0a43034)
+
+---
+
+### MVCC Concurrent Writers and SSI
+
+The core differentiating feature: page-level Multi-Version Concurrency Control
+with Serializable Snapshot Isolation replacing SQLite's single-writer lock.
+
+#### Transaction Lifecycle and Core MVCC
+
+- **MVCC core types, AST, and capability context** (Cx).
+  [`a2ce704a`](https://github.com/Dicklesworthstone/frankensqlite/commit/a2ce704a27b1afb47f4f1de348ee16e0b2fcabed)
+- **MVCC transaction lifecycle** with formal invariants.
+  [`362ea4bb`](https://github.com/Dicklesworthstone/frankensqlite/commit/362ea4bbb3eb455b8a2a0e25a38e1c30a2d2f31c),
+  [`c62cde5a`](https://github.com/Dicklesworthstone/frankensqlite/commit/c62cde5aa25a9e7b7dac08fd1f1f5e06c1c9e8f7)
+- **BEGIN CONCURRENT** wired through ConcurrentRegistry.
+  [`b8e34e01`](https://github.com/Dicklesworthstone/frankensqlite/commit/b8e34e01ce8e7a02b33c15cd9a94aa4b3a24e74f),
+  [`e803849a`](https://github.com/Dicklesworthstone/frankensqlite/commit/e803849a232f8452bd0daf27305bb2a1de356895)
+- **MVCC page-level locking** for concurrent transactions.
+  [`43bde5a1`](https://github.com/Dicklesworthstone/frankensqlite/commit/43bde5a1c8a5e8be2be94a5e1b1e3cdc04b7e58d)
+- **Page-level MVCC conflict detection** and SSI cycle validation.
+  [`5439982a`](https://github.com/Dicklesworthstone/frankensqlite/commit/5439982ae0e4cf65b56d44bf35bb9206472dbc1f)
+- **`PRAGMA concurrent_mode`** toggle and `BEGIN CONCURRENT`.
+  [`8883ce4b`](https://github.com/Dicklesworthstone/frankensqlite/commit/8883ce4b27a1ebf29e9eaa8e9f397b2ab5a37bc1)
+- **Version-chain length controls** with eager GC and backpressure.
+  [`ef3a472e`](https://github.com/Dicklesworthstone/frankensqlite/commit/ef3a472e683b6b4ef12483dec7271674e4a7b207)
+- **Per-handle `Arc<Mutex<ConcurrentHandle>>`** replacing registry-wide Mutex.
+  [`1f915617`](https://github.com/Dicklesworthstone/frankensqlite/commit/1f91561769303b2bb94b06e3e94bc0b08e3dfb08)
+
+#### SSI Validation and Conflict Detection
+
+- **Commit-time SSI validation** with proof-carrying artifacts.
+  [`d1b1f696`](https://github.com/Dicklesworthstone/frankensqlite/commit/d1b1f6966c62e2ecc58cb2d0f9b6af54e7eb8ec2)
+- **SSI witness objects** with hot/cold plane discovery.
+  [`235fc953`](https://github.com/Dicklesworthstone/frankensqlite/commit/235fc953ebcccbc08a7e1a20cfbe62ebc3e9e9b4)
+- **FCW conflict detection** with GF(256) rebase and SharedPageLockTable.
+  [`634ac590`](https://github.com/Dicklesworthstone/frankensqlite/commit/634ac590cdc1f26e6bc8a07a4df3da63e1a4c75e)
+- **SharedPageLockTable** with rolling rebuild protocol.
+  [`ab4c8ba8`](https://github.com/Dicklesworthstone/frankensqlite/commit/ab4c8ba8ce4eeb7ea23b3a60b4a458f3e7da6839)
+- **Distributionally Robust Optimization (DRO)** layer for SSI T3 abort
+  decisions with sliding-window radius estimation.
+  [`10b5e45c`](https://github.com/Dicklesworthstone/frankensqlite/commit/10b5e45cf45a1691d420784af7249617070f54b4),
+  [`d598a108`](https://github.com/Dicklesworthstone/frankensqlite/commit/d598a108e4e977197e2769388a3be3a941064303)
+- **SSI CommittedPivot detection**, ghost epoch tracking, cache invalidation.
+  [`d53bd9c6`](https://github.com/Dicklesworthstone/frankensqlite/commit/d53bd9c6e8c5f4f7dfecf3564b4665fe33601a75)
+- **CommitIndex migrated to left-right publication** for lock-free reads.
+  [`1efe6740`](https://github.com/Dicklesworthstone/frankensqlite/commit/1efe6740b0ed321d74ee58351a186a898e0c7316)
+- **Shared conflict observer** and always-on column defaults.
+  [`bacfdcc4`](https://github.com/Dicklesworthstone/frankensqlite/commit/bacfdcc4285819b6dc4313777e86ca444d3b16b1)
+
+#### Cell-Level MVCC Visibility (Track D, late March)
+
+Finer-grained visibility tracking at the cell level rather than the page level.
+
+- **Cell-level MVCC visibility system** -- delta WAL, structural/logical
+  boundary design.
+  [`0094bdab`](https://github.com/Dicklesworthstone/frankensqlite/commit/0094bdab036de0cebfc0d25ec50f8637f7c912c7)
+- **Cell-level visibility log** and structural page tracking (C4).
+  [`25c651e5`](https://github.com/Dicklesworthstone/frankensqlite/commit/25c651e5d57b6e5a38d4c2cd51f9e98ccf2d88c0)
+- **Cell-level delta commit module** in WAL.
+  [`386d641d`](https://github.com/Dicklesworthstone/frankensqlite/commit/386d641d184c2b439d178d554db80d1439d87ce1)
+- **Deferred EBR slot recycling** plumbing.
+  [`d2cb6619`](https://github.com/Dicklesworthstone/frankensqlite/commit/d2cb6619aca52e3b32a0e0e4dd97e7e7baebe03f)
+
+#### Epoch-Based Reclamation (EBR) and GC
+
+- **Epoch-based reclamation module** for safe concurrent version store cleanup.
+  [`f050a132`](https://github.com/Dicklesworthstone/frankensqlite/commit/f050a132310387e31014233c109801ee4ddaae90)
+- **MVCC GC wiring** complete.
+  [`0b755289`](https://github.com/Dicklesworthstone/frankensqlite/commit/0b7552899f62515ddb8a6f9d2ea93c6e2e9cfe51)
+- **Lock-free CAS-based chain head table**.
+  [`f5525fbc`](https://github.com/Dicklesworthstone/frankensqlite/commit/f5525fbc3cd3e9a065db98e119a40f19e1f2e56a)
+- **GC-horizon index**, MVCC write profiling, version chain retention fix.
+  [`cc725ccc`](https://github.com/Dicklesworthstone/frankensqlite/commit/cc725cccd3e33e2e469c1bbaa9f3e43f462b7f36)
+- **Active snapshot refcounts** for correct GC horizon caching.
+  [`29abdee5`](https://github.com/Dicklesworthstone/frankensqlite/commit/29abdee5dd17ba118ed7b5e5b1f7e18b3f5f7d25)
+- **History compression** and merge certificates.
+  [`40865985`](https://github.com/Dicklesworthstone/frankensqlite/commit/40865985f43f0e1eee39e1cf22f2a36e9bfae99e)
+
+#### Transaction Lifecycle Observability
+
+- **`PRAGMA fsqlite_txn_stats`**, `PRAGMA fsqlite_transactions`, `PRAGMA
+  fsqlite_txn_advisor`, `PRAGMA fsqlite_txn_timeline_json` -- full transaction
+  lifecycle introspection.
+  [`855eaabf`](https://github.com/Dicklesworthstone/frankensqlite/commit/855eaabfef09b5f2e2a3e0bcff06e1e73b1f4afe)
+- **Adaptive checkpoint scheduling** with advisor PRAGMAs.
+  [`191ecaeb`](https://github.com/Dicklesworthstone/frankensqlite/commit/191ecaeba903077a95e0c27f4f33ba8d21c18690)
+
+---
+
+### Parallel WAL and Group Commit
+
+The single biggest architectural push (Track D, 2026-03-17 through 2026-03-21).
+Introduced infrastructure for multiple concurrent WAL writers and a group commit
+protocol that pipelines epoch flushes.
+
+- **Lock-free per-thread WAL buffers (D1)** -- each writer thread gets a
+  dedicated WAL buffer, eliminating contention on the shared WAL append path.
+  [`bf1466ce`](https://github.com/Dicklesworthstone/frankensqlite/commit/bf1466ceee2d201bbba63dba7464f7f7bcdbc7de)
+- **Background epoch ticker (D1.5)** -- dedicated thread advances the global
+  epoch.
+  [`0cdc48ce`](https://github.com/Dicklesworthstone/frankensqlite/commit/0cdc48ceb1387c41b2a4d673ae7d36b4c89f8d3d)
+- **Segment file I/O and recovery (D1.6, D1.7)** -- parallel WAL backed by
+  segment files with a recovery path.
+  [`fa2745f4`](https://github.com/Dicklesworthstone/frankensqlite/commit/fa2745f4f3266129d46ceedc656d66eeb6cee6e3),
+  [`712dc88a`](https://github.com/Dicklesworthstone/frankensqlite/commit/712dc88a57be3031fb56bc3d7b799ab81a1a07ac)
+- **D2 ShardedPageCache** -- 128-partition page cache for thread scalability.
+  [`ca3caf26`](https://github.com/Dicklesworthstone/frankensqlite/commit/ca3caf26608754fe1af7b3f3dd543ef0bbf59ea5)
+- **D3 CommitSequenceCombiner** -- batched commit sequence allocation via
+  flat-combining.
+  [`97e98c83`](https://github.com/Dicklesworthstone/frankensqlite/commit/97e98c83585382ec1790413678fb699c5c830072)
+- **Split-lock commit protocol (D1-CRITICAL)** -- separates the commit surface
+  from the conflict surface so WAL growth does not block conflict detection.
+  [`1e4d6379`](https://github.com/Dicklesworthstone/frankensqlite/commit/1e4d637942d31d58dc9d0898aa5829494e36267e)
+- **Epoch pipelining** -- eliminates `flushing_wait` bottleneck in group commit.
+  [`a17ba22a`](https://github.com/Dicklesworthstone/frankensqlite/commit/a17ba22ae7a618c6ea0ddf035354d8561d524fb4)
+- **Page 1 conflict elimination** -- header page no longer a mandatory conflict
+  surface.
+  [`b97a3b77`](https://github.com/Dicklesworthstone/frankensqlite/commit/b97a3b777797b36cc0cbb1e32f52abdbd2c8a504)
+- **RwLock WAL backend** -- Mutex to RwLock migration for concurrent page reads.
+  [`cfd60a53`](https://github.com/Dicklesworthstone/frankensqlite/commit/cfd60a538af0657ade86edbff01102bd00ffdee5)
+- **Major connection expansion**, pager improvements, group commit scaling.
+  [`42208411`](https://github.com/Dicklesworthstone/frankensqlite/commit/42208411e94e7696e9557ffd3dd6b762d4cac156)
+- **Commit path phase timing** (A/B/C1/C2) benchmarking.
+  [`0778a8f6`](https://github.com/Dicklesworthstone/frankensqlite/commit/0778a8f6fd8b4104c2a4a825e46547e35ca91262)
+
+---
+
+### Write-Ahead Log (WAL)
+
+#### WAL Core Implementation
+
+- **WAL header parsing, frame I/O, and index header types**.
+  [`2871974a`](https://github.com/Dicklesworthstone/frankensqlite/commit/2871974a5c2c994ffb4f28fb2e3cfe2e57e5be37)
+- **WAL checksum, index, and test infrastructure**.
+  [`c88da7c2`](https://github.com/Dicklesworthstone/frankensqlite/commit/c88da7c2b55e23beb4f95e0e117b20b3b11e9e3e)
+- **Checkpoint executor and implementation modules**.
+  [`3915f847`](https://github.com/Dicklesworthstone/frankensqlite/commit/3915f847c3a2d8cb42fc29c2b21aa5b4ceb2e299)
+- **WAL checkpoint integration** into pager.
+  [`553c3b9f`](https://github.com/Dicklesworthstone/frankensqlite/commit/553c3b9fc96f19e4e21fbb3e8e6e7f1e6d19e3ef)
+- **Pin WAL read snapshot at transaction begin** to prevent visibility drift.
+  [`42011dd8`](https://github.com/Dicklesworthstone/frankensqlite/commit/42011dd89e1a0ff6e099c6cd1ade65be9e02bb74)
+- **Two-pass checkpoint deduplication** for sequential page writes.
+  [`b3953199`](https://github.com/Dicklesworthstone/frankensqlite/commit/b39531996ac2e2b48f2266ae1e10e18e5eef24a2)
+
+#### WAL Recovery and Hardening
+
+- **WAL-recovery for stale main-file headers** and read-only WAL backend install.
+  [`6da92596`](https://github.com/Dicklesworthstone/frankensqlite/commit/6da9259684813dfe2ed0e5ff62c0edcd971b9ffa)
+- **Centralized WAL backend installation** with page-size validation.
+  [`ea2ff736`](https://github.com/Dicklesworthstone/frankensqlite/commit/ea2ff736c5186aa3132c475dc79fb6bf9a42ea40)
+- **Crash-loop replay determinism test** for WAL recovery.
+  [`3675601a`](https://github.com/Dicklesworthstone/frankensqlite/commit/3675601a82d48a6979dd99c0dd54e9e49023d96c)
+- **Absorb frames only up to last commit boundary** and detect ABA resets.
+  [`06155f84`](https://github.com/Dicklesworthstone/frankensqlite/commit/06155f84e97b55b5bf2e7330e4cf68f4816e2c5d)
+- **WAL page index ABA hazard prevention** via generation identity tracking.
+  [`2df16c8e`](https://github.com/Dicklesworthstone/frankensqlite/commit/2df16c8e3eebe276fb4da05393681f0dcfa80a0b)
+- **WAL checksum accumulator order** correction.
+  [`c7ccc0be`](https://github.com/Dicklesworthstone/frankensqlite/commit/c7ccc0be2ed8d3643c5c359f67f962b1bcbae6df)
+- **Split prepared-frame append** into pre-lock finalize and durable write
+  phases.
+  [`ea3e9e00`](https://github.com/Dicklesworthstone/frankensqlite/commit/ea3e9e0005c4ed8325f262b4632f5d8057518a73)
+
+#### WAL-FEC (Forward Error Correction)
+
+- **Fountain-coded WAL recovery** with decode proofs (RaptorQ).
+  [`2ee3f10f`](https://github.com/Dicklesworthstone/frankensqlite/commit/2ee3f10f3c4f8148a0feab63e9f57c375acb08e4)
+- **WAL-FEC sidecar format**.
+  [`58db07c7`](https://github.com/Dicklesworthstone/frankensqlite/commit/58db07c7c00bd9a2f3b3e3bb5f15b9e2a2dbc75e)
+- **Pipelined WAL-FEC repair generation**.
+  [`d57e1693`](https://github.com/Dicklesworthstone/frankensqlite/commit/d57e16931fc2af5e4ebe2c2fd34bc88f5fc8f64b)
+- **WAL-FEC RaptorQ repair symbols**.
+  [`2ac8b760`](https://github.com/Dicklesworthstone/frankensqlite/commit/2ac8b760d7d8b94bcf0ddf9e37c03a2a75e7f505)
+
+---
+
+### Pager and Page Cache
+
+- **ARC-based page cache** with adaptive scan resistance.
+  [`8e0e7031`](https://github.com/Dicklesworthstone/frankensqlite/commit/8e0e7031f1cf3dc86c2c2b3e72b2cf9c6b2c0db8)
+- **S3-FIFO page cache** with LRU/ARC benchmark harness.
+  [`e7389ffb`](https://github.com/Dicklesworthstone/frankensqlite/commit/e7389ffb1e2e4c3c2fddecfcb01c3c3c3dfc4f73)
+- **Rollback journal format** with lock-byte page support.
+  [`0cba28bb`](https://github.com/Dicklesworthstone/frankensqlite/commit/0cba28bbb82b0ff4f96be73ffa5984fbe3f52e6b)
+- **Freelist serialization** into write set instead of direct I/O.
+  [`70818421`](https://github.com/Dicklesworthstone/frankensqlite/commit/70818421fd3c06b32a8fbfb7f61ff0fa8d69fb2f)
+- **Persist freelist to SQLite freelist pages**.
+  [`a7c95f42`](https://github.com/Dicklesworthstone/frankensqlite/commit/a7c95f4203051ec2d9be253ffdd3c24c24501f89)
+- **Page1 header patching** on commit to prevent malformed DB.
+  [`1ab7cee6`](https://github.com/Dicklesworthstone/frankensqlite/commit/1ab7cee6670ba87a69a3eaf1fc8ca307f15b7a03)
+- **MVCC snapshot db_size boundary guard** to prevent corruption.
+  [`4202ea30`](https://github.com/Dicklesworthstone/frankensqlite/commit/4202ea3093c1c04f38b8d0b35f91cabe3e8d0bab)
+- **Batch-allocate EOF pages** to reduce mutex contention.
+  [`878e8215`](https://github.com/Dicklesworthstone/frankensqlite/commit/878e8215f63de2758af6f9d760dadf7edc877539)
+- **Per-transaction page read cache** to eliminate `inner.lock` contention.
+  [`cc8a47aa`](https://github.com/Dicklesworthstone/frankensqlite/commit/cc8a47aadbf9ee5261854065fcb8ca2e6251121e)
+- **Cache-line-striped atomics** for publication counters.
+  [`e7612b1b`](https://github.com/Dicklesworthstone/frankensqlite/commit/e7612b1b6e5b4f72d48c5fead4eff42ccf7eb58d)
+- **Separate conflict surface from commit surface** for concurrent WAL growth.
+  [`f74c5d55`](https://github.com/Dicklesworthstone/frankensqlite/commit/f74c5d55a3ee7c1bff67f2d1a20b1f7c31b6e5cc)
+
+---
+
+### B-Tree Engine
+
+- **B-tree scaffold** -- cursor, cell, balance, overflow, freelist, and payload.
+  [`239e16a6`](https://github.com/Dicklesworthstone/frankensqlite/commit/239e16a6a4b6fa5a78cbfc1a24f7f73a25d33637)
+- **N-ary split** for root node overflow.
+  [`33551179`](https://github.com/Dicklesworthstone/frankensqlite/commit/33551179dbc1b3cf2bb8a476aa34e962523a2fc4)
+- **Balance-shallower root collapse**.
+  [`b29a4ae0`](https://github.com/Dicklesworthstone/frankensqlite/commit/b29a4ae0a68aee5e10bd27b85b209faaeddd5c78)
+- **UNIQUE index enforcement** and record comparison semantics.
+  [`fff4cbb5`](https://github.com/Dicklesworthstone/frankensqlite/commit/fff4cbb52fb948ef624f82fc23f372f19699d909)
+- **Interior-node deletion** with rebalance.
+  [`455043bd`](https://github.com/Dicklesworthstone/frankensqlite/commit/455043bdd0d5dc3045fdd44a69d463d77f7cc6cf)
+- **SwissIndex SIMD hash map** integrated into VdbeEngine and MemDatabase.
+  [`61ced98e`](https://github.com/Dicklesworthstone/frankensqlite/commit/61ced98ed66bd73c2f98b8e5d66f7d69e6ae3b58)
+- **60/40 biased leaf split**, cursor `last_insert_rowid`, overflow fixes.
+  [`2ff3a888`](https://github.com/Dicklesworthstone/frankensqlite/commit/2ff3a888f1c2c6c7e1e5f00ac3ae3ccbcfc5e098)
+- **Safe prefetch hints** in cursor descent.
+  [`2a2434cf`](https://github.com/Dicklesworthstone/frankensqlite/commit/2a2434cf3a17cf4d0d01413ad1f47ee0bb60f76a)
+- **O(n) slope-constraint PLA** replacing O(n*k) brute-force segment training
+  in learned index.
+  [`22fb1dae`](https://github.com/Dicklesworthstone/frankensqlite/commit/22fb1daedc5140ba79d75233ed2ebbfb9e531322)
+- **Handle oversized interior cell replacement** via structural rebalance.
+  [`f417dcad`](https://github.com/Dicklesworthstone/frankensqlite/commit/f417dcad546aff15269ec19ce0c271d0a118057e)
+- **Replace MockBtreeCursor with real BtCursor** for storage cursors.
+  [`d71450f1`](https://github.com/Dicklesworthstone/frankensqlite/commit/d71450f1d6bc6b6f8a2be37a86a765f02b4c2dfb)
+
+---
+
+### Virtual File System (VFS)
+
+- **Unix VFS** with full file locking, SHM, and memory VFS.
+  [`37ff9bdf`](https://github.com/Dicklesworthstone/frankensqlite/commit/37ff9bdf6ce4d6a5a7ae0e55f42f0b22e2c53de0)
+- **Windows VFS** backend and cross-platform libc type compatibility.
+  [`38e81bac`](https://github.com/Dicklesworthstone/frankensqlite/commit/38e81bac4f2b2b37ed2b8277f7e65f2a9b6f2f2e),
+  [`dd92a350`](https://github.com/Dicklesworthstone/frankensqlite/commit/dd92a350a55d9dbd5dfe1ee3ff3be8d7e22cf1c7)
+- **Mmap-based SHM layer** for multi-process WAL correctness.
+  [`98cc42c3`](https://github.com/Dicklesworthstone/frankensqlite/commit/98cc42c36bd5c2d4f8ca3e7be97be81ff3ddecbb)
+- **Cross-process file locking** for WAL write safety.
+  [`20b1d153`](https://github.com/Dicklesworthstone/frankensqlite/commit/20b1d153830218d1c193f9c23e4e27e3e66a3efb)
+- **io_uring backend** with asupersync integration, runtime disable-on-failure,
+  and SHM lock fixes.
+  [`a26db876`](https://github.com/Dicklesworthstone/frankensqlite/commit/a26db87636af01792f7a948c9808d6a3d073bdc9)
+- **io_uring wired as default Linux pager backend**.
+  [`00f4a6ac`](https://github.com/Dicklesworthstone/frankensqlite/commit/00f4a6ac64cfb3cfdc597528435223ca02c2d238)
+- **TracingFile wrapper** and VfsMetrics for observability.
+  [`b8658d7f`](https://github.com/Dicklesworthstone/frankensqlite/commit/b8658d7f4e2e4b9e1eadabe98ddabe4f0a0d2619)
+
+---
+
+### SQL Parser
+
+- **Complete SQL lexer and parser** -- hand-written recursive descent with Pratt
+  expression parsing.
+  [`c70c530b`](https://github.com/Dicklesworthstone/frankensqlite/commit/c70c530bf717ca052908be1770c770592944fb46)
+- **Semantic analysis** with parse metrics and SQLite-compat lexer fixes.
+  [`bd302d93`](https://github.com/Dicklesworthstone/frankensqlite/commit/bd302d93e47f8c00b3a52d1f2cfd26ab25a63a2a)
+- **IS [NOT] DISTINCT FROM**, NOT NULL postfix, NULL constraint, block comments.
+  [`bbee1add`](https://github.com/Dicklesworthstone/frankensqlite/commit/bbee1addded154cfb1f0cde8a1e2c44f97898b3f)
+- **SQL:2011 temporal query parsing** (`FOR SYSTEM_TIME AS OF`).
+  [`29f6dbea`](https://github.com/Dicklesworthstone/frankensqlite/commit/29f6dbeabd2f52fe1d734972c678b59d1c3281f1)
+- **Parser recursion guard** RAII helper.
+  [`04bb7818`](https://github.com/Dicklesworthstone/frankensqlite/commit/04bb7818ac7bebb2c8a339e1e7f0a13b8f1f7ca5)
+- **Proptest property suites** for parser round-trip.
+  [`044c683e`](https://github.com/Dicklesworthstone/frankensqlite/commit/044c683e17adf3e94c5aba03cac32e3d44b02cff)
+
+---
+
+### Query Planner
+
+- **Cost-based query planner** with join reordering and selectivity estimation.
+  [`7a5f6f47`](https://github.com/Dicklesworthstone/frankensqlite/commit/7a5f6f4799651ce53bddd42b32ddefaf123bd0bf)
+- **Beam search join ordering** (NGQP-inspired).
+  [`ef9ba57e`](https://github.com/Dicklesworthstone/frankensqlite/commit/ef9ba57e6f0f88d4e92e5b7fdff4d5cc6a4c8a36)
+- **Partial index and expression index** support.
+  [`b6715fea`](https://github.com/Dicklesworthstone/frankensqlite/commit/b6715fea741ba96da23a2cfe5f5e76edec6bdb40),
+  [`4a857675`](https://github.com/Dicklesworthstone/frankensqlite/commit/4a857675a962e35443d9e5918a868cd1d0a13dd1)
+- **Skip scan index access path**.
+  [`d15f40ec`](https://github.com/Dicklesworthstone/frankensqlite/commit/d15f40ec5b83e8f70fba6eea3b56b7ffa58a5a6d)
+- **WHERE predicate pushdown** to primary table scan in multi-table joins.
+  [`7e70d9c7`](https://github.com/Dicklesworthstone/frankensqlite/commit/7e70d9c7e87b5fcfbcfb29d5d05e05c3b8f99d18)
+- **INTEGER PRIMARY KEY point lookups** upgraded to SeekRowid.
+  [`f61099a6`](https://github.com/Dicklesworthstone/frankensqlite/commit/f61099a64e7949a4aa86ed44f84e60b50ed2a0d3)
+- **LIKE prefix range optimization** with upper bound computation.
+  [`a7fe176c`](https://github.com/Dicklesworthstone/frankensqlite/commit/a7fe176cdf1cc2b0d6d1de3a38e75b26fb70a8a6)
+- **ANALYZE/REINDEX** with `sqlite_stat1` support.
+  [`825cb634`](https://github.com/Dicklesworthstone/frankensqlite/commit/825cb6349980c1e3fdb2f5200883fb5ad6e8f005)
+
+---
+
+### VDBE (Virtual Database Engine)
+
+#### Bytecode Engine
+
+- **VDBE program builder**, label system, and coroutines.
+  [`9df8fa4c`](https://github.com/Dicklesworthstone/frankensqlite/commit/9df8fa4cf85deb4ce05dd2f3fda1c8a3aee1b3e0)
+- **190+ opcodes** implemented across multiple landing commits.
+  [`6c4d9664`](https://github.com/Dicklesworthstone/frankensqlite/commit/6c4d966471b57389f2b79da38ba2b8cc2a0fa740)
+- **Cursor-level decode cache** with hit/miss instrumentation.
+  [`88c650d0`](https://github.com/Dicklesworthstone/frankensqlite/commit/88c650d06702edfe44adf9c69a9562f4fccd3fa6)
+- **Cached VDBE engine reuse**, budgeted SSI evidence, B-tree overflow
+  refinements.
+  [`81aeb3cf`](https://github.com/Dicklesworthstone/frankensqlite/commit/81aeb3cf51eeb27f3e7a8df0f87e7b1c4b093cfa)
+- **ReadCookie/SetCookie opcodes** and NewRowid write-through.
+  [`6996c1b8`](https://github.com/Dicklesworthstone/frankensqlite/commit/6996c1b8c4e79aa3edeacbfb57d29f36b40eff11)
+
+#### Vectorized Execution
+
+- **Vectorized hash-join operator** with inner/left/semi/anti variants.
+  [`408b419f`](https://github.com/Dicklesworthstone/frankensqlite/commit/408b419f7c1a8de05aa3c8f4aecb8a3fc10e7d0e)
+- **Vectorized aggregation operator** with hash and ordered paths.
+  [`168b9dc7`](https://github.com/Dicklesworthstone/frankensqlite/commit/168b9dc79060b0f90d2c58d8ce2cf2bfca5ad04e)
+- **Vectorized filter** with selection composition and SIMD tracking.
+  [`60e1ce6a`](https://github.com/Dicklesworthstone/frankensqlite/commit/60e1ce6a8cd1d1d4b2d6bb4c08d4bf06b2ab0e56)
+- **External merge sort** with spill-to-disk.
+  [`a477373f`](https://github.com/Dicklesworthstone/frankensqlite/commit/a477373f6e3c3d6f5fcb1df6ea6c2af3e88c7e00)
+- **Morsel-driven parallel execution** with exchange operators.
+  [`d4d4615e`](https://github.com/Dicklesworthstone/frankensqlite/commit/d4d4615e8c16c0a3c7b6c2a5d5ab9c9e2dc9e0f8)
+- **L2-aware morsel auto-tuning** and dispatch observability.
+  [`46248fb5`](https://github.com/Dicklesworthstone/frankensqlite/commit/46248fb56e1a5cc3d6e1b1f77c1b44e1c5d7a3f0)
+- **VDBE JOIN codegen** for simple INNER JOIN queries.
+  [`2d0ea19c`](https://github.com/Dicklesworthstone/frankensqlite/commit/2d0ea19ca0f1c1c8b8d1c6f14e4eba89a7e7d54c)
+
+---
+
+### SQL Feature Coverage
+
+#### DML (INSERT/UPDATE/DELETE)
+
+- **INSERT codegen** with INTEGER PRIMARY KEY rowid routing.
+  [`6d20abaf`](https://github.com/Dicklesworthstone/frankensqlite/commit/6d20abaf3f5bff88f965d0c12a7e74de9ed15b84)
+- **INSERT...SELECT** in VDBE and planner codegen.
+  [`b8d13882`](https://github.com/Dicklesworthstone/frankensqlite/commit/b8d138824a1bc1e5df7a52ef39d4e50c0fb6f6de)
+- **INSERT OR REPLACE / INSERT OR IGNORE** conflict handling.
+  [`778cf161`](https://github.com/Dicklesworthstone/frankensqlite/commit/778cf1618e3c2ad50f6f1c3dc3816bb0c1a2b97d)
+- **UPSERT/ON CONFLICT** with DO UPDATE and DO NOTHING.
+  [`e753b7bb`](https://github.com/Dicklesworthstone/frankensqlite/commit/e753b7bb0445c690be8c7d85ee698bac8bd0f922)
+- **INSERT/UPDATE/DELETE RETURNING** clause support.
+  [`b16c2ab6`](https://github.com/Dicklesworthstone/frankensqlite/commit/b16c2ab6b02e40a2e82d1b0a61cc3de2ee3c4c3b),
+  [`9c70f50d`](https://github.com/Dicklesworthstone/frankensqlite/commit/9c70f50d5d4cdcab0e9cf7b7a8cd3eb5ce68f0b0)
+- **Native `Connection::execute_batch`** with no-op detection.
+  [`1021ead3`](https://github.com/Dicklesworthstone/frankensqlite/commit/1021ead32742266822b529c688d8009e0724de2e)
+- **Two-pass DELETE** to prevent self-referencing subquery corruption.
+  [`42a6f5da`](https://github.com/Dicklesworthstone/frankensqlite/commit/42a6f5daed2bf1e7e4b0b1ab67ebf64b8e1b6e93)
+
+#### DDL
+
+- **CREATE TABLE AS SELECT**.
+  [`f3fa1ad7`](https://github.com/Dicklesworthstone/frankensqlite/commit/f3fa1ad7f8ddc4ff4bd0f8e2db0bdf2ed2f5f3e7)
+- **CREATE INDEX** with backfill of existing rows.
+  [`b1d368c5`](https://github.com/Dicklesworthstone/frankensqlite/commit/b1d368c56b84e23f93aced5a00c1bd6f97fd37a5)
+- **CREATE VIEW, DROP INDEX/VIEW**.
+  [`e1a788b4`](https://github.com/Dicklesworthstone/frankensqlite/commit/e1a788b43a08e0e8ef5e0c91bb49384e27df6e37)
+- **WITHOUT ROWID table creation** with DML rejection guards.
+  [`cdfa9052`](https://github.com/Dicklesworthstone/frankensqlite/commit/cdfa9052a2efb6b6b7a9e9eef7d8e8c79a8e3f5f)
+- **ALTER TABLE ADD/DROP COLUMN** with schema fidelity.
+  [`3b9848a6`](https://github.com/Dicklesworthstone/frankensqlite/commit/3b9848a649420d91859d15c66b9ac45f44d74c02)
+- **VACUUM INTO**.
+  [`f96986a4`](https://github.com/Dicklesworthstone/frankensqlite/commit/f96986a4dc87dc696d05e4eb5943278e355eb9c0)
+- **STRICT type enforcement**.
+  [`f8e4006d`](https://github.com/Dicklesworthstone/frankensqlite/commit/f8e4006d4368cfa25a7b7989013c5399220e47b7)
+
+#### Queries (SELECT)
+
+- **JOINs** (INNER, LEFT, CROSS, RIGHT, FULL OUTER, NATURAL, USING).
+  [`cda92efd`](https://github.com/Dicklesworthstone/frankensqlite/commit/cda92efdef9d9e7ad39e7e2e7e9adb6bb5d6db38),
+  [`5544f57f`](https://github.com/Dicklesworthstone/frankensqlite/commit/5544f57fbbae9c2b6d5e83dcf7c5bfe1e29daae5),
+  [`e6546940`](https://github.com/Dicklesworthstone/frankensqlite/commit/e6546940a8e57f1e0cc7ddd9e6a75c3ca8cc1e76)
+- **GROUP BY** with JOIN, expressions, aliases, numeric index.
+  [`ba48fbd3`](https://github.com/Dicklesworthstone/frankensqlite/commit/ba48fbd343de4e5cb0b5bd9e4cf9faa1de5f1e2f),
+  [`057cf615`](https://github.com/Dicklesworthstone/frankensqlite/commit/057cf615c5e55fb5b2b59e75c2c9b2a5fb2f23b5)
+- **HAVING** clause with complex aggregate arguments.
+  [`1cef2110`](https://github.com/Dicklesworthstone/frankensqlite/commit/1cef21103fbadf2b11ddeec3c7e2a0c8c6cc6f17),
+  [`73484b42`](https://github.com/Dicklesworthstone/frankensqlite/commit/73484b42e9c08d6c3bed2e60f82f8a3e8e0ce9d8)
+- **DISTINCT** via row dedup.
+  [`a5c60f7b`](https://github.com/Dicklesworthstone/frankensqlite/commit/a5c60f7b6e3c6ddc3f3c7b1e8f7de2ea4a6e5c5a)
+- **Compound SELECT** (UNION/UNION ALL/INTERSECT/EXCEPT).
+  [`5f3b008f`](https://github.com/Dicklesworthstone/frankensqlite/commit/5f3b008f9e84b60f02dbcee8e36ab4ffdd93c99a)
+- **Common Table Expressions** (WITH clause) via table materialization.
+  [`5efb72ef`](https://github.com/Dicklesworthstone/frankensqlite/commit/5efb72ef32c8b86d3dcc2fea6e74acda0a5fea72)
+- **Recursive CTEs** with proper self-reference detection.
+  [`2d143861`](https://github.com/Dicklesworthstone/frankensqlite/commit/2d143861e3f2f6e10bb8f1c6fa2b2f7a8b3ad4ff)
+- **Subqueries in FROM clause** (derived tables).
+  [`b222522b`](https://github.com/Dicklesworthstone/frankensqlite/commit/b222522b02bbb1d34c8c90b5f2b1b47fa8d39de3)
+- **IN (SELECT ...)** subquery support.
+  [`c985721c`](https://github.com/Dicklesworthstone/frankensqlite/commit/c985721c39dda34d09f7f7e09e8e2d69ad6fb41b)
+- **Correlated scalar subqueries** with JOINs in FROM clause.
+  [`6092fb23`](https://github.com/Dicklesworthstone/frankensqlite/commit/6092fb23b61d39b8a23e2e0b6fdab05d2e6d68c6)
+- **ORDER BY NULLS FIRST/LAST**.
+  [`725bd298`](https://github.com/Dicklesworthstone/frankensqlite/commit/725bd298642d33386d984c0f047def98bb5c0a6a)
+- **Time-travel queries** (SQL:2011 `FOR SYSTEM_TIME AS OF`).
+  [`69b57ecf`](https://github.com/Dicklesworthstone/frankensqlite/commit/69b57ecf8572f06dca6f9a58cb12d6fd4e1b5f0e)
+
+#### Window Functions
+
+- **Full window function support** -- ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD,
+  NTH_VALUE, CUME_DIST, PERCENT_RANK, NTILE, FIRST_VALUE, LAST_VALUE.
+  [`25cfd93e`](https://github.com/Dicklesworthstone/frankensqlite/commit/25cfd93e7652291b801eeac981e964e6d5699a92)
+- **Per-function partition/sort** for multiple window specs.
+  [`12638ce9`](https://github.com/Dicklesworthstone/frankensqlite/commit/12638ce9cf5cb327e626ae52d8987761ef9cffcb)
+- **Aggregate-as-window functions** (SUM, AVG, COUNT, MIN, MAX, TOTAL).
+  [`07a6003a`](https://github.com/Dicklesworthstone/frankensqlite/commit/07a6003abdb7bcfc9ac1e84f3e3c8a3c15c41f84)
+- **Two-pass evaluation** for all partition-dependent window functions.
+  [`0b39083c`](https://github.com/Dicklesworthstone/frankensqlite/commit/0b39083c089d5f71181cb4f553df21d2db3dda96)
+- **RANGE and GROUPS** frame semantics.
+  [`25cfd93e`](https://github.com/Dicklesworthstone/frankensqlite/commit/25cfd93e7652291b801eeac981e964e6d5699a92)
+
+#### Constraints and Integrity
+
+- **CHECK constraint enforcement** on INSERT and UPDATE.
+  [`3db8d9ae`](https://github.com/Dicklesworthstone/frankensqlite/commit/3db8d9aee955018d79b79da9ff591ced270ad2df)
+- **NOT NULL constraint enforcement** at codegen level.
+  [`573a1006`](https://github.com/Dicklesworthstone/frankensqlite/commit/573a1006f4815e13167df204a4bb9c55db18aa8f)
+- **UNIQUE constraint enforcement** in MemDatabase and pager-backed paths.
+  [`b93d5cdf`](https://github.com/Dicklesworthstone/frankensqlite/commit/b93d5cdf3e0c2e58cc2e0ad1a4d32d3ae8a04a6f)
+- **AUTOINCREMENT/sqlite_sequence** support.
+  [`bcb357a7`](https://github.com/Dicklesworthstone/frankensqlite/commit/bcb357a71d97752a8165b437923494d8eada1347)
+- **Foreign key enforcement** on UPDATE/DELETE with CASCADE propagation.
+  [`d314d32b`](https://github.com/Dicklesworthstone/frankensqlite/commit/d314d32bcd46b4eabc7a2b80c06b21ec2a03fc94),
+  [`abef2e0f`](https://github.com/Dicklesworthstone/frankensqlite/commit/abef2e0f8c0be8f44eac6f0eea5f3dbc1c1c7c5f)
+- **Generated columns** (stored and virtual).
+  [`2b4503ec`](https://github.com/Dicklesworthstone/frankensqlite/commit/2b4503ece38e87b7ee26457e059505acdb0be3fb)
+
+#### Triggers
+
+- **Per-row OLD/NEW pseudo-table values** for DML triggers.
+  [`ce5d92bd`](https://github.com/Dicklesworthstone/frankensqlite/commit/ce5d92bd3e2da6f6c9f4e7d96b88f6b4b1f7b1cb)
+- **UPDATE OF column-change filtering**.
+  [`32e50e3a`](https://github.com/Dicklesworthstone/frankensqlite/commit/32e50e3a0f08cf50b9c7def19c31b09b1618ec7d)
+- **RAISE() action handling** in trigger body statements.
+  [`c04c03dc`](https://github.com/Dicklesworthstone/frankensqlite/commit/c04c03dcf7c26f4aeb8c6c7d7ad8ffc4e3a3c2e1)
+
+---
+
+### Built-in Functions
+
+- **Function registry** with builtins, authorizer, and collation.
+  [`a37017ed`](https://github.com/Dicklesworthstone/frankensqlite/commit/a37017edf1fdd8e3c3c1e10dc7bdf0e16c0d6f9c)
+- **20+ common SQLite scalar functions** in `eval_scalar_fn`.
+  [`76361291`](https://github.com/Dicklesworthstone/frankensqlite/commit/76361291acbfe49dfda9e1e1e7c4d87e76b5b7df)
+- **Kahan-Babuska-Neumaier compensated summation** for SUM/AVG/total.
+  [`d5ac7704`](https://github.com/Dicklesworthstone/frankensqlite/commit/d5ac770473ee9242282da0e1a6e6ebdf8903e2b0)
+- **Datetime functions** with localtime/utc modifiers, month/year overflow.
+  [`0a269b5b`](https://github.com/Dicklesworthstone/frankensqlite/commit/0a269b5b9a68a5740c4a9c0209782e29e7c01117)
+- **CollationRegistry** threaded through ORDER BY, sorting, and GROUP BY paths.
+  [`87e8d9db`](https://github.com/Dicklesworthstone/frankensqlite/commit/87e8d9db84c6a2c3ec6cb7afdd8a36a59c10e8c6),
+  [`d8834079`](https://github.com/Dicklesworthstone/frankensqlite/commit/d8834079a03d1d1bdbed2f6c7a9fbd2eec3a9ff3)
+- **UDF registration API** for user-defined functions.
+  [`204a241e`](https://github.com/Dicklesworthstone/frankensqlite/commit/204a241e8780a5e6c08e7e9ff1dbfb0e1fc76d31)
+- **`%!.15g` float-to-text formatting** matching C SQLite.
+  [`6ae07957`](https://github.com/Dicklesworthstone/frankensqlite/commit/6ae079572979023507c7fc2cfc73f696a4fd5739)
+- **Round-half-away-from-zero** matching SQLite custom printf.
+  [`57d26354`](https://github.com/Dicklesworthstone/frankensqlite/commit/57d26354b1f7b00f9c4f29b5fde04ec02c45d22e)
+
+---
+
+### Extensions
+
+#### FTS5 Full-Text Search
+
+- **FTS5 virtual table creation**, MATCH operator routing.
+  [`a1603989`](https://github.com/Dicklesworthstone/frankensqlite/commit/a1603989e8d0e7eadb0eb2b94e5c5d1e3a9a0b7c)
+- **Real column filter evaluation** in FTS5 queries.
+  [`0147eb5b`](https://github.com/Dicklesworthstone/frankensqlite/commit/0147eb5b4b8c5b1876a7fde6afe2ea5ee663498d)
+- **highlight() and snippet()** scalar functions.
+  [`3f6d1189`](https://github.com/Dicklesworthstone/frankensqlite/commit/3f6d1189985f6bb7751ccf00027448d878bc2c2b)
+- **Multiple MATCH constraints** combined with AND.
+  [`46c4bd99`](https://github.com/Dicklesworthstone/frankensqlite/commit/46c4bd99f8db7ded4e38c0bb19d8bfcb09fa05e1)
+
+#### FTS3/FTS4 Full-Text Search
+
+- **FTS3/FTS4 legacy full-text search extension**.
+  [`50e512eb`](https://github.com/Dicklesworthstone/frankensqlite/commit/50e512ebc85ec7b4b0b35f18b5c1d9c9cb6b2f36)
+
+#### R-Tree Spatial Index
+
+- **R*-tree spatial index** with geopoly format functions.
+  [`4b04e603`](https://github.com/Dicklesworthstone/frankensqlite/commit/4b04e603b4dea5e7c5b57b8c5dd1b1e1b0fbe5bc)
+- **R-tree extension parity** with fsqlite-func integration and harness
+  coverage.
+  [`d48445e7`](https://github.com/Dicklesworthstone/frankensqlite/commit/d48445e7667f88209c31ef1529e73bed6ea32aa6)
+
+#### JSON Extension
+
+- **JSON1 scalar core** and path extraction foundation.
+  [`3e79382a`](https://github.com/Dicklesworthstone/frankensqlite/commit/3e79382aac3a78e9edf5d7e1f8e8f18eab2db7d0)
+- **json_each/json_tree** virtual-table cursors.
+  [`8334743c`](https://github.com/Dicklesworthstone/frankensqlite/commit/8334743c0d8a1eda7fb2d0ef4f8a5df5e8c4a0cf)
+- **JSONB scalar function** parity and blob input support.
+  [`fbfe5675`](https://github.com/Dicklesworthstone/frankensqlite/commit/fbfe5675ece6c2d3cf2f753f66b30f54f3821ce5)
+- **Reject BLOB values** in json_quote per SQLite specification.
+  [`05c257fb`](https://github.com/Dicklesworthstone/frankensqlite/commit/05c257fbc75a2c16e4ee06e9dd7ac4b9db3e7d0e)
+
+#### Session Extension
+
+- **Changeset/patchset tracking** and application.
+  [`bc54260d`](https://github.com/Dicklesworthstone/frankensqlite/commit/bc54260db5ced36e7d0e2e7b7f00c8c65f8cd1f3)
+- **Session format corrections** -- binary format, change coalescing, conflict
+  apply semantics.
+  [`366e1eda`](https://github.com/Dicklesworthstone/frankensqlite/commit/366e1edaaf5a88a7f8c2b0d1ac9e3bc1a82b2e7e)
+
+#### ICU Extension
+
+- **Unicode collation**, case mapping, and tokenization.
+  [`08a0c9d0`](https://github.com/Dicklesworthstone/frankensqlite/commit/08a0c9d03f32bf3e05ace96fa1cdc74e0a1dd2b0)
+
+#### Miscellaneous Extensions
+
+- **generate_series, decimal arithmetic, and UUID**.
+  [`f0906c21`](https://github.com/Dicklesworthstone/frankensqlite/commit/f0906c210a2b4cbf4c49a3c45b83a7f2c8a1c18a)
+- **Prevent infinite loop** in generate_series on integer overflow.
+  [`44c114fe`](https://github.com/Dicklesworthstone/frankensqlite/commit/44c114fe1f3f8c35e2a54e09e5a8e1e3f7b6e4f1)
+
+---
+
+### RaptorQ Durability (Forward Error Correction)
+
+- **Unified RaptorQ repair engine** with BLAKE3 proofs.
+  [`c30cf910`](https://github.com/Dicklesworthstone/frankensqlite/commit/c30cf910ec8e6dba6bbbea3e4ab5e1ab56c8ac7d)
+- **RaptorQ source block partitioning**.
+  [`427389b0`](https://github.com/Dicklesworthstone/frankensqlite/commit/427389b0ae5ed1c3f1f7b2a4a6e25c3f0e4ffeaa)
+- **Fountain-coded snapshot shipping** (replication).
+  [`897fa04c`](https://github.com/Dicklesworthstone/frankensqlite/commit/897fa04c0ebff8ab11e3a73fd7cf5fb7e5aef4a9)
+- **Erasure-coded page storage** (`.db-fec` sidecar).
+  [`ba45ad1d`](https://github.com/Dicklesworthstone/frankensqlite/commit/ba45ad1d3c7b7f2b5f8bbfc2df6e7b0e7e3e3fe7)
+- **XOR parity replaced with RFC 6330 RaptorQ** InactivationDecoder.
+  [`8b162c4b`](https://github.com/Dicklesworthstone/frankensqlite/commit/8b162c4b6a4ef4e8e4a4e1b0a0c1b5e0c0edf2a3)
+- **Proofs of Retrievability** (PoR) module.
+  [`9e2fcb2c`](https://github.com/Dicklesworthstone/frankensqlite/commit/9e2fcb2cc4cdbbe9fd48c4d0d73c99c8bd7a5e99)
+
+---
+
+### C API Compatibility Shim
+
+- **SQLite C API compatibility shim crate** (`fsqlite-c-api`).
+  [`b14643bb`](https://github.com/Dicklesworthstone/frankensqlite/commit/b14643bbb77c6a6faec02fc270dccc33efca0b88)
+- **`sqlite3_prepare_v2`-style statement parsing** with tail offset support.
+  [`cf10270d`](https://github.com/Dicklesworthstone/frankensqlite/commit/cf10270d125313398ce5761af1eaf8df87a4cfcd)
+- **Multi-statement batch execution** and real column names in `sqlite3_exec`.
+  [`d40e4cb2`](https://github.com/Dicklesworthstone/frankensqlite/commit/d40e4cb27d29a4050884fb1cb8455bb2e546afbb)
+- **Panic-safe close** -- `catch_unwind` around `sqlite3_open`,
+  `sqlite3_prepare_v2`, and `sqlite3_step`.
+  [`826ab12b`](https://github.com/Dicklesworthstone/frankensqlite/commit/826ab12beed2f0b48b54b3bca7ee94b83e4e69f4),
+  [`a4f9b47d`](https://github.com/Dicklesworthstone/frankensqlite/commit/a4f9b47d5c9c7f6fde7f0cc16c0e9af0f3c2b8f4)
+- **Temporary database lifecycle**, finalize error propagation, VDBE result code
+  parsing.
+  [`20b587f3`](https://github.com/Dicklesworthstone/frankensqlite/commit/20b587f385a38902d16aed86ec12ce0d75bceafd)
+
+---
+
+### WASM (WebAssembly)
+
+- **Enable FrankenSQLite compilation** for `wasm32-unknown-unknown`.
+  [`202b9f26`](https://github.com/Dicklesworthstone/frankensqlite/commit/202b9f2682718edab6b3cef56c1db6a7d9e65842)
+- **Full WASM database engine** with R-tree virtual table adapter.
+  [`f76c7de2`](https://github.com/Dicklesworthstone/frankensqlite/commit/f76c7de2a55d7a4aa9b869ba526388664dcb2fb4)
+- **Gate OS-specific deps** for wasm32 compatibility across pager, WAL, MVCC,
+  VDBE, btree, ext-misc, observability, and core crates.
+  [`dbfa3317`](https://github.com/Dicklesworthstone/frankensqlite/commit/dbfa33171e7e0edbb98d6e93bb0afc3cdd1e0c8c)
+  through
+  [`56cdcc51`](https://github.com/Dicklesworthstone/frankensqlite/commit/56cdcc51cc57f5a6cf89e5d00bf0d9e3cb6baf23)
+- **JS-facing coverage** and host connection tests.
+  [`9df761c3`](https://github.com/Dicklesworthstone/frankensqlite/commit/9df761c35fa6f5bd8d580f7990ea04d78c314cbd)
+
+---
+
+### Type System
+
+- **Core type system** with 64 tests (`fsqlite-types` Phase 1).
+  [`bfd62701`](https://github.com/Dicklesworthstone/frankensqlite/commit/bfd62701858561f59913a2d61a966d7dcc239152)
+- **Record format serialization** for SQLite binary format.
+  [`3756438e`](https://github.com/Dicklesworthstone/frankensqlite/commit/3756438eec6c51bb8a84e1aadba1e3e8b21b5fdf)
+- **`SqliteValue::Text/Blob` migration to `Arc<str>`/`Arc<[u8]>`** for O(1)
+  clone across the entire workspace (all 6 extension crates, func, core, VDBE,
+  harness, compat).
+  [`fa399373`](https://github.com/Dicklesworthstone/frankensqlite/commit/fa3993737120862696e26bcdc0dcfa40c4693528)
+  through
+  [`580575b2`](https://github.com/Dicklesworthstone/frankensqlite/commit/580575b239ed10e15e691e1c9e968b709e2d6652)
+- **SQL three-valued NULL logic** for comparisons.
+  [`44b6f1dc`](https://github.com/Dicklesworthstone/frankensqlite/commit/44b6f1dc2cdcdeb568e2be20c42963378c251327)
+- **Non-numeric text arithmetic** yields integer, not float.
+  [`49167f2b`](https://github.com/Dicklesworthstone/frankensqlite/commit/49167f2b94b4f4e6bef99bc6bfbd14e73e87b7d9)
+- **Type affinity coercion** in comparisons.
+  [`84e01813`](https://github.com/Dicklesworthstone/frankensqlite/commit/84e018131715652ad301793754e4d11c7cb08319)
+- **Lazy record decode**, conditional profiling, and value helpers.
+  [`53d4ec87`](https://github.com/Dicklesworthstone/frankensqlite/commit/53d4ec87b0e0bb0f0a65f6b8f3e8b7e5f0be8c59)
+
+---
+
+### Connection and Public API
+
+- **`fsqlite::Connection`** -- `open()`, `execute()`, `query()`, `prepare()`.
+  [`256b7c0b`](https://github.com/Dicklesworthstone/frankensqlite/commit/256b7c0b97dbee0e4cb0a5ca2d8e84f3c9dc0e0d)
+- **Real SQLite binary format persistence**.
+  [`b30fc295`](https://github.com/Dicklesworthstone/frankensqlite/commit/b30fc295d5d1f6a3e0f2f1d2c0dcddf3c6a0d25f)
+- **Phase 5A complete** -- schema loading, cookies, storage cursors.
+  [`d6bc2aa5`](https://github.com/Dicklesworthstone/frankensqlite/commit/d6bc2aa5e4132fcf0b24049f217ee033d313e462)
+- **PreparedStatement::execute_with_params** now works for DML.
+  [`1fc5bb82`](https://github.com/Dicklesworthstone/frankensqlite/commit/1fc5bb82b0d09649734c88d1b655d2ba9c034324)
+- **Pre-compiled INSERT reuse** and schema-scoped compiled cache.
+  [`53ee09c9`](https://github.com/Dicklesworthstone/frankensqlite/commit/53ee09c93c4ef8c9dc6ed04b1c0f71b1deff40a6)
+- **Rusqlite compat layer**.
+  [`f9c447e5`](https://github.com/Dicklesworthstone/frankensqlite/commit/f9c447e560d5eb4e0f5ad3c87e7c0d1d1e27d71e)
+
+---
+
+### Performance Optimization
+
+- **Hekaton-style lock-free page locks** and cached read snapshots.
+  [`bb6f3606`](https://github.com/Dicklesworthstone/frankensqlite/commit/bb6f36066209de6bb71985d39c9eef399a305773)
+- **Batch commit-index fence**, SmallVec active-commits, proactive chain
+  compaction.
+  [`55ddcc6c`](https://github.com/Dicklesworthstone/frankensqlite/commit/55ddcc6c65d7769042fb5ac076fe231f8e1e84c1)
+- **Zero-cost observability**, in-memory pager fast path, SQL normalization.
+  [`f44dddfb`](https://github.com/Dicklesworthstone/frankensqlite/commit/f44dddfb20803d088850c656869d46b3856445fb)
+- **Autocommit hot path** optimization -- skip external schema refresh for
+  in-memory, skip WAL post-commit backfill for `:memory:`.
+  [`63fdd78c`](https://github.com/Dicklesworthstone/frankensqlite/commit/63fdd78c9f4907d53b7d3ce4dfce90ecddb49c6b),
+  [`bdace094`](https://github.com/Dicklesworthstone/frankensqlite/commit/bdace094d2ac2a89e55f27e1db6e9b2eda52a7e7)
+- **Autoincrement sequence fast-path**, post-write action pipeline.
+  [`14e1ac90`](https://github.com/Dicklesworthstone/frankensqlite/commit/14e1ac908bf8a4cd52e68e3af5fb5ba96cc1e8a8)
+- **Sort-based GROUP BY**, `Arc<Statement>` in prepared stmts, NOCASE
+  optimization.
+  [`69e8af20`](https://github.com/Dicklesworthstone/frankensqlite/commit/69e8af20d5141f3b32ad4e81570667deec8c8f41)
+- **Reduce per-statement overhead** -- uncontended finalize fast path, inline
+  hot register lookups.
+  [`9cf25d4a`](https://github.com/Dicklesworthstone/frankensqlite/commit/9cf25d4ad5b1fdb6d9a9ec7dbe2cc5dcd25b7e4f)
+- **Prechecked insert**, handle recycling, memory autocommit fast path.
+  [`af73463d`](https://github.com/Dicklesworthstone/frankensqlite/commit/af73463d0fca0b7c3b4b4a6deb6e7f9e8c68c7e0)
+- **O(1) atomic occupancy counter** for lock table.
+  [`8a08921c`](https://github.com/Dicklesworthstone/frankensqlite/commit/8a08921c5aef12fbd8cf7ed18c2badc7e36c0c8a)
+- **SmallVec for VDBE program ops** and optimized record parsing.
+  [`a2b112fc`](https://github.com/Dicklesworthstone/frankensqlite/commit/a2b112fc3e71e34e97af4de7e6ca5fe5c5de3f10)
+- **Owned-page write fast path**, StorageCursor rewrite.
+  [`a46d6f30`](https://github.com/Dicklesworthstone/frankensqlite/commit/a46d6f30b5b2f3fd2e44c6b7c6f0f7e3bf2b2e4c)
+
+---
+
+### Conformance and Differential Testing
+
+A massive conformance effort produced 500+ oracle tests comparing FrankenSQLite
+results against C SQLite on identical SQL.
+
+- **Conformance oracle framework** with C SQLite comparison.
+  [`57ffa844`](https://github.com/Dicklesworthstone/frankensqlite/commit/57ffa8441c64e0a06bb0f6ad7dbcae7c57c9c8de)
+- **500+ oracle conformance tests** covering JOINs, aggregates, window
+  functions, subqueries, CTEs, triggers, foreign keys, UPSERT, DISTINCT,
+  COLLATE, type coercion, NULL semantics, and dozens of edge cases.
+  Representative batch commits:
+  [`11665f60`](https://github.com/Dicklesworthstone/frankensqlite/commit/11665f60da9ba1d61ac42577d7df954032f74f01) (200 total),
+  [`8cf6f075`](https://github.com/Dicklesworthstone/frankensqlite/commit/8cf6f0752fd93f977da844d2e8396516b73d5cfe) (353 total),
+  [`529f1164`](https://github.com/Dicklesworthstone/frankensqlite/commit/529f11643a1d4c0e0e56f1f45f1b9c1b3c3e8bb8) (457 total)
+- **Parity-certification mode** with MVCC visibility telemetry and WAL replay
+  tracing.
+  [`84d7b1a6`](https://github.com/Dicklesworthstone/frankensqlite/commit/84d7b1a6a7851d6583d8d961ad07bf3a1d12c741)
+- **Exhaustive function parity matrix** differential test against C SQLite.
+  [`4c9cf08e`](https://github.com/Dicklesworthstone/frankensqlite/commit/4c9cf08e9a9c078eb0a75453c9da2ab3318d2c7a)
+- **Oracle preflight doctor** in CI workflow.
+  [`6f491bf8`](https://github.com/Dicklesworthstone/frankensqlite/commit/6f491bf814b229ea351c814c0b3b390e9bc03baf)
+- **Property-based testing** -- proptest suites for cell visibility invariants,
+  parser round-trip, MVCC snapshot isolation, vectorized operator equivalence.
+  [`6f5582f6`](https://github.com/Dicklesworthstone/frankensqlite/commit/6f5582f69182d29c0dcc77ab9b144bccda3ee4a5),
+  [`044c683e`](https://github.com/Dicklesworthstone/frankensqlite/commit/044c683e17adf3e94c5aba03cac32e3d44b02cff),
+  [`f1b31fb9`](https://github.com/Dicklesworthstone/frankensqlite/commit/f1b31fb9c00e7a2d7d47e2c4e4d7b1e0e8e3d5f1)
+
+---
+
+### E2E Testing and Benchmarks
+
+- **Comprehensive benchmark suite** (FrankenSQLite vs C SQLite).
+  [`0b5512cc`](https://github.com/Dicklesworthstone/frankensqlite/commit/0b5512cc36daee77a84b9c3f5eecc5f37e7a5fe4)
+- **Persistent concurrency benchmark** and perf gate tooling.
+  [`3a8154e2`](https://github.com/Dicklesworthstone/frankensqlite/commit/3a8154e233a7fc45b3b1f2e2f7f3bb5e9fc54c5c)
+- **Corruption injection framework** with scenario catalog and recovery runners.
+  [`da9dc5e0`](https://github.com/Dicklesworthstone/frankensqlite/commit/da9dc5e06bcb3c8fc1e8f43cfb5d97d2f77e52a0)
+- **Interactive TUI viewer** for run records and benchmarks.
+  [`f5c0b01e`](https://github.com/Dicklesworthstone/frankensqlite/commit/f5c0b01eb3c5ee2f2e2dbee0d7e9c77c8e2b2e7c)
+- **Hot-path profiling API** for pre-built oplogs, concurrent writer profiling.
+  [`2fae093d`](https://github.com/Dicklesworthstone/frankensqlite/commit/2fae093d3c3e3c3f2e0e6f8e3aeef78c9a5b7e1d)
+- **MVCC concurrent writers scaling test suite**.
+  [`791ab0a1`](https://github.com/Dicklesworthstone/frankensqlite/commit/791ab0a1bb27f7e31bfad17b5c4f8f6c2f2d2cc2)
+- **SHA-256 artifact integrity** and cross-process lock testing.
+  [`53db4db1`](https://github.com/Dicklesworthstone/frankensqlite/commit/53db4db1df66e33b58ebb4c6d11b9d57c3ef3f9c)
+
+---
+
+### Observability
+
+- **MVCC conflict analytics** and observability suite.
+  [`492428dd`](https://github.com/Dicklesworthstone/frankensqlite/commit/492428dd37e5f1e67aee0c6a72f8c5bdb8be7ffa)
+- **TxnSlot lifecycle telemetry** and instrumentation.
+  [`4ddfb008`](https://github.com/Dicklesworthstone/frankensqlite/commit/4ddfb0087f42f2c7e0d1a5db64f3f2c2e8f3a5e1)
+- **RaptorQ metrics** and tracing spans.
+  [`dee49104`](https://github.com/Dicklesworthstone/frankensqlite/commit/dee49104a8e28f7f3cdd5b5a6fc1c8da4f4e0a7f)
+- **WAL metrics counters** and tracing span.
+  [`b8931ec7`](https://github.com/Dicklesworthstone/frankensqlite/commit/b8931ec7a0e3c9e67e7bfa0de2bf3ebf8c3e8c55)
+- **SSI metrics counters** and tracing span for `ssi_validate`.
+  [`a31aa3b3`](https://github.com/Dicklesworthstone/frankensqlite/commit/a31aa3b3c9e9db3e0c6a0a5c0b0f0c3b5e5eab85)
+- **TracingFile wrapper** and VfsMetrics.
+  [`b8658d7f`](https://github.com/Dicklesworthstone/frankensqlite/commit/b8658d7f4e2e4b9e1eadabe98ddabe4f0a0d2619)
+
+---
+
+### CLI
+
+- **REPL shell** with `-c/--command` and `.read`.
+  [`30108bef`](https://github.com/Dicklesworthstone/frankensqlite/commit/30108bef4d1db29c7bbfb1e7e2c4a8c3b7e5e9f7)
+- **Propagate SQL and dot-command errors** to shell exit code.
+  [`872948e7`](https://github.com/Dicklesworthstone/frankensqlite/commit/872948e7fbb3c3f8d0e6c38f7d89b9b0c4f4c1c8)
+
+---
+
+### Licensing
+
+- **MIT + OpenAI/Anthropic Rider** adopted across workspace (2026-02-18).
+  [`5d684f5f`](https://github.com/Dicklesworthstone/frankensqlite/commit/5d684f5f4da037afd971ba1ea28846597939d653)
+
+---
+
+## Workspace Crates
+
+| Crate | Role |
+|-------|------|
+| `fsqlite` | Top-level public API facade |
+| `fsqlite-core` | Connection, query dispatch, schema management |
+| `fsqlite-types` | Core type system (`SqliteValue`, `PageNumber`, `TxnId`, etc.) |
+| `fsqlite-error` | Structured error types |
+| `fsqlite-vfs` | Virtual File System (POSIX, io_uring, WASM) |
+| `fsqlite-pager` | Page cache, group commit, WAL integration |
+| `fsqlite-wal` | Write-Ahead Log (compat + parallel) |
+| `fsqlite-mvcc` | Page-level MVCC, SSI, EBR, version store |
+| `fsqlite-btree` | B-tree engine with learned index |
+| `fsqlite-ast` | SQL abstract syntax tree |
+| `fsqlite-parser` | SQL parser |
+| `fsqlite-planner` | Query planner and optimizer |
+| `fsqlite-vdbe` | Virtual Database Engine (bytecode interpreter) |
+| `fsqlite-func` | Built-in scalar and aggregate functions |
+| `fsqlite-ext-fts3` | FTS3 extension |
+| `fsqlite-ext-fts5` | FTS5 extension |
+| `fsqlite-ext-rtree` | R-Tree extension |
+| `fsqlite-ext-json` | JSON/JSONB extension |
+| `fsqlite-ext-session` | Session extension |
+| `fsqlite-ext-icu` | ICU extension |
+| `fsqlite-ext-misc` | Miscellaneous extensions (`generate_series`, etc.) |
+| `fsqlite-c-api` | Optional C ABI shim (only `unsafe` code in workspace) |
+| `fsqlite-cli` | Command-line shell |
+| `fsqlite-e2e` | End-to-end tests and benchmarks |
+| `fsqlite-harness` | Conformance test harness and oracle infrastructure |
+| `fsqlite-wasm` | WebAssembly database engine |
+| `fsqlite-observability` | Telemetry and instrumentation |

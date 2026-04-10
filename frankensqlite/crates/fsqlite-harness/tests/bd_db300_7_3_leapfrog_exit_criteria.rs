@@ -1,0 +1,796 @@
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use fsqlite_harness::leapfrog_exit_criteria::{BEAD_ID, LeapfrogExitCriteria};
+
+const CONTRACT_PATH: &str = "leapfrog_exit_criteria.toml";
+const REQUIRED_TESTS: [&str; 7] = [
+    "test_bd_db300_7_3_contract_schema_and_links",
+    "test_bd_db300_7_3_required_campaign_surface_exists",
+    "test_bd_db300_7_3_cell_targets_are_monotone",
+    "test_bd_db300_7_3_verification_plan_is_actionable",
+    "test_bd_db300_7_3_operator_report_contract_is_actionable",
+    "test_bd_db300_7_3_transferability_rubric_is_actionable",
+    "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
+];
+const REQUIRED_LOG_FIELDS: [&str; 9] = [
+    "throughput_ratio_vs_sqlite",
+    "retry_rate",
+    "wait_fraction_of_wall_time",
+    "cpu_utilization_pct",
+    "p50_latency_ratio_vs_sqlite",
+    "p95_latency_ratio_vs_sqlite",
+    "p99_latency_ratio_vs_sqlite",
+    "responsiveness_regression_ratio_vs_sqlite",
+    "topology_reassignments",
+];
+const REQUIRED_MODES: [&str; 3] = ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"];
+const REQUIRED_METRIC_FAMILIES: [&str; 12] = [
+    "throughput",
+    "retry",
+    "abort",
+    "cpu_efficiency",
+    "latency",
+    "topology",
+    "wait",
+    "page_touch",
+    "split_path",
+    "allocator",
+    "cache",
+    "copy_allocation",
+];
+const REQUIRED_TRANSFERABILITY_CLASSES: [&str; 4] = [
+    "transferable",
+    "profile_specific_but_useful",
+    "suspicious",
+    "non_claimable",
+];
+const REQUIRED_HARDWARE_CLASSES: [&str; 3] =
+    ["same_host", "same_topology_class", "cross_hardware_class"];
+const REQUIRED_DOWNSTREAM_BEADS: [&str; 2] = ["bd-db300.7.3", "bd-db300.7.4"];
+const REQUIRED_WORKLOADS: [&str; 3] = [
+    "commutative_inserts_disjoint_keys",
+    "hot_page_contention",
+    "mixed_read_write",
+];
+const REQUIRED_OPERATOR_SOURCE_BEADS: [&str; 3] =
+    ["bd-db300.7.5.5", "bd-db300.7.5.6", "bd-db300.7.6.4"];
+const REQUIRED_OPERATOR_UPSTREAM_CONTRACTS: [&str; 3] = [
+    "db300_regime_atlas_contract.toml",
+    "db300_shadow_oracle_contract.toml",
+    "db300_policy_snapshot_contract.toml",
+];
+const REQUIRED_OPERATOR_REPORT_FIELDS: [&str; 10] = [
+    "activation_regime_id",
+    "activation_state",
+    "rollout_stage",
+    "safe_by_default_boundary",
+    "shadow_sample_rate",
+    "kill_switch_state",
+    "fallback_state",
+    "rollout_annotation",
+    "fallback_annotation",
+    "user_visibility",
+];
+const REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS: [&str; 3] = [
+    "artifacts/{bead_id}/{run_id}/manifest.json",
+    "artifacts/{bead_id}/{run_id}/summary.md",
+    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
+];
+
+fn workspace_root() -> Result<PathBuf, String> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|error| format!("workspace_root_canonicalize_failed: {error}"))
+}
+
+fn load_contract() -> Result<LeapfrogExitCriteria, String> {
+    let root = workspace_root()?;
+    LeapfrogExitCriteria::load_from_workspace_root(&root)
+}
+
+#[test]
+fn test_bd_db300_7_3_contract_schema_and_links() -> Result<(), String> {
+    let root = workspace_root()?;
+    let criteria = load_contract()?;
+    criteria.validate(&root)?;
+
+    if criteria.meta.bead_id != BEAD_ID {
+        return Err(format!(
+            "unexpected bead id actual={} expected={BEAD_ID}",
+            criteria.meta.bead_id
+        ));
+    }
+
+    let contract_path = root.join(CONTRACT_PATH);
+    if !contract_path.exists() {
+        return Err(format!(
+            "contract path missing path={}",
+            contract_path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_required_campaign_surface_exists() -> Result<(), String> {
+    let criteria = load_contract()?;
+
+    let expected_scenarios = [
+        "commutative_inserts_disjoint_keys_c1",
+        "commutative_inserts_disjoint_keys_c4",
+        "commutative_inserts_disjoint_keys_c8",
+        "hot_page_contention_c1",
+        "hot_page_contention_c4",
+        "hot_page_contention_c8",
+        "mixed_read_write_c1",
+        "mixed_read_write_c4",
+        "mixed_read_write_c8",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect::<BTreeSet<_>>();
+
+    let actual_scenarios = criteria
+        .verification_plan
+        .e2e_scenarios
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if actual_scenarios != expected_scenarios {
+        return Err(format!(
+            "scenario set mismatch actual={actual_scenarios:?} expected={expected_scenarios:?}"
+        ));
+    }
+
+    let expected_profiles = [
+        "baseline_unpinned",
+        "recommended_pinned",
+        "adversarial_cross_node",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_profiles = criteria
+        .campaign
+        .required_placement_profiles
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_profiles != expected_profiles {
+        return Err(format!(
+            "placement profile mismatch actual={actual_profiles:?} expected={expected_profiles:?}"
+        ));
+    }
+
+    let expected_modes = REQUIRED_MODES.into_iter().collect::<BTreeSet<_>>();
+    let actual_modes = criteria
+        .campaign
+        .required_modes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_modes != expected_modes {
+        return Err(format!(
+            "mode set mismatch actual={actual_modes:?} expected={expected_modes:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_cell_targets_are_monotone() -> Result<(), String> {
+    let criteria = load_contract()?;
+    let c1 = criteria
+        .cell_gate("c1")
+        .ok_or_else(|| "missing c1 gate".to_owned())?;
+    let c4 = criteria
+        .cell_gate("c4")
+        .ok_or_else(|| "missing c4 gate".to_owned())?;
+    let c8 = criteria
+        .cell_gate("c8")
+        .ok_or_else(|| "missing c8 gate".to_owned())?;
+
+    if !(c1.recommended_min_throughput_ratio_vs_sqlite
+        < c4.recommended_min_throughput_ratio_vs_sqlite
+        && c4.recommended_min_throughput_ratio_vs_sqlite
+            < c8.recommended_min_throughput_ratio_vs_sqlite)
+    {
+        return Err(
+            "recommended throughput targets must strictly increase c1 < c4 < c8".to_owned(),
+        );
+    }
+
+    if !(c1.baseline_catastrophic_floor_ratio_vs_sqlite
+        > c4.baseline_catastrophic_floor_ratio_vs_sqlite
+        && c4.baseline_catastrophic_floor_ratio_vs_sqlite
+            > c8.baseline_catastrophic_floor_ratio_vs_sqlite)
+    {
+        return Err("baseline catastrophic floors must get looser as concurrency rises".to_owned());
+    }
+
+    if !(c1.adversarial_catastrophic_floor_ratio_vs_sqlite
+        > c4.adversarial_catastrophic_floor_ratio_vs_sqlite
+        && c4.adversarial_catastrophic_floor_ratio_vs_sqlite
+            > c8.adversarial_catastrophic_floor_ratio_vs_sqlite)
+    {
+        return Err(
+            "adversarial catastrophic floors must get looser as concurrency rises".to_owned(),
+        );
+    }
+
+    if !(c1.max_retry_rate < c4.max_retry_rate && c4.max_retry_rate < c8.max_retry_rate) {
+        return Err("retry budget must widen monotonically c1 < c4 < c8".to_owned());
+    }
+
+    if !(c1.max_wait_fraction_of_wall_time < c4.max_wait_fraction_of_wall_time
+        && c4.max_wait_fraction_of_wall_time < c8.max_wait_fraction_of_wall_time)
+    {
+        return Err("wait budget must widen monotonically c1 < c4 < c8".to_owned());
+    }
+
+    if !(c1.min_cpu_utilization_pct < c4.min_cpu_utilization_pct
+        && c4.min_cpu_utilization_pct < c8.min_cpu_utilization_pct)
+    {
+        return Err("minimum CPU utilization must tighten monotonically".to_owned());
+    }
+
+    if !(c1.max_p99_latency_ratio_vs_sqlite < c4.max_p99_latency_ratio_vs_sqlite
+        && c4.max_p99_latency_ratio_vs_sqlite < c8.max_p99_latency_ratio_vs_sqlite)
+    {
+        return Err("p99 latency guard must relax monotonically with concurrency".to_owned());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
+    let criteria = load_contract()?;
+
+    let actual_tests = criteria
+        .verification_plan
+        .unit_tests
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_tests = REQUIRED_TESTS.into_iter().collect::<BTreeSet<_>>();
+    if actual_tests != expected_tests {
+        return Err(format!(
+            "verification unit test set mismatch actual={actual_tests:?} expected={expected_tests:?}"
+        ));
+    }
+
+    let log_fields = criteria
+        .verification_plan
+        .required_log_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let artifacts = criteria
+        .verification_plan
+        .logging_artifacts
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let metric_definitions = criteria
+        .metric_dictionary
+        .metrics
+        .iter()
+        .map(|metric| (metric.metric_id.as_str(), metric))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for required_field in REQUIRED_LOG_FIELDS {
+        if !log_fields.contains(required_field) {
+            return Err(format!("required log field missing field={required_field}"));
+        }
+        let Some(metric) = metric_definitions.get(required_field) else {
+            return Err(format!(
+                "metric dictionary missing required metric_id={required_field}"
+            ));
+        };
+        if !metric.required_for_claim {
+            return Err(format!(
+                "required metric_id={required_field} must be marked required_for_claim"
+            ));
+        }
+        if metric.collection_artifact.trim().is_empty() || metric.collection_field.trim().is_empty()
+        {
+            return Err(format!(
+                "required metric_id={required_field} must name a concrete collection artifact and field"
+            ));
+        }
+        if !artifacts.contains(metric.collection_artifact.as_str()) {
+            return Err(format!(
+                "required metric_id={required_field} points at undeclared artifact={}",
+                metric.collection_artifact
+            ));
+        }
+    }
+    for log_field in &log_fields {
+        if !metric_definitions.contains_key(log_field) {
+            return Err(format!(
+                "required log field lacks metric dictionary entry field={log_field}"
+            ));
+        }
+    }
+
+    if !criteria.scorecard.claim_forbidden_when_any_fail {
+        return Err("claim gate must be fail-able".to_owned());
+    }
+    if !criteria
+        .scorecard
+        .claim_language
+        .contains("leapfrogs SQLite")
+    {
+        return Err("claim language must explicitly name the leapfrog claim".to_owned());
+    }
+    if !criteria
+        .scorecard
+        .claim_language
+        .contains("recommended_pinned")
+    {
+        return Err("claim language must mention the recommended placement".to_owned());
+    }
+
+    for required_artifact in [
+        "artifacts/{bead_id}/{run_id}/events.jsonl",
+        "artifacts/{bead_id}/{run_id}/manifest.json",
+        "artifacts/{bead_id}/{run_id}/summary.md",
+        "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
+        "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
+        "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
+        "artifacts/{bead_id}/{run_id}/retry_report.json",
+        "artifacts/{bead_id}/{run_id}/topology.json",
+    ] {
+        if !artifacts.contains(required_artifact) {
+            return Err(format!(
+                "logging artifact missing artifact={required_artifact}"
+            ));
+        }
+    }
+
+    let metric_families = criteria
+        .metric_dictionary
+        .metrics
+        .iter()
+        .map(|metric| metric.family.as_str())
+        .collect::<BTreeSet<_>>();
+    for required_family in REQUIRED_METRIC_FAMILIES {
+        if !metric_families.contains(required_family) {
+            return Err(format!(
+                "metric dictionary missing required family={required_family}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_workload_family_thresholds_are_actionable() -> Result<(), String> {
+    let criteria = load_contract()?;
+    let metric_ids = criteria
+        .metric_dictionary
+        .metrics
+        .iter()
+        .map(|metric| metric.metric_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let required_log_fields = criteria
+        .verification_plan
+        .required_log_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+
+    let actual_workloads = criteria
+        .workload_families
+        .iter()
+        .map(|family| family.workload.as_str())
+        .collect::<Vec<_>>();
+    if actual_workloads != REQUIRED_WORKLOADS {
+        return Err(format!(
+            "workload family order mismatch actual={actual_workloads:?} expected={REQUIRED_WORKLOADS:?}"
+        ));
+    }
+
+    for family in &criteria.workload_families {
+        if family.family_label.trim().is_empty() || family.interpretation.trim().is_empty() {
+            return Err(format!(
+                "workload family {} must describe label and interpretation",
+                family.workload
+            ));
+        }
+        if family.c1_target_direction.trim().is_empty()
+            || family.c4_target_direction.trim().is_empty()
+            || family.c8_target_direction.trim().is_empty()
+        {
+            return Err(format!(
+                "workload family {} must define c1/c4/c8 target directions",
+                family.workload
+            ));
+        }
+        if family.frontier_metrics.is_empty() || family.must_not_regress_metrics.is_empty() {
+            return Err(format!(
+                "workload family {} must define frontier and protected metrics",
+                family.workload
+            ));
+        }
+        for metric_id in family
+            .frontier_metrics
+            .iter()
+            .chain(family.must_not_regress_metrics.iter())
+        {
+            if !metric_ids.contains(metric_id.as_str()) {
+                return Err(format!(
+                    "workload family {} references undefined metric {}",
+                    family.workload, metric_id
+                ));
+            }
+            if !required_log_fields.contains(metric_id.as_str()) {
+                return Err(format!(
+                    "workload family {} references non-gated metric {}",
+                    family.workload, metric_id
+                ));
+            }
+        }
+    }
+
+    let insert_family = criteria
+        .workload_families
+        .iter()
+        .find(|family| family.workload == "commutative_inserts_disjoint_keys")
+        .ok_or_else(|| "missing insert-heavy workload family".to_owned())?;
+    if !insert_family
+        .frontier_metrics
+        .iter()
+        .any(|metric| metric == "throughput_ratio_vs_sqlite")
+    {
+        return Err("insert-heavy family must treat throughput as a frontier metric".to_owned());
+    }
+
+    let hot_page_family = criteria
+        .workload_families
+        .iter()
+        .find(|family| family.workload == "hot_page_contention")
+        .ok_or_else(|| "missing hot-page workload family".to_owned())?;
+    if !hot_page_family
+        .frontier_metrics
+        .iter()
+        .any(|metric| metric == "wait_fraction_of_wall_time")
+    {
+        return Err("hot-page family must treat wait share as a frontier diagnostic".to_owned());
+    }
+
+    let mixed_family = criteria
+        .workload_families
+        .iter()
+        .find(|family| family.workload == "mixed_read_write")
+        .ok_or_else(|| "missing mixed workload family".to_owned())?;
+    if !mixed_family
+        .must_not_regress_metrics
+        .iter()
+        .any(|metric| metric == "responsiveness_regression_ratio_vs_sqlite")
+    {
+        return Err(
+            "mixed family must protect responsiveness as a must-not-regress metric".to_owned(),
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_operator_report_contract_is_actionable() -> Result<(), String> {
+    let root = workspace_root()?;
+    let criteria = load_contract()?;
+    let operator_report = &criteria.operator_report_contract;
+
+    if operator_report.consumer_bead_id != "bd-db300.7.4" {
+        return Err(format!(
+            "unexpected operator consumer bead={}",
+            operator_report.consumer_bead_id
+        ));
+    }
+
+    let source_beads = operator_report
+        .source_contract_beads
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if source_beads != REQUIRED_OPERATOR_SOURCE_BEADS {
+        return Err(format!(
+            "operator source beads mismatch actual={source_beads:?} expected={REQUIRED_OPERATOR_SOURCE_BEADS:?}"
+        ));
+    }
+
+    let upstream_contracts = operator_report
+        .upstream_contract_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if upstream_contracts != REQUIRED_OPERATOR_UPSTREAM_CONTRACTS {
+        return Err(format!(
+            "operator upstream contracts mismatch actual={upstream_contracts:?} expected={REQUIRED_OPERATOR_UPSTREAM_CONTRACTS:?}"
+        ));
+    }
+    for contract_path in &operator_report.upstream_contract_paths {
+        let resolved = root.join(contract_path);
+        if !resolved.exists() {
+            return Err(format!(
+                "operator upstream contract missing path={}",
+                resolved.display()
+            ));
+        }
+    }
+
+    let bundle_artifacts = operator_report
+        .required_bundle_artifacts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if bundle_artifacts != REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS {
+        return Err(format!(
+            "operator bundle artifact mismatch actual={bundle_artifacts:?} expected={REQUIRED_OPERATOR_REPORT_BUNDLE_ARTIFACTS:?}"
+        ));
+    }
+
+    for (label, actual) in [
+        (
+            "required_manifest_fields",
+            operator_report
+                .required_manifest_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "required_summary_fields",
+            operator_report
+                .required_summary_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "required_threshold_fields",
+            operator_report
+                .required_threshold_fields
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        if actual != REQUIRED_OPERATOR_REPORT_FIELDS {
+            return Err(format!(
+                "{label} mismatch actual={actual:?} expected={REQUIRED_OPERATOR_REPORT_FIELDS:?}"
+            ));
+        }
+    }
+
+    if operator_report
+        .default_activation_regime_id
+        .trim()
+        .is_empty()
+    {
+        return Err("default activation regime id must not be blank".to_owned());
+    }
+    if operator_report.default_activation_state != "regime_gated_default" {
+        return Err(format!(
+            "unexpected default activation state={}",
+            operator_report.default_activation_state
+        ));
+    }
+    if operator_report.default_rollout_stage != "default" {
+        return Err(format!(
+            "unexpected default rollout stage={}",
+            operator_report.default_rollout_stage
+        ));
+    }
+    if operator_report.default_shadow_sample_rate != "0%" {
+        return Err(format!(
+            "unexpected default shadow sample rate={}",
+            operator_report.default_shadow_sample_rate
+        ));
+    }
+    if operator_report.default_kill_switch_state != "disarmed" {
+        return Err(format!(
+            "unexpected default kill switch state={}",
+            operator_report.default_kill_switch_state
+        ));
+    }
+    if operator_report.default_fallback_state != "inactive" {
+        return Err(format!(
+            "unexpected default fallback state={}",
+            operator_report.default_fallback_state
+        ));
+    }
+    if operator_report.user_visibility != "operator_visible_regime_gated_default" {
+        return Err(format!(
+            "unexpected user visibility={}",
+            operator_report.user_visibility
+        ));
+    }
+    if operator_report.safe_by_default_boundary.trim().is_empty()
+        || operator_report.rollout_annotation.trim().is_empty()
+        || operator_report.fallback_annotation.trim().is_empty()
+    {
+        return Err(
+            "operator report contract must keep boundary and annotations explicit".to_owned(),
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_transferability_rubric_is_actionable() -> Result<(), String> {
+    let criteria = load_contract()?;
+    let rubric = &criteria.transferability_rubric;
+
+    let actual_modes = rubric
+        .required_modes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_modes = REQUIRED_MODES.into_iter().collect::<BTreeSet<_>>();
+    if actual_modes != expected_modes {
+        return Err(format!(
+            "rubric modes mismatch actual={actual_modes:?} expected={expected_modes:?}"
+        ));
+    }
+
+    let actual_hardware_classes = rubric
+        .required_hardware_classes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_hardware_classes = REQUIRED_HARDWARE_CLASSES
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual_hardware_classes != expected_hardware_classes {
+        return Err(format!(
+            "rubric hardware classes mismatch actual={actual_hardware_classes:?} expected={expected_hardware_classes:?}"
+        ));
+    }
+
+    let actual_downstream_beads = rubric
+        .downstream_beads
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_downstream_beads = REQUIRED_DOWNSTREAM_BEADS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual_downstream_beads != expected_downstream_beads {
+        return Err(format!(
+            "rubric downstream bead mismatch actual={actual_downstream_beads:?} expected={expected_downstream_beads:?}"
+        ));
+    }
+
+    if rubric.single_writer_role != "comparison_or_fallback_only" {
+        return Err(format!(
+            "unexpected single_writer_role={}",
+            rubric.single_writer_role
+        ));
+    }
+
+    let ordered_classes = rubric
+        .classification_order
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if ordered_classes != REQUIRED_TRANSFERABILITY_CLASSES {
+        return Err(format!(
+            "rubric class order mismatch actual={ordered_classes:?} expected={REQUIRED_TRANSFERABILITY_CLASSES:?}"
+        ));
+    }
+
+    let actual_classes = rubric
+        .classes
+        .iter()
+        .map(|class| class.classification_id.as_str())
+        .collect::<Vec<_>>();
+    if actual_classes != REQUIRED_TRANSFERABILITY_CLASSES {
+        return Err(format!(
+            "rubric classes mismatch actual={actual_classes:?} expected={REQUIRED_TRANSFERABILITY_CLASSES:?}"
+        ));
+    }
+
+    let expected_report_labels = std::collections::BTreeMap::from([
+        ("transferable", "transferable win"),
+        ("profile_specific_but_useful", "lab-specific win"),
+        ("suspicious", "topology-sensitive win"),
+        ("non_claimable", "no-catastrophic-regression failure"),
+    ]);
+    let expected_minimum_hardware = std::collections::BTreeMap::from([
+        ("transferable", "same_topology_class"),
+        ("profile_specific_but_useful", "same_host"),
+        ("suspicious", "same_host"),
+        ("non_claimable", "same_host"),
+    ]);
+    let expected_claimability = std::collections::BTreeMap::from([
+        ("transferable", true),
+        ("profile_specific_but_useful", false),
+        ("suspicious", false),
+        ("non_claimable", false),
+    ]);
+    let expected_catastrophic_guard = std::collections::BTreeMap::from([
+        ("transferable", true),
+        ("profile_specific_but_useful", true),
+        ("suspicious", true),
+        ("non_claimable", false),
+    ]);
+    let mut covered_profiles = BTreeSet::new();
+    for class in &rubric.classes {
+        let class_id = class.classification_id.as_str();
+        let Some(expected_label) = expected_report_labels.get(class_id) else {
+            return Err(format!("unexpected class id={class_id}"));
+        };
+        if class.final_report_label != *expected_label {
+            return Err(format!(
+                "class={class_id} report label mismatch actual={} expected={expected_label}",
+                class.final_report_label
+            ));
+        }
+        let Some(expected_hardware) = expected_minimum_hardware.get(class_id) else {
+            return Err(format!("missing hardware expectation for class={class_id}"));
+        };
+        if class.minimum_hardware_evidence != *expected_hardware {
+            return Err(format!(
+                "class={class_id} hardware evidence mismatch actual={} expected={expected_hardware}",
+                class.minimum_hardware_evidence
+            ));
+        }
+        let Some(expected_claimable) = expected_claimability.get(class_id) else {
+            return Err(format!(
+                "missing claimability expectation for class={class_id}"
+            ));
+        };
+        if class.claimable != *expected_claimable {
+            return Err(format!(
+                "class={class_id} claimability mismatch actual={} expected={expected_claimable}",
+                class.claimable
+            ));
+        }
+        let Some(expected_guard) = expected_catastrophic_guard.get(class_id) else {
+            return Err(format!(
+                "missing catastrophic-guard expectation for class={class_id}"
+            ));
+        };
+        if class.requires_no_catastrophic_regression != *expected_guard {
+            return Err(format!(
+                "class={class_id} catastrophic guard mismatch actual={} expected={expected_guard}",
+                class.requires_no_catastrophic_regression
+            ));
+        }
+        if class.summary.trim().is_empty()
+            || class.placement_rule.trim().is_empty()
+            || class.mode_rule.trim().is_empty()
+            || class.hardware_rule.trim().is_empty()
+            || class.reporting_requirement.trim().is_empty()
+            || class.example.trim().is_empty()
+        {
+            return Err(format!("class={class_id} contains blank rubric prose"));
+        }
+        for profile in &class.example_profiles {
+            covered_profiles.insert(profile.as_str());
+        }
+    }
+
+    let expected_profiles = [
+        "baseline_unpinned",
+        "recommended_pinned",
+        "adversarial_cross_node",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if covered_profiles != expected_profiles {
+        return Err(format!(
+            "rubric profile coverage mismatch actual={covered_profiles:?} expected={expected_profiles:?}"
+        ));
+    }
+
+    Ok(())
+}

@@ -1,0 +1,23 @@
+[package]
+name = "optimize-params"
+version = "0.1.0"
+description = "CMA-ES hyperparameter optimizer for frankensearch fusion pipeline"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "optimize-params"
+path = "src/main.rs"
+
+[dependencies]
+frankensearch-core = { workspace = true }
+frankensearch-fusion = { workspace = true }
+fastcma = { path = "../../../fast_cmaes", default-features = false, features = ["test_utils"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

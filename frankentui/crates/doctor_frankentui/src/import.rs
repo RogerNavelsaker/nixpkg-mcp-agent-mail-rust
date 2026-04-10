@@ -1,0 +1,2015 @@
+use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::{collections::BTreeMap, collections::BTreeSet};
+
+use clap::Args;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+
+use crate::error::{DoctorError, Result};
+use crate::util::{
+    OutputIntegration, command_exists, ensure_dir, now_compact_timestamp, now_utc_iso, output_for,
+    write_string,
+};
+
+const DEFAULT_IMPORT_RUN_ROOT: &str = "/tmp/doctor_frankentui/import";
+const SNAPSHOT_DIR_NAME: &str = "snapshot";
+const GIT_CLONE_STAGING_DIR_NAME: &str = "_source_clone";
+const INTAKE_META_FILENAME: &str = "intake_meta.json";
+const LOCKFILE_NAMES: [&str; 6] = [
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "bun.lock",
+    "npm-shrinkwrap.json",
+];
+
+const STRICT_TSCONFIG_FLAGS: [(&str, &str); 13] = [
+    ("strict", "/compilerOptions/strict"),
+    ("noImplicitAny", "/compilerOptions/noImplicitAny"),
+    ("strictNullChecks", "/compilerOptions/strictNullChecks"),
+    (
+        "strictFunctionTypes",
+        "/compilerOptions/strictFunctionTypes",
+    ),
+    (
+        "strictBindCallApply",
+        "/compilerOptions/strictBindCallApply",
+    ),
+    (
+        "strictPropertyInitialization",
+        "/compilerOptions/strictPropertyInitialization",
+    ),
+    ("noImplicitThis", "/compilerOptions/noImplicitThis"),
+    ("alwaysStrict", "/compilerOptions/alwaysStrict"),
+    (
+        "noUncheckedIndexedAccess",
+        "/compilerOptions/noUncheckedIndexedAccess",
+    ),
+    (
+        "exactOptionalPropertyTypes",
+        "/compilerOptions/exactOptionalPropertyTypes",
+    ),
+    ("noImplicitOverride", "/compilerOptions/noImplicitOverride"),
+    (
+        "noPropertyAccessFromIndexSignature",
+        "/compilerOptions/noPropertyAccessFromIndexSignature",
+    ),
+    (
+        "useUnknownInCatchVariables",
+        "/compilerOptions/useUnknownInCatchVariables",
+    ),
+];
+
+#[derive(Debug, Clone, Args)]
+pub struct ImportArgs {
+    /// Local project path or Git URL to import.
+    #[arg(long)]
+    pub source: String,
+
+    /// Optional pinned commit for immutable snapshot materialization.
+    #[arg(long = "pinned-commit")]
+    pub pinned_commit: Option<String>,
+
+    /// Root directory where intake run artifacts are written.
+    #[arg(long = "run-root", default_value = DEFAULT_IMPORT_RUN_ROOT)]
+    pub run_root: PathBuf,
+
+    /// Stable run directory name for deterministic automation.
+    #[arg(long = "run-name")]
+    pub run_name: Option<String>,
+
+    /// Allow snapshots that do not look like OpenTUI/React projects.
+    #[arg(long)]
+    pub allow_non_opentui: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SourceKind {
+    LocalPath,
+    GitUrl,
+}
+
+impl SourceKind {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPath => "local_path",
+            Self::GitUrl => "git_url",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IntakeErrorClass {
+    Auth,
+    Network,
+    MissingFiles,
+    IncompatibleRepo,
+    Unknown,
+}
+
+impl IntakeErrorClass {
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Network => "network",
+            Self::MissingFiles => "missing_files",
+            Self::IncompatibleRepo => "incompatible_repo",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IntakeFailure {
+    class: IntakeErrorClass,
+    message: String,
+}
+
+impl IntakeFailure {
+    fn new(class: IntakeErrorClass, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+        }
+    }
+
+    fn into_doctor_error(self) -> DoctorError {
+        let code = match self.class {
+            IntakeErrorClass::Auth => 41,
+            IntakeErrorClass::Network => 42,
+            IntakeErrorClass::MissingFiles => 43,
+            IntakeErrorClass::IncompatibleRepo => 44,
+            IntakeErrorClass::Unknown => 45,
+        };
+        DoctorError::exit(
+            code,
+            format!(
+                "intake_failed class={} reason={}",
+                self.class.as_str(),
+                self.message
+            ),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LockfileFingerprint {
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ToolchainFingerprint {
+    package_manager: Option<String>,
+    package_manager_version: Option<String>,
+    package_manager_source: Option<String>,
+    workspace_markers: Vec<String>,
+    workspace_globs: Vec<String>,
+    node_version: Option<String>,
+    rust_toolchain: Option<String>,
+    typescript_version: Option<String>,
+    jsx_mode: Option<String>,
+    tsconfig_path_aliases: Vec<String>,
+    tsconfig_strict: Option<bool>,
+    tsconfig_strict_flags: BTreeMap<String, bool>,
+    bundler: Option<String>,
+    bundler_source: Option<String>,
+    runtime_env_markers: Vec<String>,
+    dynamic_import_detected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IntakeMetadata {
+    status: String,
+    started_at: String,
+    finished_at: Option<String>,
+    run_name: String,
+    source: String,
+    source_kind: String,
+    source_path: Option<String>,
+    git_url: Option<String>,
+    pinned_commit: Option<String>,
+    resolved_commit: Option<String>,
+    snapshot_dir: String,
+    source_hash: Option<String>,
+    lockfiles: Vec<LockfileFingerprint>,
+    toolchain: ToolchainFingerprint,
+    error_class: Option<IntakeErrorClass>,
+    error_message: Option<String>,
+}
+
+impl IntakeMetadata {
+    #[must_use]
+    fn new(
+        run_name: String,
+        source: String,
+        source_kind: SourceKind,
+        snapshot_dir: &Path,
+        pinned_commit: Option<String>,
+    ) -> Self {
+        Self {
+            status: "running".to_string(),
+            started_at: now_utc_iso(),
+            finished_at: None,
+            run_name,
+            source,
+            source_kind: source_kind.as_str().to_string(),
+            source_path: None,
+            git_url: None,
+            pinned_commit,
+            resolved_commit: None,
+            snapshot_dir: snapshot_dir.display().to_string(),
+            source_hash: None,
+            lockfiles: Vec::new(),
+            toolchain: ToolchainFingerprint::default(),
+            error_class: None,
+            error_message: None,
+        }
+    }
+}
+
+pub fn run_import(args: ImportArgs) -> Result<()> {
+    let integration = OutputIntegration::detect();
+    let ui = output_for(&integration);
+    let run_name = args
+        .run_name
+        .clone()
+        .unwrap_or_else(|| format!("intake_{}", now_compact_timestamp()));
+    let run_dir = args.run_root.join(&run_name);
+
+    if run_dir.exists() {
+        return Err(DoctorError::invalid(format!(
+            "run directory already exists: {}",
+            run_dir.display()
+        )));
+    }
+
+    let snapshot_dir = run_dir.join(SNAPSHOT_DIR_NAME);
+    ensure_dir(&snapshot_dir)?;
+
+    let source_kind = detect_source_kind(&args.source);
+    let mut metadata = IntakeMetadata::new(
+        run_name.clone(),
+        args.source.clone(),
+        source_kind,
+        &snapshot_dir,
+        args.pinned_commit.clone(),
+    );
+
+    match source_kind {
+        SourceKind::LocalPath => metadata.source_path = Some(args.source.clone()),
+        SourceKind::GitUrl => metadata.git_url = Some(args.source.clone()),
+    }
+
+    if !integration.should_emit_json() {
+        ui.rule(Some("doctor_frankentui plan|migrate"));
+        ui.info(&format!("source={}", args.source));
+        ui.info(&format!("source_kind={}", source_kind.as_str()));
+        ui.info(&format!("run_dir={}", run_dir.display()));
+    }
+
+    let outcome = perform_intake(&args, source_kind, &run_dir, &snapshot_dir, &mut metadata);
+    metadata.finished_at = Some(now_utc_iso());
+
+    let result = match outcome {
+        Ok(()) => {
+            metadata.status = "ok".to_string();
+            if !integration.should_emit_json() {
+                ui.success("intake snapshot created");
+                ui.success(&format!("snapshot={}", snapshot_dir.display()));
+            }
+            Ok(())
+        }
+        Err(failure) => {
+            metadata.status = "failed".to_string();
+            metadata.error_class = Some(failure.class);
+            metadata.error_message = Some(failure.message.clone());
+            if !integration.should_emit_json() {
+                ui.error(&failure.message);
+            }
+            Err(failure.into_doctor_error())
+        }
+    };
+
+    write_intake_metadata(&run_dir, &metadata)?;
+
+    if integration.should_emit_json() {
+        println!(
+            "{}",
+            json!({
+                "command": "import",
+                "status": metadata.status,
+                "run_name": metadata.run_name,
+                "run_dir": run_dir.display().to_string(),
+                "snapshot_dir": metadata.snapshot_dir,
+                "source_kind": metadata.source_kind,
+                "pinned_commit": metadata.pinned_commit,
+                "resolved_commit": metadata.resolved_commit,
+                "source_hash": metadata.source_hash,
+                "lockfile_count": metadata.lockfiles.len(),
+                "error_class": metadata.error_class,
+                "error_message": metadata.error_message,
+                "integration": integration,
+            })
+        );
+    }
+
+    result
+}
+
+fn perform_intake(
+    args: &ImportArgs,
+    source_kind: SourceKind,
+    run_dir: &Path,
+    snapshot_dir: &Path,
+    metadata: &mut IntakeMetadata,
+) -> std::result::Result<(), IntakeFailure> {
+    let resolved_commit = match source_kind {
+        SourceKind::LocalPath => intake_local_source(args, snapshot_dir)?,
+        SourceKind::GitUrl => intake_git_source(args, run_dir, snapshot_dir)?,
+    };
+    metadata.resolved_commit = resolved_commit;
+
+    if !args.allow_non_opentui {
+        validate_snapshot_shape(snapshot_dir)?;
+    }
+
+    metadata.lockfiles = collect_lockfile_fingerprints(snapshot_dir)?;
+    metadata.toolchain = detect_toolchain_fingerprint(snapshot_dir)?;
+    metadata.source_hash = Some(compute_directory_hash(snapshot_dir)?);
+    freeze_snapshot(snapshot_dir)?;
+
+    Ok(())
+}
+
+fn intake_local_source(
+    args: &ImportArgs,
+    snapshot_dir: &Path,
+) -> std::result::Result<Option<String>, IntakeFailure> {
+    let source_path = PathBuf::from(&args.source);
+
+    if !source_path.exists() {
+        return Err(IntakeFailure::new(
+            IntakeErrorClass::MissingFiles,
+            format!("source path does not exist: {}", source_path.display()),
+        ));
+    }
+    if !source_path.is_dir() {
+        return Err(IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            format!("source path is not a directory: {}", source_path.display()),
+        ));
+    }
+
+    let pinned_commit_requested = args.pinned_commit.is_some();
+    let has_git_marker = source_path.join(".git").exists() || pinned_commit_requested;
+    let is_git_work_tree = if has_git_marker {
+        if !command_exists("git") {
+            if pinned_commit_requested {
+                return Err(IntakeFailure::new(
+                    IntakeErrorClass::IncompatibleRepo,
+                    "required command missing: git",
+                ));
+            }
+            false
+        } else {
+            is_git_work_tree(&source_path)?
+        }
+    } else {
+        false
+    };
+
+    if pinned_commit_requested || is_git_work_tree {
+        ensure_required_command("git", IntakeErrorClass::IncompatibleRepo)?;
+        ensure_required_command("tar", IntakeErrorClass::IncompatibleRepo)?;
+
+        if !is_git_work_tree && pinned_commit_requested {
+            return Err(IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                "pinned commit requested for local source that is not a git work tree",
+            ));
+        }
+
+        let commit_ref = args.pinned_commit.as_deref().unwrap_or("HEAD");
+        let resolved_commit = resolve_git_commit(&source_path, commit_ref)?;
+        materialize_git_snapshot(&source_path, &resolved_commit, snapshot_dir)?;
+        return Ok(Some(resolved_commit));
+    }
+
+    copy_tree_snapshot(&source_path, snapshot_dir)?;
+    Ok(None)
+}
+
+fn intake_git_source(
+    args: &ImportArgs,
+    run_dir: &Path,
+    snapshot_dir: &Path,
+) -> std::result::Result<Option<String>, IntakeFailure> {
+    ensure_required_command("git", IntakeErrorClass::IncompatibleRepo)?;
+    ensure_required_command("tar", IntakeErrorClass::IncompatibleRepo)?;
+
+    let clone_dir = run_dir.join(GIT_CLONE_STAGING_DIR_NAME);
+    ensure_dir(&clone_dir).map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::Unknown,
+            format!("unable to create clone staging dir: {error}"),
+        )
+    })?;
+
+    let mut clone = Command::new("git");
+    clone
+        .arg("clone")
+        .arg("--no-checkout")
+        .arg("--filter=blob:none")
+        .arg(&args.source)
+        .arg(&clone_dir);
+    run_git_command_with_classification(clone, "git clone", IntakeErrorClass::Network)?;
+
+    let commit_ref = args.pinned_commit.as_deref().unwrap_or("HEAD");
+    let resolved_commit = resolve_git_commit(&clone_dir, commit_ref)?;
+    materialize_git_snapshot(&clone_dir, &resolved_commit, snapshot_dir)?;
+    Ok(Some(resolved_commit))
+}
+
+fn resolve_git_commit(
+    repo_dir: &Path,
+    reference: &str,
+) -> std::result::Result<String, IntakeFailure> {
+    let mut rev_parse = Command::new("git");
+    rev_parse
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg(format!("{reference}^{{commit}}"));
+    let output = run_git_command_with_classification(
+        rev_parse,
+        "git rev-parse --verify",
+        IntakeErrorClass::MissingFiles,
+    )?;
+
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if commit.is_empty() {
+        return Err(IntakeFailure::new(
+            IntakeErrorClass::MissingFiles,
+            "resolved commit is empty",
+        ));
+    }
+    Ok(commit)
+}
+
+fn materialize_git_snapshot(
+    repo_dir: &Path,
+    commit: &str,
+    snapshot_dir: &Path,
+) -> std::result::Result<(), IntakeFailure> {
+    let mut git_archive = Command::new("git");
+    git_archive
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("archive")
+        .arg("--format=tar")
+        .arg(commit)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut git_child = git_archive.spawn().map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::Unknown,
+            format!("failed to spawn git archive: {error}"),
+        )
+    })?;
+
+    let git_stdout = git_child.stdout.take().ok_or_else(|| {
+        IntakeFailure::new(
+            IntakeErrorClass::Unknown,
+            "git archive did not expose stdout for tar pipeline",
+        )
+    })?;
+
+    let tar_output = Command::new("tar")
+        .arg("-xf")
+        .arg("-")
+        .arg("-C")
+        .arg(snapshot_dir)
+        .stdin(Stdio::from(git_stdout))
+        .output()
+        .map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("failed to execute tar extraction: {error}"),
+            )
+        })?;
+
+    let git_output = git_child.wait_with_output().map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::Unknown,
+            format!("failed to wait for git archive completion: {error}"),
+        )
+    })?;
+
+    if !git_output.status.success() {
+        let stderr = String::from_utf8_lossy(&git_output.stderr).to_string();
+        return Err(IntakeFailure::new(
+            classify_git_stderr(&stderr),
+            format!(
+                "git archive failed for commit {commit}: {}",
+                normalize_stderr(&stderr)
+            ),
+        ));
+    }
+
+    if !tar_output.status.success() {
+        let stderr = String::from_utf8_lossy(&tar_output.stderr).to_string();
+        return Err(IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            format!(
+                "tar extraction failed for commit {commit}: {}",
+                normalize_stderr(&stderr)
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn write_intake_metadata(run_dir: &Path, metadata: &IntakeMetadata) -> Result<()> {
+    let path = run_dir.join(INTAKE_META_FILENAME);
+    let content = serde_json::to_string_pretty(metadata)?;
+    write_string(&path, &content)
+}
+
+fn validate_snapshot_shape(snapshot_dir: &Path) -> std::result::Result<(), IntakeFailure> {
+    let package_json = snapshot_dir.join("package.json");
+    if !package_json.exists() {
+        return Err(IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            "snapshot does not contain package.json",
+        ));
+    }
+
+    let package_content = fs::read_to_string(&package_json).map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            format!("unable to read package.json: {error}"),
+        )
+    })?;
+
+    let package_json_value =
+        serde_json::from_str::<serde_json::Value>(&package_content).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                format!("package.json is not valid JSON: {error}"),
+            )
+        })?;
+
+    if !package_json_value.is_object() {
+        return Err(IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            "package.json root value must be an object",
+        ));
+    }
+
+    Ok(())
+}
+
+fn detect_toolchain_fingerprint(
+    snapshot_dir: &Path,
+) -> std::result::Result<ToolchainFingerprint, IntakeFailure> {
+    let mut fingerprint = ToolchainFingerprint::default();
+    let mut package_json_value: Option<serde_json::Value> = None;
+
+    let package_json_path = snapshot_dir.join("package.json");
+    if package_json_path.exists() {
+        let package_json = fs::read_to_string(&package_json_path).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                format!("unable to read package.json: {error}"),
+            )
+        })?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&package_json).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                format!("unable to parse package.json: {error}"),
+            )
+        })?;
+        package_json_value = Some(parsed.clone());
+
+        if let Some(raw_package_manager) = parsed
+            .get("packageManager")
+            .and_then(serde_json::Value::as_str)
+        {
+            let (manager, version) = parse_package_manager_field(raw_package_manager);
+            fingerprint.package_manager = manager;
+            fingerprint.package_manager_version = version;
+            fingerprint.package_manager_source = Some("package.json#packageManager".to_string());
+        }
+
+        if let Some(node_version) = parsed
+            .pointer("/engines/node")
+            .and_then(serde_json::Value::as_str)
+            .map(std::string::ToString::to_string)
+        {
+            fingerprint.node_version = Some(node_version);
+        }
+
+        let typescript_version = parsed
+            .pointer("/devDependencies/typescript")
+            .or_else(|| parsed.pointer("/dependencies/typescript"))
+            .and_then(serde_json::Value::as_str)
+            .map(std::string::ToString::to_string);
+        fingerprint.typescript_version = typescript_version;
+    }
+
+    let (workspace_markers, workspace_globs) =
+        detect_workspace_context(snapshot_dir, package_json_value.as_ref())?;
+    fingerprint.workspace_markers = workspace_markers;
+    fingerprint.workspace_globs = workspace_globs;
+
+    if fingerprint.node_version.is_none() {
+        let nvmrc = read_first_nonempty_line(&snapshot_dir.join(".nvmrc"))?;
+        let node_version = nvmrc.or_else(|| {
+            read_first_nonempty_line(&snapshot_dir.join(".node-version"))
+                .ok()
+                .flatten()
+        });
+        fingerprint.node_version = node_version;
+    }
+
+    if fingerprint.package_manager.is_none() {
+        let package_manager = infer_package_manager_from_lockfiles(snapshot_dir);
+        if let Some((manager, source)) = package_manager {
+            fingerprint.package_manager = Some(manager);
+            fingerprint.package_manager_source = Some(source);
+        }
+    }
+
+    if let Some(rust_toolchain) = read_rust_toolchain(snapshot_dir)? {
+        fingerprint.rust_toolchain = Some(rust_toolchain);
+    }
+
+    let tsconfig_values = parse_tsconfig_values(snapshot_dir)?;
+    if !tsconfig_values.is_empty() {
+        fingerprint.jsx_mode = first_tsconfig_string(&tsconfig_values, "/compilerOptions/jsx");
+        fingerprint.tsconfig_strict =
+            first_tsconfig_bool(&tsconfig_values, "/compilerOptions/strict");
+        fingerprint.tsconfig_path_aliases = collect_tsconfig_path_aliases(&tsconfig_values);
+        fingerprint.tsconfig_strict_flags = collect_tsconfig_strict_flags(&tsconfig_values);
+    }
+
+    let (bundler, bundler_source) =
+        detect_bundler_assumption(snapshot_dir, package_json_value.as_ref());
+    fingerprint.bundler = bundler;
+    fingerprint.bundler_source = bundler_source;
+
+    let (runtime_env_markers, dynamic_import_detected) =
+        detect_runtime_context(snapshot_dir, fingerprint.bundler.as_deref())?;
+    fingerprint.runtime_env_markers = runtime_env_markers;
+    fingerprint.dynamic_import_detected = dynamic_import_detected;
+
+    Ok(fingerprint)
+}
+
+fn detect_workspace_context(
+    snapshot_dir: &Path,
+    package_json: Option<&serde_json::Value>,
+) -> std::result::Result<(Vec<String>, Vec<String>), IntakeFailure> {
+    let mut markers = BTreeSet::new();
+    let mut globs = BTreeSet::new();
+
+    if let Some(parsed) = package_json
+        && let Some(workspaces) = parsed.get("workspaces")
+    {
+        markers.insert("package.json#workspaces".to_string());
+        collect_workspace_globs(workspaces, &mut globs);
+    }
+
+    let pnpm_workspace_path = snapshot_dir.join("pnpm-workspace.yaml");
+    if pnpm_workspace_path.exists() {
+        markers.insert("pnpm-workspace.yaml".to_string());
+        for glob in parse_pnpm_workspace_globs(&pnpm_workspace_path)? {
+            globs.insert(glob);
+        }
+    }
+
+    for marker in ["lerna.json", "turbo.json", "nx.json"] {
+        if snapshot_dir.join(marker).exists() {
+            markers.insert(marker.to_string());
+        }
+    }
+
+    Ok((
+        markers.into_iter().collect::<Vec<_>>(),
+        globs.into_iter().collect::<Vec<_>>(),
+    ))
+}
+
+fn collect_workspace_globs(value: &serde_json::Value, globs: &mut BTreeSet<String>) {
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(glob) = item.as_str() {
+                insert_workspace_glob(glob, globs);
+            }
+        }
+        return;
+    }
+
+    if let Some(packages) = value.get("packages").and_then(serde_json::Value::as_array) {
+        for item in packages {
+            if let Some(glob) = item.as_str() {
+                insert_workspace_glob(glob, globs);
+            }
+        }
+    }
+}
+
+fn insert_workspace_glob(glob: &str, globs: &mut BTreeSet<String>) {
+    let trimmed = glob.trim();
+    if !trimmed.is_empty() {
+        globs.insert(trimmed.to_string());
+    }
+}
+
+fn parse_pnpm_workspace_globs(path: &Path) -> std::result::Result<Vec<String>, IntakeFailure> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            format!("unable to read {}: {error}", path.display()),
+        )
+    })?;
+
+    let mut packages = BTreeSet::new();
+    let mut in_packages = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        if !in_packages {
+            if trimmed.starts_with("packages:") {
+                in_packages = true;
+            }
+            continue;
+        }
+
+        if !line.starts_with(' ') && !line.starts_with('\t') && !trimmed.starts_with('-') {
+            in_packages = false;
+            continue;
+        }
+
+        if !trimmed.starts_with('-') {
+            continue;
+        }
+
+        let candidate = trimmed
+            .trim_start_matches('-')
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        insert_workspace_glob(candidate, &mut packages);
+    }
+
+    Ok(packages.into_iter().collect())
+}
+
+fn parse_tsconfig_values(
+    snapshot_dir: &Path,
+) -> std::result::Result<Vec<serde_json::Value>, IntakeFailure> {
+    let mut values = Vec::new();
+    for filename in ["tsconfig.json", "tsconfig.base.json"] {
+        let path = snapshot_dir.join(filename);
+        if !path.exists() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&path).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                format!("unable to read {filename}: {error}"),
+            )
+        })?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                format!("unable to parse {filename}: {error}"),
+            )
+        })?;
+        values.push(parsed);
+    }
+    Ok(values)
+}
+
+fn first_tsconfig_string(tsconfig_values: &[serde_json::Value], pointer: &str) -> Option<String> {
+    tsconfig_values.iter().find_map(|value| {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(std::string::ToString::to_string)
+    })
+}
+
+fn first_tsconfig_bool(tsconfig_values: &[serde_json::Value], pointer: &str) -> Option<bool> {
+    tsconfig_values
+        .iter()
+        .find_map(|value| value.pointer(pointer).and_then(serde_json::Value::as_bool))
+}
+
+fn collect_tsconfig_path_aliases(tsconfig_values: &[serde_json::Value]) -> Vec<String> {
+    let mut aliases = BTreeSet::new();
+    for value in tsconfig_values {
+        let Some(paths) = value
+            .pointer("/compilerOptions/paths")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for alias in paths.keys() {
+            let trimmed = alias.trim();
+            if !trimmed.is_empty() {
+                aliases.insert(trimmed.to_string());
+            }
+        }
+    }
+    aliases.into_iter().collect()
+}
+
+fn collect_tsconfig_strict_flags(tsconfig_values: &[serde_json::Value]) -> BTreeMap<String, bool> {
+    let mut flags = BTreeMap::new();
+    for (flag_name, pointer) in STRICT_TSCONFIG_FLAGS {
+        if let Some(value) = first_tsconfig_bool(tsconfig_values, pointer) {
+            flags.insert(flag_name.to_string(), value);
+        }
+    }
+    flags
+}
+
+fn detect_bundler_assumption(
+    snapshot_dir: &Path,
+    package_json: Option<&serde_json::Value>,
+) -> (Option<String>, Option<String>) {
+    #[allow(clippy::type_complexity)]
+    const BUNDLER_HEURISTICS: [(&str, &[&str], &[&str], &[&str]); 11] = [
+        (
+            "next",
+            &["next.config.js", "next.config.mjs", "next.config.ts"],
+            &["next"],
+            &["next"],
+        ),
+        (
+            "vite",
+            &[
+                "vite.config.ts",
+                "vite.config.js",
+                "vite.config.mjs",
+                "vite.config.cjs",
+            ],
+            &["vite"],
+            &["vite"],
+        ),
+        (
+            "sveltekit",
+            &["svelte.config.js", "svelte.config.ts"],
+            &["@sveltejs/kit"],
+            &["svelte-kit"],
+        ),
+        (
+            "astro",
+            &["astro.config.mjs", "astro.config.ts", "astro.config.js"],
+            &["astro"],
+            &["astro"],
+        ),
+        (
+            "remix",
+            &["remix.config.js", "remix.config.ts", "remix.config.mjs"],
+            &["@remix-run/dev"],
+            &["remix"],
+        ),
+        (
+            "webpack",
+            &[
+                "webpack.config.js",
+                "webpack.config.ts",
+                "webpack.config.mjs",
+                "webpack.config.cjs",
+            ],
+            &["webpack"],
+            &["webpack"],
+        ),
+        (
+            "rspack",
+            &[
+                "rspack.config.js",
+                "rspack.config.ts",
+                "rspack.config.mjs",
+                "rspack.config.cjs",
+            ],
+            &["rspack", "@rspack/core"],
+            &["rspack"],
+        ),
+        (
+            "rollup",
+            &[
+                "rollup.config.js",
+                "rollup.config.ts",
+                "rollup.config.mjs",
+                "rollup.config.cjs",
+            ],
+            &["rollup"],
+            &["rollup"],
+        ),
+        ("parcel", &[".parcelrc"], &["parcel"], &["parcel"]),
+        ("esbuild", &[], &["esbuild"], &["esbuild"]),
+        ("bun", &["bunfig.toml"], &["bun"], &["bun"]),
+    ];
+
+    for (bundler, config_files, deps, script_tokens) in BUNDLER_HEURISTICS {
+        let mut evidence = BTreeSet::new();
+
+        for config in config_files {
+            if snapshot_dir.join(config).exists() {
+                evidence.insert(format!("config:{config}"));
+            }
+        }
+
+        if let Some(parsed) = package_json {
+            for dep in deps {
+                if package_json_has_dependency(parsed, dep) {
+                    evidence.insert(format!("dependency:{dep}"));
+                }
+            }
+            for token in script_tokens {
+                if package_json_script_contains(parsed, token) {
+                    evidence.insert(format!("script:{token}"));
+                }
+            }
+        }
+
+        if !evidence.is_empty() {
+            let source = evidence.into_iter().collect::<Vec<_>>().join(",");
+            return (Some(bundler.to_string()), Some(source));
+        }
+    }
+
+    (None, None)
+}
+
+fn package_json_has_dependency(parsed: &serde_json::Value, dep_name: &str) -> bool {
+    [
+        "/dependencies",
+        "/devDependencies",
+        "/peerDependencies",
+        "/optionalDependencies",
+    ]
+    .iter()
+    .any(|pointer| {
+        parsed
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|deps| deps.contains_key(dep_name))
+    })
+}
+
+fn package_json_script_contains(parsed: &serde_json::Value, token: &str) -> bool {
+    let token = token.to_ascii_lowercase();
+    parsed
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            scripts.values().any(|value| {
+                value
+                    .as_str()
+                    .is_some_and(|script| script.to_ascii_lowercase().contains(token.as_str()))
+            })
+        })
+}
+
+fn detect_runtime_context(
+    snapshot_dir: &Path,
+    bundler: Option<&str>,
+) -> std::result::Result<(Vec<String>, bool), IntakeFailure> {
+    let files = collect_files(snapshot_dir)?;
+    let mut runtime_markers = BTreeSet::new();
+    let mut dynamic_import_detected = false;
+
+    for file in files {
+        if !is_js_ts_source_file(&file) {
+            continue;
+        }
+
+        let content_bytes = fs::read(&file).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to read source file {}: {error}", file.display()),
+            )
+        })?;
+        let content = String::from_utf8_lossy(&content_bytes);
+
+        if content.contains("import(") || content.contains("import (") {
+            dynamic_import_detected = true;
+        }
+        if content.contains("import.meta.env") {
+            runtime_markers.insert("import.meta.env".to_string());
+        }
+        if content.contains("process.env") {
+            runtime_markers.insert("process.env".to_string());
+        }
+        if content.contains("Bun.env") {
+            runtime_markers.insert("Bun.env".to_string());
+        }
+    }
+
+    if let Some(inferred_marker) = inferred_runtime_marker_for_bundler(bundler) {
+        runtime_markers.insert(inferred_marker.to_string());
+    }
+
+    Ok((
+        runtime_markers.into_iter().collect::<Vec<_>>(),
+        dynamic_import_detected,
+    ))
+}
+
+fn inferred_runtime_marker_for_bundler(bundler: Option<&str>) -> Option<&'static str> {
+    match bundler {
+        Some("vite" | "sveltekit" | "astro") => Some("import.meta.env"),
+        Some("bun") => Some("Bun.env"),
+        Some(_) => Some("process.env"),
+        None => None,
+    }
+}
+
+fn is_js_ts_source_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            matches!(
+                extension,
+                "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts"
+            )
+        })
+}
+
+fn parse_package_manager_field(value: &str) -> (Option<String>, Option<String>) {
+    if let Some((manager, version)) = value.rsplit_once('@') {
+        if manager.is_empty() {
+            (Some(value.to_string()), None)
+        } else {
+            (Some(manager.to_string()), Some(version.to_string()))
+        }
+    } else {
+        (Some(value.to_string()), None)
+    }
+}
+
+fn infer_package_manager_from_lockfiles(snapshot_dir: &Path) -> Option<(String, String)> {
+    for (filename, manager) in [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("package-lock.json", "npm"),
+        ("npm-shrinkwrap.json", "npm"),
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+    ] {
+        if snapshot_dir.join(filename).exists() {
+            return Some((manager.to_string(), format!("lockfile:{filename}")));
+        }
+    }
+    None
+}
+
+fn read_rust_toolchain(snapshot_dir: &Path) -> std::result::Result<Option<String>, IntakeFailure> {
+    for filename in ["rust-toolchain.toml", "rust-toolchain"] {
+        let path = snapshot_dir.join(filename);
+        if !path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::IncompatibleRepo,
+                format!("unable to read {filename}: {error}"),
+            )
+        })?;
+        if filename == "rust-toolchain.toml" {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("channel")
+                    && let Some((_, raw_value)) = rest.split_once('=')
+                {
+                    let value = raw_value.trim().trim_matches('"');
+                    if !value.is_empty() {
+                        return Ok(Some(value.to_string()));
+                    }
+                }
+            }
+            continue;
+        }
+
+        if let Some(value) = content
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(std::string::ToString::to_string)
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_first_nonempty_line(path: &Path) -> std::result::Result<Option<String>, IntakeFailure> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path).map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::IncompatibleRepo,
+            format!("unable to read {}: {error}", path.display()),
+        )
+    })?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(std::string::ToString::to_string))
+}
+
+fn collect_lockfile_fingerprints(
+    snapshot_dir: &Path,
+) -> std::result::Result<Vec<LockfileFingerprint>, IntakeFailure> {
+    let files = collect_files(snapshot_dir)?;
+    let mut fingerprints = Vec::new();
+    for file in files {
+        let Some(name) = file.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !LOCKFILE_NAMES.contains(&name) {
+            continue;
+        }
+        let relative_path = file.strip_prefix(snapshot_dir).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to compute lockfile relative path: {error}"),
+            )
+        })?;
+        let hash = sha256_file(&file)?;
+        let size_bytes = fs::metadata(&file).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to inspect lockfile metadata: {error}"),
+            )
+        })?;
+        fingerprints.push(LockfileFingerprint {
+            path: relative_path.display().to_string(),
+            sha256: hash,
+            size_bytes: size_bytes.len(),
+        });
+    }
+    fingerprints.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(fingerprints)
+}
+
+fn compute_directory_hash(snapshot_dir: &Path) -> std::result::Result<String, IntakeFailure> {
+    let files = collect_files(snapshot_dir)?;
+    let mut hasher = Sha256::new();
+
+    for file in files {
+        let relative = file.strip_prefix(snapshot_dir).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to compute relative path for source hash: {error}"),
+            )
+        })?;
+        hasher.update(relative.display().to_string().as_bytes());
+        hasher.update([0_u8]);
+
+        let mut input = File::open(&file).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to open file for hashing: {error}"),
+            )
+        })?;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = input.read(&mut buffer).map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!("unable to read file for hashing: {error}"),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        hasher.update([0_u8]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_files(root: &Path) -> std::result::Result<Vec<PathBuf>, IntakeFailure> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to enumerate directory {}: {error}", dir.display()),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!("unable to read directory entry: {error}"),
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!("unable to read file type for {}: {error}", path.display()),
+                )
+            })?;
+
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn freeze_snapshot(snapshot_dir: &Path) -> std::result::Result<(), IntakeFailure> {
+    let mut paths = Vec::new();
+    let mut stack = vec![snapshot_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        paths.push(dir.clone());
+        let entries = fs::read_dir(&dir).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!(
+                    "unable to enumerate snapshot directory {}: {error}",
+                    dir.display()
+                ),
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!("unable to read snapshot entry: {error}"),
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!(
+                        "unable to read snapshot entry type for {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            if file_type.is_dir() {
+                stack.push(path.clone());
+            }
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!(
+                    "unable to inspect permissions for {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!(
+                    "unable to set readonly permissions for {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn copy_tree_snapshot(
+    source_dir: &Path,
+    snapshot_dir: &Path,
+) -> std::result::Result<(), IntakeFailure> {
+    let mut stack = vec![source_dir.to_path_buf()];
+    while let Some(current_dir) = stack.pop() {
+        let entries = fs::read_dir(&current_dir).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!(
+                    "unable to read source directory {}: {error}",
+                    current_dir.display()
+                ),
+            )
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!("unable to read source directory entry: {error}"),
+                )
+            })?;
+            let source_path = entry.path();
+            let relative = source_path.strip_prefix(source_dir).map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!("unable to compute source relative path: {error}"),
+                )
+            })?;
+
+            if should_skip_path(relative) {
+                continue;
+            }
+
+            let target_path = snapshot_dir.join(relative);
+            let file_type = entry.file_type().map_err(|error| {
+                IntakeFailure::new(
+                    IntakeErrorClass::Unknown,
+                    format!(
+                        "unable to determine source entry type for {}: {error}",
+                        source_path.display()
+                    ),
+                )
+            })?;
+
+            if file_type.is_dir() {
+                ensure_dir(&target_path).map_err(|error| {
+                    IntakeFailure::new(
+                        IntakeErrorClass::Unknown,
+                        format!(
+                            "unable to create snapshot directory {}: {error}",
+                            target_path.display()
+                        ),
+                    )
+                })?;
+                stack.push(source_path);
+                continue;
+            }
+
+            if file_type.is_file() {
+                if let Some(parent) = target_path.parent() {
+                    ensure_dir(parent).map_err(|error| {
+                        IntakeFailure::new(
+                            IntakeErrorClass::Unknown,
+                            format!(
+                                "unable to create snapshot parent {}: {error}",
+                                parent.display()
+                            ),
+                        )
+                    })?;
+                }
+                fs::copy(&source_path, &target_path).map_err(|error| {
+                    IntakeFailure::new(
+                        IntakeErrorClass::Unknown,
+                        format!(
+                            "unable to copy {} to snapshot: {error}",
+                            source_path.display()
+                        ),
+                    )
+                })?;
+                continue;
+            }
+
+            #[cfg(unix)]
+            if file_type.is_symlink() {
+                use std::os::unix::fs::symlink;
+
+                let link_target = fs::read_link(&source_path).map_err(|error| {
+                    IntakeFailure::new(
+                        IntakeErrorClass::Unknown,
+                        format!(
+                            "unable to read symlink target for {}: {error}",
+                            source_path.display()
+                        ),
+                    )
+                })?;
+
+                if let Some(parent) = target_path.parent() {
+                    ensure_dir(parent).map_err(|error| {
+                        IntakeFailure::new(
+                            IntakeErrorClass::Unknown,
+                            format!(
+                                "unable to create symlink parent directory {}: {error}",
+                                parent.display()
+                            ),
+                        )
+                    })?;
+                }
+                symlink(&link_target, &target_path).map_err(|error| {
+                    IntakeFailure::new(
+                        IntakeErrorClass::Unknown,
+                        format!(
+                            "unable to create snapshot symlink {}: {error}",
+                            target_path.display()
+                        ),
+                    )
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_path(relative: &Path) -> bool {
+    relative.components().any(|component| {
+        if let Component::Normal(name) = component {
+            name == OsStr::new(".git") || name == OsStr::new("node_modules")
+        } else {
+            false
+        }
+    })
+}
+
+fn sha256_file(path: &Path) -> std::result::Result<String, IntakeFailure> {
+    let mut input = File::open(path).map_err(|error| {
+        IntakeFailure::new(
+            IntakeErrorClass::Unknown,
+            format!("unable to open {} for hashing: {error}", path.display()),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = input.read(&mut buffer).map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to read {} for hashing: {error}", path.display()),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn ensure_required_command(
+    command: &str,
+    missing_class: IntakeErrorClass,
+) -> std::result::Result<(), IntakeFailure> {
+    if command_exists(command) {
+        Ok(())
+    } else {
+        Err(IntakeFailure::new(
+            missing_class,
+            format!("required command missing: {command}"),
+        ))
+    }
+}
+
+fn is_git_work_tree(path: &Path) -> std::result::Result<bool, IntakeFailure> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map_err(|error| {
+            IntakeFailure::new(
+                IntakeErrorClass::Unknown,
+                format!("unable to determine git work tree status: {error}"),
+            )
+        })?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+fn run_git_command_with_classification(
+    mut command: Command,
+    label: &str,
+    fallback_class: IntakeErrorClass,
+) -> std::result::Result<std::process::Output, IntakeFailure> {
+    let output = command.output().map_err(|error| {
+        IntakeFailure::new(
+            fallback_class,
+            format!("unable to execute {label}: {error}"),
+        )
+    })?;
+
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let class = classify_git_stderr(&stderr);
+    let class = if class == IntakeErrorClass::Unknown {
+        fallback_class
+    } else {
+        class
+    };
+
+    Err(IntakeFailure::new(
+        class,
+        format!("{label} failed: {}", normalize_stderr(&stderr)),
+    ))
+}
+
+fn detect_source_kind(source: &str) -> SourceKind {
+    let candidate = Path::new(source);
+    if looks_like_git_url(source) && !candidate.exists() {
+        SourceKind::GitUrl
+    } else {
+        SourceKind::LocalPath
+    }
+}
+
+fn looks_like_git_url(source: &str) -> bool {
+    let trimmed = source.trim();
+    trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("ssh://")
+        || trimmed.starts_with("git@")
+        || trimmed.starts_with("file://")
+        || trimmed.ends_with(".git")
+}
+
+fn classify_git_stderr(stderr: &str) -> IntakeErrorClass {
+    let lower = stderr.to_lowercase();
+
+    let auth_patterns = [
+        "authentication failed",
+        "permission denied",
+        "could not read from remote repository",
+        "access denied",
+        "fatal: repository",
+    ];
+    if auth_patterns.iter().any(|pattern| lower.contains(pattern)) {
+        return IntakeErrorClass::Auth;
+    }
+
+    let network_patterns = [
+        "could not resolve host",
+        "failed to connect",
+        "connection timed out",
+        "network is unreachable",
+        "operation timed out",
+        "tls",
+        "proxy",
+    ];
+    if network_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return IntakeErrorClass::Network;
+    }
+
+    let missing_patterns = [
+        "unknown revision",
+        "bad object",
+        "did not match any file",
+        "no such file or directory",
+    ];
+    if missing_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return IntakeErrorClass::MissingFiles;
+    }
+
+    let incompatible_patterns = [
+        "not a git repository",
+        "does not appear to be a git repository",
+        "invalid path",
+        "unsupported repository format",
+    ];
+    if incompatible_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return IntakeErrorClass::IncompatibleRepo;
+    }
+
+    IntakeErrorClass::Unknown
+}
+
+fn normalize_stderr(stderr: &str) -> String {
+    let normalized = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if normalized.is_empty() {
+        "no stderr output".to_string()
+    } else {
+        normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use super::{
+        ImportArgs, IntakeErrorClass, classify_git_stderr, detect_source_kind,
+        parse_package_manager_field, run_import,
+    };
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git command failed: {:?}", args);
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git output");
+        assert!(output.status.success(), "git command failed: {:?}", args);
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn create_git_repo(root: &Path) -> (String, String) {
+        fs::create_dir_all(root).expect("create repo root");
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.name", "Doctor Test"]);
+        run_git(root, &["config", "user.email", "doctor@test.invalid"]);
+
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"fixture","packageManager":"pnpm@9.1.0","engines":{"node":">=20"}}"#,
+        )
+        .expect("write package json");
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src/main.tsx"), "export const version = 'one';\n")
+            .expect("write main file");
+        fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").expect("write lockfile");
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "first"]);
+        let first = git_stdout(root, &["rev-parse", "HEAD"]);
+
+        fs::write(root.join("src/main.tsx"), "export const version = 'two';\n")
+            .expect("write second main file");
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "second"]);
+        let second = git_stdout(root, &["rev-parse", "HEAD"]);
+
+        (first, second)
+    }
+
+    #[test]
+    fn detect_source_kind_prefers_existing_paths() {
+        let temp = tempdir().expect("tempdir");
+        let local = temp.path().join("source");
+        fs::create_dir_all(&local).expect("create source dir");
+
+        assert_eq!(
+            detect_source_kind(local.to_str().expect("source str")),
+            super::SourceKind::LocalPath
+        );
+        assert_eq!(
+            detect_source_kind("https://github.com/example/repo.git"),
+            super::SourceKind::GitUrl
+        );
+    }
+
+    #[test]
+    fn classify_git_stderr_maps_known_error_shapes() {
+        assert_eq!(
+            classify_git_stderr("fatal: Authentication failed for 'https://example'"),
+            IntakeErrorClass::Auth
+        );
+        assert_eq!(
+            classify_git_stderr("fatal: Could not resolve host: github.com"),
+            IntakeErrorClass::Network
+        );
+        assert_eq!(
+            classify_git_stderr("fatal: unknown revision or path not in the working tree"),
+            IntakeErrorClass::MissingFiles
+        );
+        assert_eq!(
+            classify_git_stderr("fatal: not a git repository"),
+            IntakeErrorClass::IncompatibleRepo
+        );
+    }
+
+    #[test]
+    fn parse_package_manager_field_extracts_name_and_version() {
+        let (manager, version) = parse_package_manager_field("pnpm@9.1.0");
+        assert_eq!(manager.as_deref(), Some("pnpm"));
+        assert_eq!(version.as_deref(), Some("9.1.0"));
+
+        let (manager_only, version_none) = parse_package_manager_field("yarn");
+        assert_eq!(manager_only.as_deref(), Some("yarn"));
+        assert_eq!(version_none, None);
+    }
+
+    #[test]
+    fn run_import_local_git_repo_honors_pinned_commit_and_writes_metadata() {
+        if !super::command_exists("git") || !super::command_exists("tar") {
+            return;
+        }
+
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let (first_commit, _second_commit) = create_git_repo(&source);
+        let run_root = temp.path().join("runs");
+
+        let args = ImportArgs {
+            source: source.display().to_string(),
+            pinned_commit: Some(first_commit.clone()),
+            run_root: run_root.clone(),
+            run_name: Some("pinned".to_string()),
+            allow_non_opentui: false,
+        };
+
+        run_import(args).expect("import should succeed");
+
+        let snapshot_main = run_root.join("pinned/snapshot/src/main.tsx");
+        let snapshot_text = fs::read_to_string(&snapshot_main).expect("read snapshot main");
+        assert!(
+            snapshot_text.contains("version = 'one'"),
+            "snapshot must use pinned commit content"
+        );
+
+        let intake_meta_path = run_root.join("pinned/intake_meta.json");
+        let intake_meta_text = fs::read_to_string(&intake_meta_path).expect("read intake metadata");
+        let intake_meta: Value =
+            serde_json::from_str(&intake_meta_text).expect("parse intake metadata");
+
+        assert_eq!(intake_meta["status"], "ok");
+        assert_eq!(intake_meta["resolved_commit"], first_commit);
+        assert!(
+            intake_meta["source_hash"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            intake_meta["lockfiles"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+        );
+        assert_eq!(
+            intake_meta["toolchain"]["package_manager"],
+            Value::String("pnpm".to_string())
+        );
+    }
+
+    #[test]
+    fn run_import_missing_source_classifies_failure_and_writes_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let run_root = temp.path().join("runs");
+        let missing = temp.path().join("missing-source");
+
+        let args = ImportArgs {
+            source: missing.display().to_string(),
+            pinned_commit: None,
+            run_root: run_root.clone(),
+            run_name: Some("missing".to_string()),
+            allow_non_opentui: false,
+        };
+
+        let error = run_import(args).expect_err("missing source should fail");
+        assert!(
+            error.to_string().contains("class=missing_files"),
+            "unexpected error message: {error}"
+        );
+
+        let intake_meta_path = run_root.join("missing/intake_meta.json");
+        let intake_meta_text = fs::read_to_string(&intake_meta_path).expect("read intake metadata");
+        let intake_meta: Value =
+            serde_json::from_str(&intake_meta_text).expect("parse intake metadata");
+        assert_eq!(intake_meta["status"], "failed");
+        assert_eq!(
+            intake_meta["error_class"],
+            Value::String("missing_files".to_string())
+        );
+    }
+
+    #[test]
+    fn run_import_rejects_preexisting_run_directory() {
+        let temp = tempdir().expect("tempdir");
+        let run_root = temp.path().join("runs");
+        let run_dir = run_root.join("existing");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let args = ImportArgs {
+            source: temp.path().display().to_string(),
+            pinned_commit: None,
+            run_root: run_root.clone(),
+            run_name: Some("existing".to_string()),
+            allow_non_opentui: true,
+        };
+
+        let error = run_import(args).expect_err("existing run dir should fail");
+        assert!(
+            error.to_string().contains("run directory already exists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn run_import_local_copy_skips_git_metadata() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join(".git")).expect("create .git dir");
+        fs::write(source.join("package.json"), r#"{"name":"fixture"}"#).expect("write package");
+        fs::write(source.join("yarn.lock"), "lockfile").expect("write lockfile");
+        fs::write(source.join("README.md"), "content").expect("write readme");
+        let run_root = temp.path().join("runs");
+
+        let args = ImportArgs {
+            source: source.display().to_string(),
+            pinned_commit: None,
+            run_root: run_root.clone(),
+            run_name: Some("copy".to_string()),
+            allow_non_opentui: false,
+        };
+
+        // Use allow_non_opentui false to exercise package.json validation path.
+        let result = run_import(args);
+        if let Err(error) = &result {
+            let message = error.to_string();
+            if message.contains("required command missing: git")
+                || message.contains("required command missing: tar")
+            {
+                return;
+            }
+        }
+        result.expect("import should succeed with local copy");
+
+        assert!(run_root.join("copy/snapshot/README.md").exists());
+    }
+
+    #[test]
+    fn run_import_detects_workspace_tsconfig_and_runtime_context() {
+        let temp = tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("packages/app/src")).expect("create source tree");
+
+        fs::write(
+            source.join("package.json"),
+            r#"{
+  "name": "fixture",
+  "packageManager": "pnpm@9.1.0",
+  "workspaces": ["packages/*", "apps/*"],
+  "scripts": {"dev": "vite"},
+  "devDependencies": {"typescript": "^5.7.0", "vite": "^5.4.0"}
+}"#,
+        )
+        .expect("write package json");
+        fs::write(
+            source.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .expect("write pnpm workspace");
+        fs::write(
+            source.join("tsconfig.json"),
+            r#"{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "paths": {
+      "@/*": ["src/*"],
+      "@app/*": ["packages/app/src/*"]
+    }
+  }
+}"#,
+        )
+        .expect("write tsconfig");
+        fs::write(
+            source.join("packages/app/src/main.ts"),
+            "export async function load() { return import('./lazy'); }\nconst endpoint = import.meta.env.VITE_API_URL;\n",
+        )
+        .expect("write source file");
+
+        let run_root = temp.path().join("runs");
+        let args = ImportArgs {
+            source: source.display().to_string(),
+            pinned_commit: None,
+            run_root: run_root.clone(),
+            run_name: Some("toolchain".to_string()),
+            allow_non_opentui: false,
+        };
+
+        run_import(args).expect("import should succeed");
+
+        let intake_meta_path = run_root.join("toolchain/intake_meta.json");
+        let intake_meta_text = fs::read_to_string(&intake_meta_path).expect("read intake metadata");
+        let intake_meta: Value =
+            serde_json::from_str(&intake_meta_text).expect("parse intake metadata");
+
+        let workspace_markers = intake_meta["toolchain"]["workspace_markers"]
+            .as_array()
+            .expect("workspace markers array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            workspace_markers.contains(&"package.json#workspaces"),
+            "missing package.json workspace marker: {workspace_markers:?}"
+        );
+        assert!(
+            workspace_markers.contains(&"pnpm-workspace.yaml"),
+            "missing pnpm workspace marker: {workspace_markers:?}"
+        );
+
+        let workspace_globs = intake_meta["toolchain"]["workspace_globs"]
+            .as_array()
+            .expect("workspace globs array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            workspace_globs.contains(&"packages/*"),
+            "missing packages glob: {workspace_globs:?}"
+        );
+
+        let tsconfig_aliases = intake_meta["toolchain"]["tsconfig_path_aliases"]
+            .as_array()
+            .expect("tsconfig aliases array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            tsconfig_aliases.contains(&"@/*"),
+            "missing tsconfig alias: {tsconfig_aliases:?}"
+        );
+        assert_eq!(
+            intake_meta["toolchain"]["tsconfig_strict"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            intake_meta["toolchain"]["tsconfig_strict_flags"]["strictNullChecks"],
+            Value::Bool(true)
+        );
+        assert_eq!(
+            intake_meta["toolchain"]["bundler"],
+            Value::String("vite".to_string())
+        );
+        assert_eq!(
+            intake_meta["toolchain"]["dynamic_import_detected"],
+            Value::Bool(true)
+        );
+
+        let runtime_markers = intake_meta["toolchain"]["runtime_env_markers"]
+            .as_array()
+            .expect("runtime marker array")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            runtime_markers.contains(&"import.meta.env"),
+            "missing runtime marker: {runtime_markers:?}"
+        );
+    }
+}
