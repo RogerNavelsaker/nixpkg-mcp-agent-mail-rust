@@ -1,46 +1,53 @@
-{ bash, lib, lld, makeWrapper, onnxruntime, openssl, perl, pkg-config, rustPlatform, sqlite }:
+{ bash, fetchFromGitHub, lib, lld, makeWrapper, onnxruntime, openssl, perl, pkg-config, runCommand, rustPlatform, sqlite }:
 
 let
   manifest = builtins.fromJSON (builtins.readFile ./package-manifest.json);
-  sourceTree = lib.cleanSourceWith {
-    src = ../.;
-    filter = path: type:
-      let
-        base = baseNameOf path;
-        excluded = [
-          ".beads"
-          ".claude"
-          ".git"
-          ".github"
-          ".ntm"
-          "~"
-          "agent_baseline"
-          "artifacts"
-          "baselines"
-          "docs"
-          "e2e"
-          "examples"
-          "formal"
-          "fuzz"
-          "legacy_pydantic"
-          "legacy_sqlalchemy"
-          "legacy_sqlmodel"
-          "legacy_sqlite_code"
-          "packages"
-          "result"
-          "sample_beads_db_files"
-          "sample_sqlite_db_files"
-          "scripts"
-          "skills"
-          "temp_test"
-          "temp_test_2"
-          "tests"
-          "tools"
-          "vendor"
-        ];
-      in
-      !(builtins.elem base excluded);
+  upstreamSrc = fetchFromGitHub {
+    owner = manifest.source.owner;
+    repo = manifest.source.repo;
+    rev = manifest.source.rev;
+    hash = manifest.source.hash;
   };
+  asupersyncSrc = fetchFromGitHub {
+    owner = manifest.source.siblings.asupersync.owner;
+    repo = manifest.source.siblings.asupersync.repo;
+    rev = manifest.source.siblings.asupersync.rev;
+    hash = manifest.source.siblings.asupersync.hash;
+  };
+  beadsRustSrc = fetchFromGitHub {
+    owner = manifest.source.siblings.beads_rust.owner;
+    repo = manifest.source.siblings.beads_rust.repo;
+    rev = manifest.source.siblings.beads_rust.rev;
+    hash = manifest.source.siblings.beads_rust.hash;
+  };
+  frankensqliteSrc = fetchFromGitHub {
+    owner = manifest.source.siblings.frankensqlite.owner;
+    repo = manifest.source.siblings.frankensqlite.repo;
+    rev = manifest.source.siblings.frankensqlite.rev;
+    hash = manifest.source.siblings.frankensqlite.hash;
+  };
+  frankentuilSrc = fetchFromGitHub {
+    owner = manifest.source.siblings.frankentui.owner;
+    repo = manifest.source.siblings.frankentui.repo;
+    rev = manifest.source.siblings.frankentui.rev;
+    hash = manifest.source.siblings.frankentui.hash;
+  };
+  sqlmodelRustSrc = fetchFromGitHub {
+    owner = manifest.source.siblings.sqlmodel_rust.owner;
+    repo = manifest.source.siblings.sqlmodel_rust.repo;
+    rev = manifest.source.siblings.sqlmodel_rust.rev;
+    hash = manifest.source.siblings.sqlmodel_rust.hash;
+  };
+  sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { } ''
+    mkdir -p "$out/upstream" "$out/asupersync" "$out/beads_rust" \
+             "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
+    cp -R ${upstreamSrc}/. "$out/upstream/"
+    cp -R ${asupersyncSrc}/. "$out/asupersync/"
+    cp -R ${beadsRustSrc}/. "$out/beads_rust/"
+    cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
+    cp -R ${frankentuilSrc}/. "$out/frankentui/"
+    cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
+  '';
   builtBinary = manifest.binary.upstreamName or manifest.binary.name;
   aliasOutputs = manifest.binary.aliases or [ ];
   licenseMap = {
@@ -67,7 +74,7 @@ in
 rustPlatform.buildRustPackage {
   pname = manifest.binary.name;
   version = manifest.package.version;
-  src = sourceTree;
+  src = sourceRoot;
   sourceRoot = "source/upstream";
 
   cargoLock = {
