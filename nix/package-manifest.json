@@ -12,20 +12,20 @@
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "4b4840965dbd0a3b8ae017219f027228078530a4",
-        "hash": "sha256-hSwG8KkqDobJumWcKFMhTMG1OOwP89yf7S2j539wUoY="
+        "rev": "eff20637ef4b522330a16821fc72231cfea1369b",
+        "hash": "sha256-taeHl7En2n3nhLYMb9BoQPGXt2cdu4vZpT8tIpHJRFg="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
         "repo": "beads_rust",
-        "rev": "86065b66571576efac15f6543ae8d10d6167d1ed",
-        "hash": "sha256-xG6itysIlzZs3BdHQNgKLWGG7g6F7I01SPDM9/wEnDU="
+        "rev": "cbd6e8f89ebd2d686bffaa67f2f9d84ed752016e",
+        "hash": "sha256-ebLVeCK/RA6sm55Jsz2RKlDRGdZy4pB3JM0R9IB0KHg="
       },
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "b43e6483de7dc33a9a4d3944387c7d6713ef1d74",
-        "hash": "sha256-5UT/KHFtA4eshKIMEAvZkB0JQIX/CyEeEEkUozihQ/s="
+        "rev": "d3ecb8b784d61aa9474157043862a85b3d408af3",
+        "hash": "sha256-wg1EwQ/XueOe6+z/PogoOwONpP7EOF+WNoBwzzmo3Hc="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
