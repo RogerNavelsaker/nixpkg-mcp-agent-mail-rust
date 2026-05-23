@@ -6,14 +6,14 @@
     "channel": "github-head",
     "defaultBranch": "main",
     "version": "0.3.2",
-    "rev": "85a3a0fe986d4630e96cf87814c9ca061835b1f7",
-    "hash": "sha256-+sbBKOc9XEDKzZx/RnJ2rO7HIHppuKEfh6BByb/ZWXs=",
+    "rev": "8db4cb316af7e3d2e8c22d2cc7d02e822637aa2f",
+    "hash": "sha256-xamG3FGFEozmXkh3Wj2MINfnh8MKroZI4Xcl0Z+5MQ8=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "dc38702c83981bab24533784cc5b9882903363c3",
-        "hash": "sha256-6x/aopcByLMtfg6Z6PvhWAXJo0WyvIbHJkFwZuRlA1s="
+        "rev": "4f645d437e2c631657a386825ae16cdf17a7ced5",
+        "hash": "sha256-KP2wgg0LPWh98zc5vpEiqzOD3MxOndns5vxI37F6J8c="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
@@ -24,8 +24,8 @@
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "7c785a7b27c917e5f585b362e574259667923dc3",
-        "hash": "sha256-vqGo/ZFSuWkvZgQMtN4v+2WudmNqM2A5WgDaK9oj0UM="
+        "rev": "ef85a204064444c511e7b8414a794b81f7b2f691",
+        "hash": "sha256-5fCo5RD5qQQNRsMLA/U3RZM0S458f83ygzisANgEFFs="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
