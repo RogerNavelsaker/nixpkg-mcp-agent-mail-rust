@@ -5,15 +5,15 @@
     "repo": "mcp_agent_mail_rust",
     "channel": "github-head",
     "defaultBranch": "main",
-    "version": "0.3.4",
-    "rev": "51f9584e704320a7dd6c5e6a5d2c073a5f4152fa",
-    "hash": "sha256-PldVi/tUNzTZk+nrn+Ui0q0t49lrjoZdkFTCkCAk58Y=",
+    "version": "0.3.6",
+    "rev": "bf3f633d94da51893dcf971b4240400aba408766",
+    "hash": "sha256-gfFU5+LtqzTjZAHPPlRXtAVdrVqf7nSZEToGw4a+kco=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "32f55c95cea8c5a3bb8b051fa2373b1aac91396f",
-        "hash": "sha256-R2B/OFHZCTNctgqWdPCxckeocsDcm18BKP/zgk+4+sI="
+        "rev": "a4ee9628d67020b6886e5efc3a3016d60c9c27b8",
+        "hash": "sha256-4Sxjc4kyIGyjyWDJ4gCmlZhYGz+SY9hZ0KJuvHVB5L4="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
@@ -43,7 +43,7 @@
   },
   "package": {
     "repo": "mcp-agent-mail-rust",
-    "version": "0.3.4"
+    "version": "0.3.6"
   },
   "binary": {
     "name": "am",
