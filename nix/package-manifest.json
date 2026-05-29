@@ -12,8 +12,8 @@
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "9818864c2d03f9c36c22094d1d5abf83521ea62e",
-        "hash": "sha256-NZWIHDA6jlFvG01QZ7mSRQGklnjWgdSpADVaDpfqSNw="
+        "rev": "f94163146c7246e27fb17e9827f3c326b8a34a91",
+        "hash": "sha256-wUAy+wGzbrnBxexs0cKhh/rWvOYMm6ovgtW/XKmtyq8="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
