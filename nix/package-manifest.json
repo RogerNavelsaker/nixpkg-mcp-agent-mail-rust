@@ -6,14 +6,14 @@
     "channel": "github-head",
     "defaultBranch": "main",
     "version": "0.3.14",
-    "rev": "bab8abfe4056b7eb8cb8f40f146e2fa95cf9b377",
-    "hash": "sha256-4qqQsnCRBdceYjkkI3xxrffxOqgOjTzNlX451m+jaZw=",
+    "rev": "73d62edeab4b42f6401d4d41fda12a0f06da4a83",
+    "hash": "sha256-Fb0h1JfMdMnd1O4jZYLAaSbsiwlOFM2cCEWc2AnvHgI=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "cbb179b3b4bfa03b37f442c4e71f2d9f46b1529b",
-        "hash": "sha256-ZfIV8rMkU7tyKjAGXEzZNeBmeiN/5BGBwixKHsUXgfs="
+        "rev": "386304edc523025ca437caedc61f2818a97e6026",
+        "hash": "sha256-RbOu7gSQfidjcEDv8FiX1lwLn0SrgSF1AVJ1WvbMkac="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
