@@ -30,8 +30,8 @@
       "frankentui": {
         "owner": "Dicklesworthstone",
         "repo": "frankentui",
-        "rev": "ffdf760732eab19446955d4ea261e6b3efe8b10e",
-        "hash": "sha256-8d2XN8iTviE2AIMBY7/bYuAqPSl9mIooDydL+TRtCgg="
+        "rev": "98c42774f800198ecec078c6a5e2816e04fa3a15",
+        "hash": "sha256-GCLcUKT49kKI9BB9hB7hG+f7xrW/wVrCFT4smIEqhPU="
       },
       "sqlmodel_rust": {
         "owner": "Dicklesworthstone",
