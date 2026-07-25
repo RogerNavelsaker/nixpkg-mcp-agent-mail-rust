@@ -6,8 +6,8 @@
     "channel": "github-head",
     "defaultBranch": "main",
     "version": "0.3.24",
-    "rev": "dcbb06397c8b83d63d97bfa2e603f695257417b2",
-    "hash": "sha256-56pxisgPzh40CckLOY+WrBoIGgGa4+CcFUfl8GJBPKk=",
+    "rev": "5a97477c3dabbf79bf94dedb32ce2f0a0870336c",
+    "hash": "sha256-vYjxxIJs+9IP5YW6tMtaB614hHMXW3rX3Tk27JzuFpw=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
