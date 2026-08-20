@@ -12,8 +12,8 @@
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "506fce04d71cb84108d249c7504b9308241539aa",
-        "hash": "sha256-I7O8TUokMs3jehxYq+u1q8e08c+nYGIt6538cKcAFiw="
+        "rev": "285174b6814f22782c5aeb92b5b7d310a3ad3b56",
+        "hash": "sha256-MDhkl8AxIaFpvlAL3h4QlJXa7lLMrBDXKXiSGyw1gl0="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
@@ -24,8 +24,8 @@
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "befb2e6bfb13bcfb79ae0897ed3a585700be57b7",
-        "hash": "sha256-JpmObH+TrNwPWv1nNr6vqpUlShEuFPcb68PFBmHBnOY="
+        "rev": "61edc3aaeba293acb13490c8c899ee401a9b9f3a",
+        "hash": "sha256-7hHOu95fGhkTfaU9eXveNUKxlYmYYibudiTOdonFSA4="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
