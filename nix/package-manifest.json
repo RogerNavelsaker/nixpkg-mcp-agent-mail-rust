@@ -6,38 +6,38 @@
     "channel": "github-head",
     "defaultBranch": "main",
     "version": "0.3.32",
-    "rev": "34b7b9cf21f15dbc994a35a5d77aca7548075d5d",
-    "hash": "sha256-UnCtkl79ptzQo/vXDDQIYujCBKx593el36lhoUd5M1w=",
+    "rev": "68be561b05eab5cea555b7a4c50fe344f20b5018",
+    "hash": "sha256-cy7L3j0NbY1FPzVpONPbFuYVVDdmqkOJWCdjMHycw5Q=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "6ab0fee513353fc8d7fd2b5d80a28bcf8da964c3",
-        "hash": "sha256-MOK5pLv2sL6t26RN1qKgVlOyz1NmD+fk3NzzFGIWTgo="
+        "rev": "c0c8eb0c181c3d9ca382aecc34e110543dfb6bf5",
+        "hash": "sha256-dObKWyA1wIUI4EtBAl0Np0LmLI8umwpn8B0rFSlqWBU="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
         "repo": "beads_rust",
-        "rev": "cc7c8b104c5798d70da5280470395a0171778618",
-        "hash": "sha256-GVnZYx2G1LbF0wXjsEiHx5jZnq2YswifVXWDwscQ/Z0="
+        "rev": "1a7e087b823503516b6379df9e6f154e71a362d9",
+        "hash": "sha256-NyXYSXKKt5H6Q/F0tYCWmbYo+koGV+Ja4x9Xvj7sta8="
       },
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "288528d7fa1ce9a35c7207963cb8b1c363725877",
-        "hash": "sha256-wHWhsQUQWhRUJC2ihzkVwCgYLozk5XnouTlmyAKA2CM="
+        "rev": "da0638e07afeac969f6d6c0fb04ee58ab8d0e2cd",
+        "hash": "sha256-8THGTAHxQ8t0KK0awh2CKRJp16kFuiT3RGOVLKoBQrU="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
         "repo": "frankentui",
-        "rev": "1c5e4dcb6f6d647836259d8a247cd0eb073eb514",
-        "hash": "sha256-5k8rSt7M+MospjZmvuVnFWNO80roRprm+WWu1lDfJlg="
+        "rev": "a5706ffb994ed6dce04d9f9f57314b3f58d3ecfe",
+        "hash": "sha256-RJtQNe5+x2FezgXJGkNN74C5t0zmVhJlmdpbddOWy2U="
       },
       "sqlmodel_rust": {
         "owner": "Dicklesworthstone",
         "repo": "sqlmodel_rust",
-        "rev": "cf4ff17382e60064b9b4e4b88a49d07534a81e2d",
-        "hash": "sha256-se7eBtTISjAoNUtz1PoFF4S0rUX5Fukrau7iyfu1w+A="
+        "rev": "578a78247517ea2d9e09d7bcd3ceebc620df287a",
+        "hash": "sha256-AoggWSHPKijHjuQwIuZ8z3jBp021oo4BB+zD5Go+Ya4="
       }
     }
   },
