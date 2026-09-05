@@ -24,8 +24,8 @@
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "d22f51da13ea8d8a78f7ce13a1fbf1c6762d6880",
-        "hash": "sha256-jhyhEBD37U+UcaSL+UJeEnQ13q5cBWiklCHtnPmbuNE="
+        "rev": "2ae21ab7ed15bce529e64a26a8c840ce9c9848af",
+        "hash": "sha256-UPzrsvcuY9QKLdoQmSMGGKGgwtU/nXr5d9K+xVbHou8="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
@@ -36,8 +36,8 @@
       "sqlmodel_rust": {
         "owner": "Dicklesworthstone",
         "repo": "sqlmodel_rust",
-        "rev": "928d18e82223698bcf8bd301b86d5149d99ab0b9",
-        "hash": "sha256-CDhwxhkal39PMdVEKHstwYQw/nTKGSrSAgvftiBOJcI="
+        "rev": "15ec0b6cb8aeb756cad5d11c7b9849d56af79642",
+        "hash": "sha256-14gQvshcnPs4625Ou/uROkUAqm/tl7dYyF/TFEvu8eY="
       }
     }
   },
