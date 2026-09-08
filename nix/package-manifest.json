@@ -5,33 +5,33 @@
     "repo": "mcp_agent_mail_rust",
     "channel": "github-head",
     "defaultBranch": "main",
-    "version": "0.3.33",
-    "rev": "43459c5ae2d70966cc24f18fb2497d8b347712ca",
-    "hash": "sha256-/EYI6HKBvCN2ziHVJQGl/FowvklbZkUhZhCRnXM0TQw=",
+    "version": "0.3.34",
+    "rev": "ba2ad9ce71342dee85b9982e8275d860d617083e",
+    "hash": "sha256-nDfXNod1jtR9Le0HYX8kkt0Le1TRHD6UyFlDcCsezL0=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "5c9cb8ab0aeba44173e9fd805f4d413f2f3bd8ba",
-        "hash": "sha256-sQjE0ORex/2j8kThYNImtwh8fJrVTZEaqBcuWjSQpjM="
+        "rev": "cabf1097d2ecdc05ae55c2c2830d00c0f4f21719",
+        "hash": "sha256-Y6pt8XMT2u3LeXnOxKcbyskcJPNTYihoVrDszMy+LGA="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
         "repo": "beads_rust",
-        "rev": "797af3b55115482d3511fad10a6ff53e1baeb98a",
-        "hash": "sha256-6yxuVjv4FqDQCw94+6iuy9Vombaa+HgtG1IJzObFapI="
+        "rev": "2bf2e4ba7e1c3e4cbe929612c5c1f1667d13035b",
+        "hash": "sha256-DloA3E4fRH4bfM8uPWJ17ZKV3vzpCbQa2pjmYUE0UbA="
       },
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "399638d6b80902577864512dda1a443fb9638299",
-        "hash": "sha256-XFaIKiFp7V8HTfq9ywnZnm0zzO8MHGc1h1b8EhIQcg4="
+        "rev": "c9825f1573bc49d407049b51d755a8d5266ac1ac",
+        "hash": "sha256-P66mOnsLI32XVYCeEMdLq8eB/ncY9BfYvaHjo6fnmn4="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
         "repo": "frankentui",
-        "rev": "d6a3e183431515fb1dfe6df8502a9fa5fc397ecb",
-        "hash": "sha256-CurPnWfPkyXtoPn6DLuoCTRwhZrzD8U+6jKZ9YPfFxw="
+        "rev": "1297697c832c1f4eee8ddc03532a53f81b87cc4e",
+        "hash": "sha256-uYBuKEFbIcfNBFwwiytqjMO96ndeLWz5iFDYKsndLuQ="
       },
       "sqlmodel_rust": {
         "owner": "Dicklesworthstone",
@@ -43,7 +43,7 @@
   },
   "package": {
     "repo": "mcp-agent-mail-rust",
-    "version": "0.3.33"
+    "version": "0.3.34"
   },
   "binary": {
     "name": "am",
