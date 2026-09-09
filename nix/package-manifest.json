@@ -5,45 +5,45 @@
     "repo": "mcp_agent_mail_rust",
     "channel": "github-head",
     "defaultBranch": "main",
-    "version": "0.3.34",
-    "rev": "26a6ad625e567257783e1c0a189ca02934a00733",
-    "hash": "sha256-/NT82bfayeJnnWs3hDA1XJ6MTr1//YINxszeNdQCwU4=",
+    "version": "0.3.35",
+    "rev": "ce66a70cadc20de9baab37b1c348daeaa02934f5",
+    "hash": "sha256-H0HxaJTC4tLfyVTO5DnwHSEn/Hd0mdCHReifBxP/5PY=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
         "repo": "asupersync",
-        "rev": "e7bbaabdf63ac45c6cc7482a24205479888ac71c",
-        "hash": "sha256-y36To4tI9wZR1A2qkQdUN/42W2EWjEER2j2Mf9uLfDI="
+        "rev": "81cd5d5ab31f0188703df78b14518586a899d86d",
+        "hash": "sha256-FBbrmzDwNhdWMg178SKciJbupdIPVNrHgkvXzDsHzk8="
       },
       "beads_rust": {
         "owner": "Dicklesworthstone",
         "repo": "beads_rust",
-        "rev": "53fbfd41573e0bee0184a04011a0e8b115ba9616",
-        "hash": "sha256-g9tB8fu2LbDSxYoRlIQE8cGTZ1Q0r8q+gxCOzAtH1UA="
+        "rev": "e9303f7439533c900b40f35b924819efd250deb0",
+        "hash": "sha256-RyZwwl15Fvzl/DQBOz0UWD1kZBdTm/uNRe0ce4kRb3k="
       },
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "36446a8a21951349b6c7fb7aa194cb240fbc7ec8",
-        "hash": "sha256-zEDqz86jbPlGnNm/Zw6UiKuAHstAGdqI0ovOBX0V+hE="
+        "rev": "572ce4df7df2160cd42b9cff21d41fa5416cddfc",
+        "hash": "sha256-YszcLQcrM2+o4cGnGHUnfywkobc2vQ93qNwJ7ilLhYY="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
         "repo": "frankentui",
-        "rev": "807d5d70b039d89918580973eddcd7955d770eb1",
-        "hash": "sha256-QPdAS0EqzsY0cQmuhzeErLpiMvSK6w4ildLOL4O0TRE="
+        "rev": "6439f3f9fd8e06680166e1f021884b2d8afc8145",
+        "hash": "sha256-eCvUSsW4Hl9Fc4/zbOAyssNahlB73nwEdA/PDDESvMI="
       },
       "sqlmodel_rust": {
         "owner": "Dicklesworthstone",
         "repo": "sqlmodel_rust",
-        "rev": "592b66624c8ec352996011050b7551dc1e1fcb9f",
-        "hash": "sha256-ga/AzeABK9fna2fgV9rOuixEcMmERAyDN17ci5EozNw="
+        "rev": "80feaa267c0e52966da7c9197f57866e36b2a886",
+        "hash": "sha256-O/ST4+ws6anKjg3O/IiyqH25qkglgpsly0S7balcyk0="
       }
     }
   },
   "package": {
     "repo": "mcp-agent-mail-rust",
-    "version": "0.3.34"
+    "version": "0.3.35"
   },
   "binary": {
     "name": "am",
