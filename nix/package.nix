@@ -41,7 +41,7 @@ let
   sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { } ''
     mkdir -p "$out/upstream" "$out/asupersync" "$out/beads_rust" \
              "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
-    cp -R ${upstreamSrc}/. "$out/upstream/"
+    cp -R ${upstreamSrc}/. "$out/"
     cp -R ${asupersyncSrc}/. "$out/asupersync/"
     cp -R ${beadsRustSrc}/. "$out/beads_rust/"
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
