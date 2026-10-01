@@ -65,12 +65,12 @@ let
     fi
     # Workspace dependencies own the default-features setting; remove the
     # member-level override so Cargo accepts the inherited dependency.
-    if grep -Fq 'frankensearch-rerank = { workspace = true, default-features = false' \
+    if grep -Fq 'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"; then
       substituteInPlace "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml" \
         --replace-fail \
-          'frankensearch-rerank = { workspace = true, default-features = false' \
-          'frankensearch-rerank = { workspace = true'
+          'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
+          'frankensearch-rerank = { workspace = true, optional = true'
     fi
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
