@@ -60,7 +60,7 @@ let
       "$out/frankensearch/Cargo.toml"
     # Remove the member-level feature override, which Cargo rejects when the
     # workspace declaration sets default-features.
-    perl -0pi -e 's~\\s*,?\\s*default-features\\s*=\\s*false~~g' \
+    perl -0pi -e 's~(?m)^[ \\t]*frankensearch-rerank[ \\t]*=[^\\n]*$~frankensearch-rerank = { workspace = true }~' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
