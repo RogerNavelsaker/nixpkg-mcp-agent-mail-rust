@@ -75,10 +75,9 @@ rustPlatform.buildRustPackage {
   pname = manifest.binary.name;
   version = manifest.package.version;
   src = sourceRoot;
-  sourceRoot = "source";
   postUnpack = ''
-    cp -R source/upstream/. source/
-    rm -rf source/upstream
+    cd "$sourceRoot/upstream"
+    sourceRoot=$PWD
   '';
 
   cargoLock = {
