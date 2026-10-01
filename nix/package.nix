@@ -81,7 +81,7 @@ rustPlatform.buildRustPackage {
     sourceRoot=$PWD
     # Cargo requires default-features to be configured at the workspace
     # dependency declaration, not overridden by a member.
-    perl -0pi -e 's/(^\s*frankensearch-rerank\s*=\s*\{.*?)(\})/$1, default-features = false $2/ms unless /(^\s*frankensearch-rerank\s*=\s*\{.*?default-features\s*=)/ms' \
+    perl -0pi -e 's/(^\s*frankensearch-rerank\s*=\s*\{[^}]*?)(\})/$1, default-features = false $2/ms' \
       "$sourceRoot/Cargo.toml"
     perl -0pi -e 's/(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false\s*,?/$1/gs' \
       "$sourceRoot/crates/frankensearch-fsfs/Cargo.toml"
