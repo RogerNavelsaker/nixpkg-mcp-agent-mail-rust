@@ -54,6 +54,11 @@ let
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
+    # Cargo rejects a member overriding default-features for this workspace dependency.
+    substituteInPlace "$out/frankensearch/Cargo.toml" \
+      --replace-fail \
+        'frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }' \
+        'frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank", default-features = false }'
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
