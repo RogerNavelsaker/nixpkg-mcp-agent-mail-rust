@@ -62,7 +62,7 @@ let
       "$out/frankensearch/Cargo.toml"
     # The workspace dependency must own the default-feature setting; Cargo
     # rejects a member-level override when it inherits that dependency.
-    perl -0pi -e 's~,\s*default-features\s*=\s*false~~g' \
+    perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{\s*workspace\s*=\s*true)\s*,\s*default-features\s*=\s*false~$1~' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
