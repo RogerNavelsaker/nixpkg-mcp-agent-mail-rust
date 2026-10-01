@@ -56,9 +56,9 @@ let
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
     # Cargo requires default-features to be configured at the workspace
     # dependency declaration, not overridden by a member.
-    perl -0pi -e 's~^(frankensearch-rerank\\s*=\\s*\\{[^\\n}]*)default-features\\s*=\\s*(?:true|false)~$1default-features = false~m; s~^(frankensearch-rerank\\s*=\\s*\\{[^\\n}]*)\\}~$1, default-features = false }~m' \
+    perl -0pi -e 's~(?ms)^frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank", default-features = false }~' \
       "$out/frankensearch/Cargo.toml"
-    perl -0pi -e 's~(?ms)^frankensearch-rerank\\s*=\\s*\\{[^}]*\\}~frankensearch-rerank = { workspace = true }~' \
+    perl -0pi -e 's~(?ms)^frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { workspace = true }~' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
