@@ -58,7 +58,7 @@ let
     # dependency declaration, not overridden by a member.
     perl -0pi -e 's/(^frankensearch-rerank\\s*=\\s*\\{[^\\n}]*path\\s*=\\s*"crates\\/frankensearch-rerank"[^\\n}]*)\\s*\\}/$1, default-features = false }/m unless /(^frankensearch-rerank\\s*=\\s*\\{[^\\n}]*path\\s*=\\s*"crates\\/frankensearch-rerank"[^\\n}]*)default-features/m' \
       "$out/frankensearch/Cargo.toml"
-    perl -0pi -e 's/(^frankensearch-rerank\\s*=\\s*\\{[^\\n}]*workspace\\s*=\\s*true[^\\n}]*)\\s*,\\s*default-features\\s*=\\s*false/$1/m' \
+    perl -0pi -e 's/^(?=[^\\n}]*frankensearch-rerank\\s*=)(?=[^\\n}]*workspace\\s*=\\s*true)([^\\n}]*)\\s*,\\s*default-features\\s*=\\s*false/$1/m; s/^(?=[^\\n}]*frankensearch-rerank\\s*=)(?=[^\\n}]*workspace\\s*=\\s*true)([^\\n}]*)default-features\\s*=\\s*false\\s*,\\s*/$1/m' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
