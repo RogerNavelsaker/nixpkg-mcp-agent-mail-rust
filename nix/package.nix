@@ -75,7 +75,7 @@ rustPlatform.buildRustPackage {
   pname = manifest.binary.name;
   version = manifest.package.version;
   src = sourceRoot;
-  sourceRoot = "source/upstream";
+  sourceRoot = "upstream";
 
   cargoLock = {
     lockFile = ../upstream/Cargo.lock;
