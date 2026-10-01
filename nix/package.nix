@@ -60,7 +60,7 @@ let
       "$out/frankensearch/Cargo.toml"
     # The upstream fsfs crate may override the workspace dependency's feature
     # setting, which Cargo rejects when the workspace declaration sets it.
-    perl -0pi -e 's~^([ \\t]*frankensearch-rerank\\s*=\\s*\\{\\s*workspace\\s*=\\s*true)[^\\n]*$~$1 }~m' \
+    perl -0pi -e 's~^([ \\t]*frankensearch-rerank\\s*=\\s*\\{[^}\\n]*workspace\\s*=\\s*true)[^}\\n]*\\}\\s*$~$1 }~m' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
