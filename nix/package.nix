@@ -54,24 +54,12 @@ let
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
-    # Cargo rejects a member overriding default-features when the workspace
-    # dependency does not disable them itself.
-    if grep -Fq 'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
-      "$out/frankensearch/Cargo.toml"; then
-      substituteInPlace "$out/frankensearch/Cargo.toml" \
-        --replace-fail \
-          'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
-          'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank", default-features = false }'
-    fi
-    # Workspace dependencies own the default-features setting; remove the
-    # member-level override so Cargo accepts the inherited dependency.
-    if grep -Fq 'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
-      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"; then
-      substituteInPlace "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml" \
-        --replace-fail \
-          'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
-          'frankensearch-rerank = { workspace = true, optional = true'
-    fi
+    # Cargo requires default-features to be configured at the workspace
+    # dependency declaration, not overridden by a member.
+    perl -0pi -e 's/(^frankensearch-rerank\\s*=\\s*\\{[^\\n}]*path\\s*=\\s*"crates\\/frankensearch-rerank"[^\\n}]*)\\s*\\}/$1, default-features = false }/m unless /(^frankensearch-rerank\\s*=\\s*\\{[^\\n}]*path\\s*=\\s*"crates\\/frankensearch-rerank"[^\\n}]*)default-features/m' \
+      "$out/frankensearch/Cargo.toml"
+    perl -0pi -e 's/(^frankensearch-rerank\\s*=\\s*\\{[^\\n}]*workspace\\s*=\\s*true[^\\n}]*)\\s*,\\s*default-features\\s*=\\s*false/$1/m' \
+      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
