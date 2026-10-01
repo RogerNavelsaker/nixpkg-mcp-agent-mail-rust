@@ -79,6 +79,21 @@ rustPlatform.buildRustPackage {
     cp ${../upstream/Cargo.lock} "$sourceRoot/upstream/Cargo.lock"
     cd "$sourceRoot/upstream"
     sourceRoot=$PWD
+    # Keep workspace dependency feature settings consistent with member manifests.
+    if grep -Fq 'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
+      "$sourceRoot/../frankensearch/Cargo.toml"; then
+      substituteInPlace "$sourceRoot/../frankensearch/Cargo.toml" \
+        --replace-fail \
+          'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
+          'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank", default-features = false }'
+    fi
+    if grep -Fq 'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
+      "$sourceRoot/../frankensearch/crates/frankensearch-fsfs/Cargo.toml"; then
+      substituteInPlace "$sourceRoot/../frankensearch/crates/frankensearch-fsfs/Cargo.toml" \
+        --replace-fail \
+          'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
+          'frankensearch-rerank = { workspace = true, optional = true'
+    fi
   '';
 
   cargoLock = {
