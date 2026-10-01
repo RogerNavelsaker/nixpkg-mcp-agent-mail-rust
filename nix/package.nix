@@ -79,21 +79,12 @@ rustPlatform.buildRustPackage {
     cp ${../upstream/Cargo.lock} "$sourceRoot/upstream/Cargo.lock"
     cd "$sourceRoot/upstream"
     sourceRoot=$PWD
-    # Keep workspace dependency feature settings consistent with member manifests.
-    if grep -Fq 'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
-      "$sourceRoot/../frankensearch/Cargo.toml"; then
-      substituteInPlace "$sourceRoot/../frankensearch/Cargo.toml" \
-        --replace-fail \
-          'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
-          'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank", default-features = false }'
-    fi
-    if grep -Fq 'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
-      "$sourceRoot/../frankensearch/crates/frankensearch-fsfs/Cargo.toml"; then
-      substituteInPlace "$sourceRoot/../frankensearch/crates/frankensearch-fsfs/Cargo.toml" \
-        --replace-fail \
-          'frankensearch-rerank = { workspace = true, optional = true, default-features = false' \
-          'frankensearch-rerank = { workspace = true, optional = true'
-    fi
+    # Cargo requires default-features to be configured at the workspace
+    # dependency declaration, not overridden by a member.
+    perl -0pi -e 's/(^frankensearch-rerank\s*=\s*\{[^\n}]*path\s*=\s*"crates\/frankensearch-rerank"[^\n}]*)\s*\}/$1, default-features = false }/m unless /(^frankensearch-rerank\s*=\s*\{[^\n}]*path\s*=\s*"crates\/frankensearch-rerank"[^\n}]*)default-features/m' \
+      "$sourceRoot/../frankensearch/Cargo.toml"
+    perl -0pi -e 's/^(?=[^\n}]*frankensearch-rerank\s*=)(?=[^\n}]*workspace\s*=\s*true)([^\n}]*)\s*,\s*default-features\s*=\s*false/$1/m; s/^(?=[^\n}]*frankensearch-rerank\s*=)(?=[^\n}]*workspace\s*=\s*true)([^\n}]*)default-features\s*=\s*false\s*,\s*/$1/m' \
+      "$sourceRoot/../frankensearch/crates/frankensearch-fsfs/Cargo.toml"
   '';
 
   cargoLock = {
