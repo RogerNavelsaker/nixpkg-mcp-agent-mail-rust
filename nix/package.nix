@@ -76,7 +76,7 @@ rustPlatform.buildRustPackage {
   version = manifest.package.version;
   src = sourceRoot;
   cargoLock = {
-    lockFile = "${sourceRoot}/upstream/Cargo.lock";
+    lockFile = ../upstream/Cargo.lock;
     allowBuiltinFetchGit = true;
   };
 
