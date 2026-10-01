@@ -40,10 +40,11 @@ let
   };
   sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { } ''
     mkdir -p "$out/upstream" "$out/asupersync" "$out/beads_rust" \
-             "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
+             "$out/frankensearch" "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
     cp -R ${upstreamSrc}/. "$out/upstream/"
     cp -R ${asupersyncSrc}/. "$out/asupersync/"
     cp -R ${beadsRustSrc}/. "$out/beads_rust/"
+    cp -R ${../frankensearch}/. "$out/frankensearch/"
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
