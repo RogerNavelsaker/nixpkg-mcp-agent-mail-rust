@@ -60,10 +60,10 @@ let
     # already sets default features.
     perl -0pi -e 's~(?ms)^[ \\t]*frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }~' \
       "$out/frankensearch/Cargo.toml"
-    # The workspace dependency must own the default-feature setting; Cargo
-    # rejects a member-level override when it inherits that dependency.
-    perl -0pi -e 's~,\s*default-features\s*=\s*false~~g' \
-      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
+    # Remove member-level overrides wherever the vendored workspace declares
+    # this dependency; Cargo rejects overriding its workspace setting.
+    find "$out/frankensearch" -name Cargo.toml -exec \
+      perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false~$1~gs' {} +
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
