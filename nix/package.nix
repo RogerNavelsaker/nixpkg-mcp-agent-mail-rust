@@ -64,6 +64,10 @@ let
     # this dependency; Cargo rejects overriding its workspace setting.
     find "$out/frankensearch" -name Cargo.toml -exec \
       perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false\s*,?~$1~gs' {} +
+    # fsfs has historically carried this override in upstream revisions; keep
+    # the targeted fallback explicit so it cannot survive manifest formatting changes.
+    perl -0pi -e 's~\s*,?\s*default-features\s*=\s*false\s*,?~~g' \
+      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
