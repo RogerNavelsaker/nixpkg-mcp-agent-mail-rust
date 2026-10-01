@@ -58,7 +58,9 @@ let
     # dependency declaration, not overridden by a member.
     perl -0pi -e 's~^[ \\t]*frankensearch-rerank\\s*=.*$~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank", default-features = false }~m' \
       "$out/frankensearch/Cargo.toml"
-    perl -0pi -e 's~^[ \\t]*frankensearch-rerank\\s*=.*$~frankensearch-rerank = { workspace = true }~m' \
+    # The upstream fsfs crate may override the workspace dependency's feature
+    # setting, which Cargo rejects when the workspace declaration sets it.
+    perl -0pi -e 's~^([ \\t]*frankensearch-rerank\\s*=\\s*\\{\\s*workspace\\s*=\\s*true)[^\\n]*$~$1 }~m' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
