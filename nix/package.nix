@@ -44,7 +44,9 @@ let
     rev = manifest.source.siblings.sqlmodel_rust.rev;
     hash = manifest.source.siblings.sqlmodel_rust.hash;
   };
-  sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { } ''
+  sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" {
+    nativeBuildInputs = [ perl ];
+  } ''
     mkdir -p "$out/upstream" "$out/asupersync" "$out/beads_rust" \
              "$out/frankensearch" "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
     cp -R ${upstreamSrc}/. "$out/"
