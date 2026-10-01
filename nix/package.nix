@@ -47,10 +47,6 @@ let
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
-    substituteInPlace "$out/Cargo.lock" \
-      --replace-fail \
-        'db458bfba780e79d099d9f8986da5a1f7b360901' \
-        '${manifest.source.siblings.frankensqlite.rev}'
   '';
   builtBinary = manifest.binary.upstreamName or manifest.binary.name;
   aliasOutputs = manifest.binary.aliases or [ ];
