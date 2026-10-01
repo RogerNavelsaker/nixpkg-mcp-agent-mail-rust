@@ -63,6 +63,15 @@ let
           'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank" }' \
           'frankensearch-rerank = { version = "0.4.1", path = "crates/frankensearch-rerank", default-features = false }'
     fi
+    # Workspace dependencies own the default-features setting; remove the
+    # member-level override so Cargo accepts the inherited dependency.
+    if grep -Fq 'frankensearch-rerank = { workspace = true, default-features = false' \
+      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"; then
+      substituteInPlace "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml" \
+        --replace-fail \
+          'frankensearch-rerank = { workspace = true, default-features = false' \
+          'frankensearch-rerank = { workspace = true'
+    fi
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
