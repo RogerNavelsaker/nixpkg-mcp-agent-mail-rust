@@ -63,7 +63,7 @@ let
     # Remove member-level overrides wherever the vendored workspace declares
     # this dependency; Cargo rejects overriding its workspace setting.
     find "$out/frankensearch" -name Cargo.toml -exec \
-      perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false~$1~gs' {} +
+      perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,\s*default-features\s*=\s*false~$1~gs; s~(frankensearch-rerank\s*=\s*\{[^}]*?)default-features\s*=\s*false\s*,\s*~$1~gs' {} +
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
