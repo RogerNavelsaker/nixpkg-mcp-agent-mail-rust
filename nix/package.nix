@@ -54,14 +54,12 @@ let
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
-    # Cargo requires default-features to be configured at the workspace
-    # dependency declaration, not overridden by a member.
-    perl -0pi -e 's~(?ms)^[ \\t]*frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank", default-features = false }~' \
+    # Keep the workspace dependency feature-neutral so members can choose
+    # whether to enable the rerank crate's default features. Cargo rejects a
+    # member-level `default-features = false` when the workspace declaration
+    # already sets default features.
+    perl -0pi -e 's~(?ms)^[ \\t]*frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }~' \
       "$out/frankensearch/Cargo.toml"
-    # Remove the member-level feature override, which Cargo rejects when the
-    # workspace declaration sets default-features.
-    perl -0pi -e 's~(?:,\\s*default-features\\s*=\\s*false|default-features\\s*=\\s*false\\s*,)~~g' \
-      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
         'db458bfba780e79d099d9f8986da5a1f7b360901' \
