@@ -82,7 +82,7 @@ rustPlatform.buildRustPackage {
     sourceRoot=$PWD
     # Cargo rejects a member's default-features override when the workspace
     # dependency declares the same setting. Remove the override everywhere.
-    find "$sourceRoot/frankensearch" -name Cargo.toml -exec \
+    find "$sourceRoot/../frankensearch" -name Cargo.toml -exec \
       perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false~$1~gs' {} +
   '';
 
