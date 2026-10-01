@@ -56,7 +56,7 @@ let
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
     # Cargo requires default-features to be configured at the workspace
     # dependency declaration, not overridden by a member.
-    perl -0pi -e 's~^[ \\t]*frankensearch-rerank\\s*=.*$~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank", default-features = false }~m' \
+    perl -0pi -e 's~(?ms)^[ \\t]*frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank", default-features = false }~' \
       "$out/frankensearch/Cargo.toml"
     # The upstream fsfs crate may override the workspace dependency's feature
     # setting, which Cargo rejects when the workspace declaration sets it.
