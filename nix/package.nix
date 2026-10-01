@@ -80,10 +80,8 @@ rustPlatform.buildRustPackage {
     cp ${../upstream/Cargo.lock} "$sourceRoot/upstream/Cargo.lock"
     cd "$sourceRoot/upstream"
     sourceRoot=$PWD
-    # Cargo requires default-features to be configured at the workspace
-    # dependency declaration, not overridden by a member.
-    perl -0pi -e 's~(?ms)^[ \t]*frankensearch-rerank\s*=\s*\{[^}]*\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }~' \
-      "$sourceRoot/frankensearch/Cargo.toml"
+    # Cargo rejects a member's default-features override when the workspace
+    # dependency declares the same setting. Remove the override everywhere.
     find "$sourceRoot/frankensearch" -name Cargo.toml -exec \
       perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^\n}]*)\s*,?\s*default-features\s*=\s*false~$1~g' {} +
   '';
