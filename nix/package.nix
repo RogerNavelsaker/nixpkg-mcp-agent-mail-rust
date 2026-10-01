@@ -77,6 +77,7 @@ rustPlatform.buildRustPackage {
   src = sourceRoot;
   postUnpack = ''
     cp ${../upstream/Cargo.lock} "$sourceRoot/upstream/Cargo.lock"
+    sed -i '/^\[target\.x86_64-unknown-linux-gnu\]$/,/^$/d' "$sourceRoot/upstream/.cargo/config.toml"
     cd "$sourceRoot/upstream"
     sourceRoot=$PWD
   '';
