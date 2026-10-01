@@ -76,6 +76,7 @@ rustPlatform.buildRustPackage {
   version = manifest.package.version;
   src = sourceRoot;
   postUnpack = ''
+    cp ${../upstream/Cargo.lock} "$sourceRoot/upstream/Cargo.lock"
     cd "$sourceRoot/upstream"
     sourceRoot=$PWD
   '';
