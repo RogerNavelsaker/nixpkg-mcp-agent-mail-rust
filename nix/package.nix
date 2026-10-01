@@ -84,7 +84,7 @@ rustPlatform.buildRustPackage {
     # dependency declaration, not overridden by a member.
     perl -0pi -e 's~(?ms)^[ \t]*frankensearch-rerank\s*=\s*\{[^}]*\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }~' \
       "$sourceRoot/../frankensearch/Cargo.toml"
-    perl -0pi -e 's~(?m)^(\s*frankensearch-rerank\s*=\s*\{[^\n]*?)\s*,?\s*default-features\s*=\s*false([^\n]*\})~$1$2~' \
+    perl -0pi -e 's~(?m)^[ \t]*frankensearch-rerank[ \t]*=[^\n]*$~frankensearch-rerank = { workspace = true }~' \
       "$sourceRoot/../frankensearch/crates/frankensearch-fsfs/Cargo.toml"
   '';
 
