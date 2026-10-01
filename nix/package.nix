@@ -58,7 +58,7 @@ let
     # dependency declaration, not overridden by a member.
     perl -0pi -e 's~^(frankensearch-rerank\\s*=\\s*\\{[^\\n}]*)default-features\\s*=\\s*(?:true|false)~$1default-features = false~m; s~^(frankensearch-rerank\\s*=\\s*\\{[^\\n}]*)\\}~$1, default-features = false }~m' \
       "$out/frankensearch/Cargo.toml"
-    perl -0pi -e 's~(frankensearch-rerank\\s*=\\s*\\{[^}]*?)\\s*,?\\s*default-features\\s*=\\s*false\\s*,?~$1~gs' \
+    perl -0pi -e 's~(?ms)^frankensearch-rerank\\s*=\\s*\\{[^}]*\\}~frankensearch-rerank = { workspace = true }~' \
       "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
     substituteInPlace "$out/Cargo.lock" \
       --replace-fail \
