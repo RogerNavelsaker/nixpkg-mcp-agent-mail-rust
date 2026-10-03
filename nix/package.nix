@@ -40,10 +40,11 @@ let
   };
   sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { } ''
     mkdir -p "$out/upstream" "$out/asupersync" "$out/beads_rust" \
-             "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
+             "$out/frankensearch" "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
     cp -R ${upstreamSrc}/. "$out/upstream/"
     cp -R ${asupersyncSrc}/. "$out/asupersync/"
     cp -R ${beadsRustSrc}/. "$out/beads_rust/"
+    cp -R ${../frankensearch}/. "$out/frankensearch/"
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
@@ -75,7 +76,15 @@ rustPlatform.buildRustPackage {
   pname = manifest.binary.name;
   version = manifest.package.version;
   src = sourceRoot;
-  sourceRoot = "source/upstream";
+  postUnpack = ''
+    cp ${../upstream/Cargo.lock} "$sourceRoot/upstream/Cargo.lock"
+    cd "$sourceRoot/upstream"
+    sourceRoot=$PWD
+    # Cargo rejects a member's default-features override when the workspace
+    # dependency declares the same setting. Remove the override everywhere.
+    find "$sourceRoot/frankensearch" -name Cargo.toml -exec \
+      perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false~$1~gs' {} +
+  '';
 
   cargoLock = {
     lockFile = ../upstream/Cargo.lock;
