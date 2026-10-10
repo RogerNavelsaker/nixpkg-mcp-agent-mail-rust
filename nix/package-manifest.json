@@ -21,6 +21,12 @@
         "rev": "a0b9c8525d9bf6f44feb612a1baeca603d2d9a83",
         "hash": "sha256-6eZemMSy2g6J3hb0BGA8AuiIEtEsRKmox6FEcIwVqKI="
       },
+      "frankensearch": {
+        "owner": "Dicklesworthstone",
+        "repo": "frankensearch",
+        "rev": "616c9a7a6bdada97d81f760808996911ba3be294",
+        "hash": "sha256-ge1B7eOb6ycfzKWYwEQ4jBE7RCMn5KwlD5zmBPcDktU="
+      },
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",

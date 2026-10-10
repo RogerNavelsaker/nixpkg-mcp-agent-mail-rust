@@ -20,6 +20,12 @@ let
     rev = manifest.source.siblings.beads_rust.rev;
     hash = manifest.source.siblings.beads_rust.hash;
   };
+  frankensearchSrc = fetchFromGitHub {
+    owner = manifest.source.siblings.frankensearch.owner;
+    repo = manifest.source.siblings.frankensearch.repo;
+    rev = manifest.source.siblings.frankensearch.rev;
+    hash = manifest.source.siblings.frankensearch.hash;
+  };
   frankensqliteSrc = fetchFromGitHub {
     owner = manifest.source.siblings.frankensqlite.owner;
     repo = manifest.source.siblings.frankensqlite.repo;
@@ -38,15 +44,34 @@ let
     rev = manifest.source.siblings.sqlmodel_rust.rev;
     hash = manifest.source.siblings.sqlmodel_rust.hash;
   };
-  sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { } ''
+  sourceRoot = runCommand "${manifest.binary.name}-${manifest.source.version}-src" { nativeBuildInputs = [ perl ]; } ''
     mkdir -p "$out/upstream" "$out/asupersync" "$out/beads_rust" \
-             "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
-    cp -R ${upstreamSrc}/. "$out/upstream/"
+             "$out/frankensearch" "$out/frankensqlite" "$out/frankentui" "$out/sqlmodel_rust"
+    cp -R ${upstreamSrc}/. "$out/"
     cp -R ${asupersyncSrc}/. "$out/asupersync/"
     cp -R ${beadsRustSrc}/. "$out/beads_rust/"
+    cp -R ${frankensearchSrc}/. "$out/frankensearch/"
     cp -R ${frankensqliteSrc}/. "$out/frankensqlite/"
     cp -R ${frankentuilSrc}/. "$out/frankentui/"
     cp -R ${sqlmodelRustSrc}/. "$out/sqlmodel_rust/"
+    # Keep the workspace dependency feature-neutral so members can choose
+    # whether to enable the rerank crate's default features. Cargo rejects a
+    # member-level `default-features = false` when the workspace declaration
+    # already sets default features.
+    perl -0pi -e 's~(?ms)^[ \\t]*frankensearch-rerank\\s*=\\s*\\{.*?\\}~frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }~' \
+      "$out/frankensearch/Cargo.toml"
+    # Remove member-level overrides wherever the vendored workspace declares
+    # this dependency; Cargo rejects overriding its workspace setting.
+    find "$out/frankensearch" -name Cargo.toml -exec \
+      perl -0pi -e 's~(frankensearch-rerank\s*=\s*\{[^}]*?)\s*,?\s*default-features\s*=\s*false\s*,?~$1~gs' {} +
+    # fsfs has historically carried this override in upstream revisions; keep
+    # the targeted fallback explicit so it cannot survive manifest formatting changes.
+    perl -0pi -e 's~\s*,?\s*default-features\s*=\s*false\s*,?~~g' \
+      "$out/frankensearch/crates/frankensearch-fsfs/Cargo.toml"
+    substituteInPlace "$out/Cargo.lock" \
+      --replace-fail \
+        'db458bfba780e79d099d9f8986da5a1f7b360901' \
+        '${manifest.source.siblings.frankensqlite.rev}'
   '';
   builtBinary = manifest.binary.upstreamName or manifest.binary.name;
   aliasOutputs = manifest.binary.aliases or [ ];
@@ -75,10 +100,8 @@ rustPlatform.buildRustPackage {
   pname = manifest.binary.name;
   version = manifest.package.version;
   src = sourceRoot;
-  sourceRoot = "source/upstream";
-
   cargoLock = {
-    lockFile = ../upstream/Cargo.lock;
+    lockFile = "${sourceRoot}/Cargo.lock";
     allowBuiltinFetchGit = true;
   };
 
