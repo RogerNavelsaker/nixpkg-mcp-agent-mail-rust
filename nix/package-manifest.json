@@ -6,8 +6,8 @@
     "channel": "github-head",
     "defaultBranch": "main",
     "version": "0.3.39",
-    "rev": "df181a75e88a3784f527307c1026f76f8906eb75",
-    "hash": "sha256-EejieGLwaQeI9veW1X0FqBwzfXFvlKVecBL1yFMD3Sk=",
+    "rev": "2b9aa65b5fc5f727d53c1db921d818aab59b5502",
+    "hash": "sha256-3YVkHo3oIni5qjNqb1uqDgrvhyrK37QoTHURSw40HhA=",
     "siblings": {
       "asupersync": {
         "owner": "Dicklesworthstone",
@@ -24,8 +24,8 @@
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "c3eebc08687a2a78cbe49b39b0b189e179ebc55d",
-        "hash": "sha256-lagksSPu11mWXm927jr5qpObO4NDC2/+d6Xe04O3DBQ="
+        "rev": "d064764015e8740a576e98bbce37103c068f3ec6",
+        "hash": "sha256-8ACha3XU08M+hfr71nnGQZhCWy7jagUHPolKkCI+HiQ="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
