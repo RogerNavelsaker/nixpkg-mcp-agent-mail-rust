@@ -18,14 +18,14 @@
       "beads_rust": {
         "owner": "Dicklesworthstone",
         "repo": "beads_rust",
-        "rev": "baea2f77bebf54402c75ecb1fd10d129bd715be9",
-        "hash": "sha256-GFPWpPOwVYnzzgMIQKzudpu79npnN7eDl4Q9kifbM5A="
+        "rev": "9e170e4578f9ea29d95e5f84e0afff755bafde9d",
+        "hash": "sha256-m0JVcVLh6Ep74T2S0Di0QNxtdgUMMn3MpPnegUEBbWE="
       },
       "frankensqlite": {
         "owner": "Dicklesworthstone",
         "repo": "frankensqlite",
-        "rev": "ad5d47395927226be0015a8ae70f72879eaba2b4",
-        "hash": "sha256-YM6sWiSfN1NeV/adJsHOI5XeNvupwoAaHn4skMFGuqs="
+        "rev": "24499460e82478216223d2d07fb2fae772a9bc80",
+        "hash": "sha256-4ugGDB71Ghg9SQdkRInS83N8J7zoe7m+LTy+s8WJ4Lc="
       },
       "frankentui": {
         "owner": "Dicklesworthstone",
