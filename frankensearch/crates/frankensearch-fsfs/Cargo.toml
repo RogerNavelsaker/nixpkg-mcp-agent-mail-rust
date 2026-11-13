@@ -23,7 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 frankensearch-core = { workspace = true }
-frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
+frankensearch-embed = { workspace = true, features = ["hash", "download"] }
 frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true }
 frankensearch-storage = { workspace = true }
